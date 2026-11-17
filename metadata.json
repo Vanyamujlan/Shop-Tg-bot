@@ -1,0 +1,6 @@
+{
+  "name": "Telegram Digital Store Bot",
+  "description": "Полноценный Telegram-магазин цифровых товаров (Telegram Stars, Premium, Gifts) на Node.js, TypeScript, Telegraf и Firebase Firestore.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

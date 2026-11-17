@@ -1,0 +1,160 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Telegram store user profile",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "telegramId": { "type": "number" },
+        "username": { "type": "string", "maxLength": 64 },
+        "firstName": { "type": "string", "maxLength": 128 },
+        "lastName": { "type": "string", "maxLength": 128 },
+        "languageCode": { "type": "string", "maxLength": 16 },
+        "isBlocked": { "type": "boolean" },
+        "totalOrders": { "type": "number" },
+        "totalSpentStars": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "telegramId", "firstName", "isBlocked", "totalOrders", "totalSpentStars", "createdAt", "updatedAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Digital product in the Telegram store (Stars, Premium, Gifts)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "category": { "type": "string", "enum": ["stars", "premium", "gifts"], "maxLength": 32 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 1000 },
+        "price": { "type": "number" },
+        "currency": { "type": "string", "enum": ["XTR"], "maxLength": 8 },
+        "imageUrl": { "type": "string", "maxLength": 500 },
+        "isActive": { "type": "boolean" },
+        "fulfillmentType": { "type": "string", "enum": ["manual", "provider_adapter"], "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "category", "description", "price", "currency", "imageUrl", "isActive", "fulfillmentType", "createdAt", "updatedAt"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Customer order in the Telegram store",
+      "type": "object",
+      "properties": {
+        "orderId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userTelegramId": { "type": "number" },
+        "username": { "type": "string", "maxLength": 64 },
+        "productId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "productName": { "type": "string", "maxLength": 120 },
+        "category": { "type": "string", "enum": ["stars", "premium", "gifts"], "maxLength": 32 },
+        "quantity": { "type": "number" },
+        "totalPrice": { "type": "number" },
+        "currency": { "type": "string", "enum": ["XTR"], "maxLength": 8 },
+        "paymentStatus": { "type": "string", "enum": ["pending", "paid", " processing", "completed", "cancelled", "refunded", "failed"], "maxLength": 32 },
+        "fulfillmentStatus": { "type": "string", "enum": ["pending", "paid", "processing", "completed", "cancelled", "refunded", "failed"], "maxLength": 32 },
+        "telegramPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "providerPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "fulfillmentNote": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "paidAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["orderId", "userId", "userTelegramId", "productId", "productName", "category", "quantity", "totalPrice", "currency", "paymentStatus", "fulfillmentStatus", "createdAt", "updatedAt"]
+    },
+    "Payment": {
+      "title": "Payment",
+      "description": "Verified Telegram Stars payment record",
+      "type": "object",
+      "properties": {
+        "paymentId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "telegramPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "providerPaymentChargeId": { "type": "string", "maxLength": 128 },
+        "orderId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userTelegramId": { "type": "number" },
+        "totalAmount": { "type": "number" },
+        "currency": { "type": "string", "enum": ["XTR"], "maxLength": 8 },
+        "invoicePayload": { "type": "string", "maxLength": 256 },
+        "status": { "type": "string", "enum": ["paid", "refunded"], "maxLength": 32 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "refundedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["paymentId", "telegramPaymentChargeId", "orderId", "userId", "userTelegramId", "totalAmount", "currency", "invoicePayload", "status", "createdAt"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Audit log of payment, order, and fulfillment events",
+      "type": "object",
+      "properties": {
+        "transactionId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "orderId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "type": { "type": "string", "enum": ["invoice_created", "pre_checkout_ok", "payment_received", "fulfillment_completed", "order_cancelled", "payment_refunded", "error"], "maxLength": 32 },
+        "amount": { "type": "number" },
+        "currency": { "type": "string", "enum": ["XTR"], "maxLength": 8 },
+        "details": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["transactionId", "orderId", "userId", "type", "amount", "currency", "details", "createdAt"]
+    },
+    "Admin": {
+      "title": "Admin",
+      "description": "Store administrator record",
+      "type": "object",
+      "properties": {
+        "adminId": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "telegramId": { "type": "number" },
+        "role": { "type": "string", "enum": ["admin", "superadmin"], "maxLength": 32 },
+        "addedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["adminId", "telegramId", "role", "addedAt"]
+    },
+    "Setting": {
+      "title": "Setting",
+      "description": "Store global configuration document",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "storeName": { "type": "string", "maxLength": 120 },
+        "supportUsername": { "type": "string", "maxLength": 64 },
+        "maintenanceMode": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["key", "storeName", "supportUsername", "maintenanceMode", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "Telegram store users indexed by Telegram ID string"
+    },
+    "/products/{productId}": {
+      "schema": { "$ref": "#/entities/Product" },
+      "description": "Digital store products (Stars, Premium, Gifts)"
+    },
+    "/orders/{orderId}": {
+      "schema": { "$ref": "#/entities/Order" },
+      "description": "Customer orders"
+    },
+    "/payments/{paymentId}": {
+      "schema": { "$ref": "#/entities/Payment" },
+      "description": "Idempotent Telegram Stars payment records indexed by sanitized charge ID"
+    },
+    "/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "Audit log of store transactions"
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/Admin" },
+      "description": "Store administrators"
+    },
+    "/settings/{settingKey}": {
+      "schema": { "$ref": "#/entities/Setting" },
+      "description": "Global store settings"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "outDir": "build",
+    "target": "es2024",
+    "module": "es2022",
+    "lib": ["ES2023", "DOM", "DOM.Iterable", "ESNext.Temporal"],
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": true,
+    "importHelpers": true,
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+    "types": ["node"]
+  },
+  "include": ["server.ts", "src/**/*.ts", "firestore.rules.test.ts", "types.d.ts"]
+}
