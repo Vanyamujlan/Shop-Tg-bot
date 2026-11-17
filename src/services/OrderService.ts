@@ -2,6 +2,7 @@ import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
   Order,
   OrderStatus,
+  PaymentRecord,
   StoreTransaction,
   StoreUser,
   TransactionType,
@@ -13,6 +14,7 @@ export class OrderService {
   /**
    * Creates a new pending order strictly using the product price stored in the database.
    * Never trusts price sent from client callbacks.
+   * Fails safely if production storage is unavailable.
    */
   public static async createOrder(params: {
     telegramUser: {
@@ -24,6 +26,8 @@ export class OrderService {
     productId: string;
     quantity?: number;
   }): Promise<Order> {
+    firestoreRepo.assertReadyForOrdersAndPayments();
+
     const user = await UserService.upsertFromTelegram(params.telegramUser);
     if (user.isBlocked) {
       throw new Error('Ваш аккаунт заблокирован в магазине. Обратитесь в поддержку.');
@@ -54,6 +58,8 @@ export class OrderService {
       currency: 'XTR',
       paymentStatus: 'pending',
       fulfillmentStatus: 'pending',
+      fulfillmentAttempts: 0,
+      fulfillmentIdempotencyKey: `fulfill_${orderId}`,
       createdAt: now,
       updatedAt: now,
     };
@@ -75,67 +81,80 @@ export class OrderService {
   }
 
   /**
-   * Server-side filtered and paginated user orders query (HIGH-02).
+   * Server-side filtered and cursor-paginated user orders query.
    */
   public static async getUserOrders(
     telegramId: number,
     limit = 20,
-    offset = 0,
+    startAfterCursor?: unknown,
   ): Promise<Order[]> {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
     return firestoreRepo.queryDocs<Order>('orders', {
       where: [{ field: 'userTelegramId', op: '==', value: telegramId }],
       orderBy: { field: 'createdAt', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
-      offset,
     });
   }
 
   /**
-   * Server-side filtered and paginated orders query for admin views (HIGH-02).
+   * Server-side filtered and cursor-paginated orders query for admin views.
+   * Uses `fulfillmentStatus` (which tracks pending -> paid -> processing -> completed / failed / cancelled / refunded).
    */
   public static async getAllOrders(
     statusFilter?: OrderStatus,
     limit = 50,
-    offset = 0,
+    startAfterCursor?: unknown,
   ): Promise<Order[]> {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
+
     if (!statusFilter) {
       return firestoreRepo.queryDocs<Order>('orders', {
         orderBy: { field: 'createdAt', direction: 'desc' },
+        startAfter: isLegacyOffset ? undefined : startAfterCursor,
+        offset: isLegacyOffset ? startAfterCursor : undefined,
         limit,
-        offset,
       });
     }
 
-    const fetchWindow = limit + offset;
-    const [byFulfillment, byPayment] = await Promise.all([
-      firestoreRepo.queryDocs<Order>('orders', {
-        where: [{ field: 'fulfillmentStatus', op: '==', value: statusFilter }],
-        orderBy: { field: 'createdAt', direction: 'desc' },
-        limit: fetchWindow,
-      }),
-      firestoreRepo.queryDocs<Order>('orders', {
-        where: [{ field: 'paymentStatus', op: '==', value: statusFilter }],
-        orderBy: { field: 'createdAt', direction: 'desc' },
-        limit: fetchWindow,
-      }),
-    ]);
-
-    const mergedMap = new Map<string, Order>();
-    for (const ord of [...byFulfillment, ...byPayment]) {
-      mergedMap.set(ord.orderId, ord);
-    }
-
-    return Array.from(mergedMap.values())
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .slice(offset, offset + limit);
+    return firestoreRepo.queryDocs<Order>('orders', {
+      where: [{ field: 'fulfillmentStatus', op: '==', value: statusFilter }],
+      orderBy: { field: 'createdAt', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
+      limit,
+    });
   }
 
+  /**
+   * Cannot mark an order paid without a verified PaymentRecord in Firestore.
+   */
   public static async markOrderPaid(params: {
     orderId: string;
     telegramPaymentChargeId: string;
     providerPaymentChargeId?: string;
   }): Promise<Order> {
+    firestoreRepo.assertReadyForOrdersAndPayments();
+    if (!params.telegramPaymentChargeId) {
+      throw new Error(
+        'Запрещено переводить заказ в статус paid без подтверждённого telegram_payment_charge_id.',
+      );
+    }
+
+    const paymentDocId = sanitizeDocId(`pay_${params.telegramPaymentChargeId}`);
+
     return firestoreRepo.runTransaction(async (tx) => {
+      // All reads before writes
+      const verifiedPayment = await tx.get<PaymentRecord>('payments', paymentDocId);
+      if (!verifiedPayment || verifiedPayment.orderId !== params.orderId) {
+        throw new Error(
+          `Запрещено отмечать заказ #${params.orderId} оплаченным без подтверждённого успешного платежа (PaymentRecord не найден).`,
+        );
+      }
+
       const existing = await tx.get<Order>('orders', params.orderId);
       if (!existing) {
         throw new Error(`Заказ ${params.orderId} не найден.`);
@@ -193,6 +212,12 @@ export class OrderService {
     fulfillmentStatus?: OrderStatus;
     fulfillmentNote?: string;
   }): Promise<Order | null> {
+    if (params.paymentStatus === 'paid' || params.fulfillmentStatus === 'paid') {
+      throw new Error(
+        'Перевод заказа в статус paid разрешён только через PaymentService.processSuccessfulPayment.',
+      );
+    }
+
     return firestoreRepo.runTransaction(async (tx) => {
       const existing = await tx.get<Order>('orders', params.orderId);
       if (!existing) return null;
@@ -249,16 +274,19 @@ export class OrderService {
   }
 
   /**
-   * Server-side ordered and limited recent transactions query (HIGH-02).
+   * Server-side ordered and cursor-paginated recent transactions query.
    */
   public static async getRecentTransactions(
     limit = 15,
-    offset = 0,
+    startAfterCursor?: unknown,
   ): Promise<StoreTransaction[]> {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
     return firestoreRepo.queryDocs<StoreTransaction>('transactions', {
       orderBy: { field: 'createdAt', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
-      offset,
     });
   }
 }

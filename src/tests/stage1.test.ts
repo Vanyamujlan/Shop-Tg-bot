@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
-import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Telegraf } from 'telegraf';
-import { firestoreRepo } from '../db/firestore.ts';
+import type { Context, Telegraf } from 'telegraf';
+import type { Request, Response } from 'express';
+import {
+  firestoreRepo,
+  StorageUnavailableError,
+} from '../db/firestore.ts';
 import { OrderService } from '../services/OrderService.ts';
 import { PaymentService } from '../services/PaymentService.ts';
 import {
@@ -13,53 +16,41 @@ import {
 } from '../services/FulfillmentService.ts';
 import { ProductService } from '../services/ProductService.ts';
 import { UserService } from '../services/UserService.ts';
-import type { StoreUser } from '../types.ts';
+import {
+  botManager,
+  verifyWebhookSecretToken,
+  isValidTelegramUpdatePayload,
+} from '../bot/bot.ts';
+import { ensureAdmin } from '../bot/handlers/adminHandler.ts';
+import type { Order, StoreUser } from '../types.ts';
 
-function inheritFirebaseEnvFromServerIfNeeded(): void {
-  if (process.env.FIREBASE_PRIVATE_KEY && process.env.FIREBASE_CLIENT_EMAIL) {
-    return;
-  }
-  try {
-    const pidRaw = execSync('pgrep -f "tsx server.ts" | head -n 1', {
-      encoding: 'utf-8',
-    }).trim();
-    if (!pidRaw) return;
-    const rawEnv = fs.readFileSync(`/proc/${pidRaw}/environ`, 'utf-8');
-    for (const entry of rawEnv.split('\0')) {
-      const eqIdx = entry.indexOf('=');
-      if (eqIdx <= 0) continue;
-      const key = entry.slice(0, eqIdx);
-      const val = entry.slice(eqIdx + 1);
-      if (
-        key.startsWith('FIREBASE_') ||
-        key === 'ADMIN_IDS' ||
-        key === 'STORE_SUPPORT_USERNAME'
-      ) {
-        process.env[key] = val;
-      }
-    }
-  } catch {
-    // Fallback to offline test mode if server process is not found
-  }
-}
+// Force isolated test environment so production Firestore and .data/ are NEVER touched
+process.env.NODE_ENV = 'test';
+process.env.ALLOW_LOCAL_FALLBACK = 'false';
+process.env.ADMIN_IDS = '777000111';
 
-
-interface TestResult {
+interface AuditTestRecord {
+  id: string;
+  category: 'Payments' | 'Fulfillment' | 'Security' | 'Database';
   name: string;
-  passed: boolean;
+  status: 'PASS' | 'FAIL';
+  environment: string;
+  emulatorUsed: boolean;
   details: string;
 }
 
-const results: TestResult[] = [];
-const createdOrderIds = new Set<string>();
-const createdPaymentIds = new Set<string>();
-const createdUserIds = new Set<string>();
-const createdTxIds = new Set<string>();
+const testResults: AuditTestRecord[] = [];
 
-function createMockBot(sentMessages: Array<{ chatId: number | string; text: string }>): Telegraf {
+function createMockBot(
+  sentMessages: Array<{ chatId: number | string; text: string }>,
+  shouldFail = false,
+): Telegraf {
   return {
     telegram: {
       sendMessage: async (chatId: number | string, text: string) => {
+        if (shouldFail) {
+          throw new Error('Simulated Telegram API 502 Bad Gateway');
+        }
         sentMessages.push({ chatId, text });
         return { message_id: Date.now() };
       },
@@ -67,479 +58,1035 @@ function createMockBot(sentMessages: Array<{ chatId: number | string; text: stri
   } as unknown as Telegraf;
 }
 
-async function cleanupTestArtifacts(): Promise<void> {
-  for (const orderId of createdOrderIds) {
-    try {
-      await firestoreRepo.deleteDoc('orders', orderId);
-    } catch {
-      // ignore cleanup error
-    }
-  }
-  for (const paymentId of createdPaymentIds) {
-    try {
-      await firestoreRepo.deleteDoc('payments', paymentId);
-    } catch {
-      // ignore cleanup error
-    }
-  }
-  for (const userId of createdUserIds) {
-    try {
-      await firestoreRepo.deleteDoc('users', userId);
-    } catch {
-      // ignore cleanup error
-    }
-  }
-  for (const txId of createdTxIds) {
-    try {
-      await firestoreRepo.deleteDoc('transactions', txId);
-    } catch {
-      // ignore cleanup error
-    }
+function createMockExpressRes(): {
+  res: Response;
+  getStatus: () => number;
+  getJson: () => unknown;
+} {
+  let statusCode = 200;
+  let jsonBody: unknown = null;
+  const mockRes = {
+    headersSent: false,
+    status(code: number) {
+      statusCode = code;
+      return mockRes;
+    },
+    json(payload: unknown) {
+      jsonBody = payload;
+      mockRes.headersSent = true;
+      return mockRes;
+    },
+  };
+  const res = mockRes as unknown as Response;
+
+  return {
+    res,
+    getStatus: () => statusCode,
+    getJson: () => jsonBody,
+  };
+}
+
+async function runTest(
+  id: string,
+  category: AuditTestRecord['category'],
+  name: string,
+  fn: () => Promise<string>,
+): Promise<void> {
+  try {
+    const details = await fn();
+    testResults.push({
+      id,
+      category,
+      name,
+      status: 'PASS',
+      environment: 'Isolated In-Memory Transactional Engine + Mock Telegram API (NODE_ENV=test)',
+      emulatorUsed: false,
+      details,
+    });
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.stack || error.message : String(error);
+    testResults.push({
+      id,
+      category,
+      name,
+      status: 'FAIL',
+      environment: 'Isolated In-Memory Transactional Engine + Mock Telegram API (NODE_ENV=test)',
+      emulatorUsed: false,
+      details: errMsg,
+    });
+    throw error;
   }
 }
 
-async function cleanupTransactionsForOrders(orderIds: string[]): Promise<void> {
-  if (orderIds.length === 0) return;
-  const recentTxs = await OrderService.getRecentTransactions(100);
-  for (const tx of recentTxs) {
-    if (orderIds.includes(tx.orderId)) {
-      createdTxIds.add(tx.transactionId);
-    }
-  }
-}
+async function runFullAuditTestSuite(): Promise<void> {
+  console.log('================================================================');
+  console.log('🧪 ЗАПУСК ПОЛНОГО НАБОРА АВТОТЕСТОВ STARS SHOP (ISOLATED MODE)');
+  console.log('================================================================');
 
-async function runStage1Tests(): Promise<void> {
-  console.log('==========================================================');
-  console.log('🧪 ЗАПУСК АВТОТЕСТОВ ЭТАПА 1 (HIGH-01, HIGH-02, MEDIUM-01, MEDIUM-SEC-01)');
-  console.log('==========================================================');
+  firestoreRepo.enableIsolatedTestMode(true);
+  FulfillmentService.baseRetryDelayMs = 10;
+  FulfillmentService.staleProcessingLeaseMs = 50;
 
-  inheritFirebaseEnvFromServerIfNeeded();
-  await firestoreRepo.init();
+  const buyer1 = {
+    id: 100200301,
+    username: 'buyer_one',
+    first_name: 'Alex',
+    last_name: 'Buyer',
+  };
+  const buyer2 = {
+    id: 100200302,
+    username: 'buyer_two',
+    first_name: 'Boris',
+    last_name: 'Other',
+  };
 
-  const repoStatus = firestoreRepo.getStatus();
-  console.log(
-    `[Test Info] Firestore Project: ${repoStatus.projectId} | Admin SDK Ready: ${repoStatus.adminSdkConnected}`,
+  // ===========================================================================
+  // 1. PAYMENTS TESTS
+  // ===========================================================================
+  await runTest(
+    'P-01',
+    'Payments',
+    'Успешная атомарная обработка платежа (successful_payment)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 2,
+      });
+      assert.equal(order.totalPrice, 20);
+      assert.equal(order.paymentStatus, 'pending');
+
+      const res = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order.orderId,
+        currency: 'XTR',
+        totalAmount: 20,
+        telegramPaymentChargeId: 'chg_p01_valid',
+        providerPaymentChargeId: 'prov_p01',
+      });
+
+      assert.equal(res.alreadyProcessed, false);
+      assert.equal(res.order.paymentStatus, 'paid');
+      assert.equal(res.order.fulfillmentStatus, 'paid');
+      assert.equal(res.payment.totalAmount, 20);
+
+      const user = await UserService.getUserByTelegramId(buyer1.id);
+      assert.equal(user?.totalOrders, 1);
+      assert.equal(user?.totalSpentStars, 20);
+      return `Заказ #${order.orderId} переведён в paid, PaymentRecord создан, статистика пользователя: 1 заказ / 20 XTR.`;
+    },
   );
 
-  const testTgId1 = 9900112233;
-  const testUserId1 = UserService.getUserId(testTgId1);
-  createdUserIds.add(testUserId1);
+  await runTest(
+    'P-02',
+    'Payments',
+    'Повторный платёж (идемпотентность при повторной доставке update)',
+    async () => {
+      const orders = await OrderService.getUserOrders(buyer1.id);
+      const order = orders[0];
 
-  try {
-    // -------------------------------------------------------------------------
-    // TEST 1: Атомарная обработка successful_payment и проверка дубликата (последовательный вызов)
-    // -------------------------------------------------------------------------
-    {
-      const order = await OrderService.createOrder({
-        telegramUser: {
-          id: testTgId1,
-          username: 'stage1_tester',
-          first_name: 'Stage1',
-          last_name: 'Tester',
-        },
-        productId: 'stars_pack_50',
-        quantity: 1,
-      });
-      createdOrderIds.add(order.orderId);
-
-      const chargeId = `chg_seq_${Date.now()}`;
-      const paymentDocId = PaymentService.getPaymentDocId(chargeId);
-      createdPaymentIds.add(paymentDocId);
-
-      const firstRes = await PaymentService.processSuccessfulPayment({
-        telegramUserId: testTgId1,
+      const dupRes = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
         invoicePayload: order.orderId,
         currency: 'XTR',
-        totalAmount: order.totalPrice,
-        telegramPaymentChargeId: chargeId,
-        providerPaymentChargeId: 'prov_seq_1',
+        totalAmount: 20,
+        telegramPaymentChargeId: 'chg_p01_valid',
       });
 
-      assert.equal(firstRes.alreadyProcessed, false, 'Первый вызов не должен быть помечен как дубликат');
-      assert.equal(firstRes.needsFulfillmentRecovery, true, 'После оплаты заказ должен ожидать выдачи');
-      assert.equal(firstRes.order.paymentStatus, 'paid');
-      assert.equal(firstRes.order.fulfillmentStatus, 'paid');
+      assert.equal(dupRes.alreadyProcessed, true);
+      const user = await UserService.getUserByTelegramId(buyer1.id);
+      assert.equal(user?.totalOrders, 1);
+      assert.equal(user?.totalSpentStars, 20);
+      return 'Повторный update вернул alreadyProcessed=true без дублирования PaymentRecord и без повторного инкремента статистики.';
+    },
+  );
 
-      const userAfterFirst = await UserService.getUserById(testUserId1);
-      assert.ok(userAfterFirst, 'Пользователь должен существовать');
-      assert.equal(userAfterFirst.totalOrders, 1, 'totalOrders должен быть равен 1');
-      assert.equal(
-        userAfterFirst.totalSpentStars,
-        order.totalPrice,
-        `totalSpentStars должен быть равен ${order.totalPrice}`,
-      );
-
-      // Запускаем выдачу
-      const sentNotifications: Array<{ chatId: number | string; text: string }> = [];
-      const mockBot = createMockBot(sentNotifications);
-      const fulfilledOrder = await FulfillmentService.initiateFulfillment(
-        firstRes.order,
-        mockBot,
-      );
-      assert.equal(fulfilledOrder.fulfillmentStatus, 'processing');
-
-      // Повторный (дублирующий) вызов successful_payment с тем же chargeId
-      const duplicateRes = await PaymentService.processSuccessfulPayment({
-        telegramUserId: testTgId1,
-        invoicePayload: order.orderId,
-        currency: 'XTR',
-        totalAmount: order.totalPrice,
-        telegramPaymentChargeId: chargeId,
-        providerPaymentChargeId: 'prov_seq_1',
-      });
-
-      assert.equal(duplicateRes.alreadyProcessed, true, 'Повторный вызов обязан вернуть alreadyProcessed: true');
-      assert.equal(
-        duplicateRes.needsFulfillmentRecovery,
-        false,
-        'Так как выдача уже в статусе processing, needsFulfillmentRecovery должен быть false',
-      );
-
-      const userAfterDuplicate = await UserService.getUserById(testUserId1);
-      assert.equal(
-        userAfterDuplicate?.totalOrders,
-        1,
-        'Повторный платёж НЕ должен увеличивать totalOrders повторно',
-      );
-      assert.equal(
-        userAfterDuplicate?.totalSpentStars,
-        order.totalPrice,
-        'Повторный платёж НЕ должен увеличивать totalSpentStars повторно',
-      );
-
-      results.push({
-        name: 'HIGH-01.1: Атомарная транзакция оплаты и защита от последовательного дубликата платежа',
-        passed: true,
-        details: `Order ${order.orderId} переведён в paid, статистика пользователя обновлена ровно 1 раз (totalOrders=1, totalSpentStars=${order.totalPrice}).`,
-      });
-    }
-
-    // -------------------------------------------------------------------------
-    // TEST 2: Параллельные (конкурентные) вызовы successful_payment + initiateFulfillment
-    // -------------------------------------------------------------------------
-    {
-      const userBefore = await UserService.getUserById(testUserId1);
-      const prevOrders = userBefore?.totalOrders || 0;
-      const prevStars = userBefore?.totalSpentStars || 0;
-
+  await runTest(
+    'P-03',
+    'Payments',
+    'Параллельная обработка одинакового платежа (6 конкурентных потоков)',
+    async () => {
       const order = await OrderService.createOrder({
-        telegramUser: {
-          id: testTgId1,
-          username: 'stage1_tester',
-          first_name: 'Stage1',
-          last_name: 'Tester',
-        },
+        telegramUser: buyer1,
         productId: 'stars_pack_250',
         quantity: 1,
       });
-      createdOrderIds.add(order.orderId);
-
-      const chargeId = `chg_parallel_${Date.now()}`;
-      createdPaymentIds.add(PaymentService.getPaymentDocId(chargeId));
 
       const parallelResults = await Promise.all(
-        Array.from({ length: 5 }, () =>
+        Array.from({ length: 6 }, () =>
           PaymentService.processSuccessfulPayment({
-            telegramUserId: testTgId1,
+            telegramUserId: buyer1.id,
             invoicePayload: order.orderId,
             currency: 'XTR',
             totalAmount: order.totalPrice,
-            telegramPaymentChargeId: chargeId,
-            providerPaymentChargeId: 'prov_parallel_1',
+            telegramPaymentChargeId: 'chg_p03_parallel',
           }),
         ),
       );
 
-      const freshProcesses = parallelResults.filter((r) => !r.alreadyProcessed);
-      const duplicateProcesses = parallelResults.filter((r) => r.alreadyProcessed);
+      const freshCount = parallelResults.filter((r) => !r.alreadyProcessed).length;
+      const dupCount = parallelResults.filter((r) => r.alreadyProcessed).length;
+      assert.equal(freshCount, 1);
+      assert.equal(dupCount, 5);
 
-      assert.equal(
-        freshProcesses.length,
-        1,
-        `Ровно 1 параллельный вызов должен записать платёж, получено: ${freshProcesses.length}`,
-      );
-      assert.equal(
-        duplicateProcesses.length,
-        4,
-        `Остальные 4 параллельных вызова должны получить alreadyProcessed=true`,
+      const user = await UserService.getUserByTelegramId(buyer1.id);
+      assert.equal(user?.totalOrders, 2);
+      assert.equal(user?.totalSpentStars, 20 + 50);
+      return 'Из 6 параллельных вызовов ровно 1 зафиксировал платёж, 5 получили alreadyProcessed=true.';
+    },
+  );
+
+  await runTest(
+    'P-04',
+    'Payments',
+    'Отклонение платежа с неверной суммой (totalAmount mismatch)',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      await assert.rejects(
+        async () => {
+          await PaymentService.processSuccessfulPayment({
+            telegramUserId: buyer1.id,
+            invoicePayload: order.orderId,
+            currency: 'XTR',
+            totalAmount: 1, // ожидалось 10 XTR
+            telegramPaymentChargeId: 'chg_p04_bad_amount',
+          });
+        },
+        /Несовпадение суммы оплаты/,
       );
 
-      const userAfter = await UserService.getUserById(testUserId1);
-      assert.equal(
-        userAfter?.totalOrders,
-        prevOrders + 1,
-        'При 5 параллельных вызовах totalOrders должен увеличиться ровно на 1',
+      const unchanged = await OrderService.getOrderById(order.orderId);
+      assert.equal(unchanged?.paymentStatus, 'pending');
+      return 'Платёж с заниженной суммой (1 вместо 10 XTR) отклонён, статус заказа остался pending.';
+    },
+  );
+
+  await runTest(
+    'P-05',
+    'Payments',
+    'Отклонение платежа с неверной валютой (не XTR)',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      const preCheck = await PaymentService.validatePreCheckout({
+        invoicePayload: order.orderId,
+        telegramUserId: buyer1.id,
+        currency: 'USD',
+        totalAmount: order.totalPrice,
+      });
+      assert.equal(preCheck.ok, false);
+
+      await assert.rejects(
+        async () => {
+          await PaymentService.processSuccessfulPayment({
+            telegramUserId: buyer1.id,
+            invoicePayload: order.orderId,
+            currency: 'USD',
+            totalAmount: order.totalPrice,
+            telegramPaymentChargeId: 'chg_p05_bad_currency',
+          });
+        },
+        /Неподдерживаемая валюта платежа/,
       );
-      assert.equal(
-        userAfter?.totalSpentStars,
-        prevStars + order.totalPrice,
-        `При 5 параллельных вызовах totalSpentStars должен увеличиться ровно на ${order.totalPrice}`,
+      return 'Валюта USD отклонена как в validatePreCheckout, так и в processSuccessfulPayment.';
+    },
+  );
+
+  await runTest(
+    'P-06',
+    'Payments',
+    'Отклонение оплаты заказа другого пользователя',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      await assert.rejects(
+        async () => {
+          await PaymentService.processSuccessfulPayment({
+            telegramUserId: buyer2.id, // чужой пользователь
+            invoicePayload: order.orderId,
+            currency: 'XTR',
+            totalAmount: order.totalPrice,
+            telegramPaymentChargeId: 'chg_p06_wrong_user',
+          });
+        },
+        /Несовпадение владельца заказа/,
+      );
+      return 'Попытка оплатить чужой заказ отклонена с ошибкой владельца.';
+    },
+  );
+
+  await runTest(
+    'P-07',
+    'Payments',
+    'Отклонение оплаты отсутствующего заказа',
+    async () => {
+      await assert.rejects(
+        async () => {
+          await PaymentService.processSuccessfulPayment({
+            telegramUserId: buyer1.id,
+            invoicePayload: 'ord_non_existent_999999',
+            currency: 'XTR',
+            totalAmount: 10,
+            telegramPaymentChargeId: 'chg_p07_missing_order',
+          });
+        },
+        /не найден при обработке оплаты/,
+      );
+      return 'Оплата несуществующего заказа корректно отклонена.';
+    },
+  );
+
+  await runTest(
+    'P-08',
+    'Payments',
+    'Проброс ошибки Firestore при сбое записи во время оплаты',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      firestoreRepo.setSimulatedFailure({
+        writeError: 'Simulated Firestore DEADLINE_EXCEEDED on write',
+      });
+
+      try {
+        await assert.rejects(
+          async () => {
+            await PaymentService.processSuccessfulPayment({
+              telegramUserId: buyer1.id,
+              invoicePayload: order.orderId,
+              currency: 'XTR',
+              totalAmount: order.totalPrice,
+              telegramPaymentChargeId: 'chg_p08_write_err',
+            });
+          },
+          /Simulated Firestore DEADLINE_EXCEEDED on write/,
+        );
+      } finally {
+        firestoreRepo.setSimulatedFailure({});
+      }
+
+      const afterFail = await OrderService.getOrderById(order.orderId);
+      assert.equal(afterFail?.paymentStatus, 'pending');
+      return 'Ошибка записи Firestore проброшена вызывающему коду, заказ остался в pending.';
+    },
+  );
+
+  await runTest(
+    'P-09',
+    'Payments',
+    'Rollback транзакции, запрет чтения после записи и защита markOrderPaid без PaymentRecord',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      // 1. Попытка отметить заказ оплаченным напрямую через markOrderPaid без PaymentRecord
+      await assert.rejects(
+        async () => {
+          await OrderService.markOrderPaid({
+            orderId: order.orderId,
+            telegramPaymentChargeId: 'unverified_charge_id',
+          });
+        },
+        /PaymentRecord не найден/,
       );
 
-      // Теперь проверим параллельный запуск initiateFulfillment
-      const sentNotifications: Array<{ chatId: number | string; text: string }> = [];
-      const mockBot = createMockBot(sentNotifications);
-
-      await Promise.all(
-        parallelResults.map((r) =>
-          FulfillmentService.initiateFulfillment(r.order, mockBot),
-        ),
+      // 2. Проверка нарушения порядка read-after-write и полного отката транзакции
+      await assert.rejects(
+        async () => {
+          await firestoreRepo.runTransaction(async (tx) => {
+            const u = await tx.get<StoreUser>('users', `tg_${buyer1.id}`);
+            assert.ok(u);
+            tx.set<StoreUser>('users', `tg_${buyer1.id}`, {
+              ...u,
+              totalOrders: 888888,
+            });
+            // Нарушаем правило: вызываем tx.get ПОСЛЕ tx.set
+            await tx.get<Order>('orders', order.orderId);
+          });
+        },
+        /все операции чтения \(tx\.get\) должны выполняться до операций записи/,
       );
+
+      const userAfterRollback = await UserService.getUserByTelegramId(buyer1.id);
+      assert.notEqual(userAfterRollback?.totalOrders, 888888);
+      return 'Защита read-before-write сработала, транзакция откатилась, неавторизованный markOrderPaid заблокирован.';
+    },
+  );
+
+  // ===========================================================================
+  // 2. FULFILLMENT TESTS
+  // ===========================================================================
+  await runTest(
+    'F-01',
+    'Fulfillment',
+    'Повторный запуск одной задачи выдачи (идемпотентность initiateFulfillment)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order.orderId,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        telegramPaymentChargeId: 'chg_f01',
+      });
+
+      const messages: Array<{ chatId: number | string; text: string }> = [];
+      const bot = createMockBot(messages);
+
+      const first = await FulfillmentService.initiateFulfillment(paid.order, bot);
+      const second = await FulfillmentService.initiateFulfillment(first, bot);
+
+      assert.equal(first.fulfillmentStatus, 'processing');
+      assert.equal(second.fulfillmentStatus, 'processing');
+      assert.equal(second.fulfillmentAttempts, 1);
+      assert.equal(messages.length, 1);
+      return 'При повторном вызове initiateFulfillment задача не дублируется (attempts=1, уведомлений=1).';
+    },
+  );
+
+  await runTest(
+    'F-02',
+    'Fulfillment',
+    'Два параллельных worker на один заказ (атомарный захват до внешней выдачи)',
+    async () => {
+      let adapterCalls = 0;
+      const countingAdapter: FulfillmentProviderAdapter = {
+        providerName: 'CountingAutoAdapter',
+        supportsIdempotency: true,
+        isConfigured: () => true,
+        requestFulfillment: async (ord, ctx) => {
+          adapterCalls++;
+          await new Promise((r) => setTimeout(r, 25));
+          return {
+            handledAutomatically: true,
+            status: 'completed',
+            details: `Автовыдача выполнена (key=${ctx?.idempotencyKey})`,
+            externalReference: `ref_${ord.orderId}`,
+          };
+        },
+      };
+      FulfillmentService.setAdapter(countingAdapter);
+
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_250',
+        quantity: 1,
+      });
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order.orderId,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        telegramPaymentChargeId: 'chg_f02_parallel_workers',
+      });
+
+      const messages: Array<{ chatId: number | string; text: string }> = [];
+      const bot = createMockBot(messages);
+
+      // Запускаем два параллельных worker одновременно
+      await Promise.all([
+        FulfillmentService.initiateFulfillment(paid.order, bot),
+        FulfillmentService.initiateFulfillment(paid.order, bot),
+      ]);
 
       const finalOrder = await OrderService.getOrderById(order.orderId);
-      assert.equal(finalOrder?.fulfillmentStatus, 'processing');
+      assert.equal(adapterCalls, 1, 'Внешний адаптер должен быть вызван ровно 1 раз');
+      assert.equal(finalOrder?.fulfillmentStatus, 'completed');
 
-      results.push({
-        name: 'HIGH-01.2: Конкурентные параллельные платежи и идемпотентность выдачи (5 потоков)',
-        passed: true,
-        details: `Из 5 конкурентных вызовов ровно 1 зафиксировал транзакцию, 4 отсечены как дубликаты. Уведомлений админу отправлено без дублей (${sentNotifications.length}).`,
-      });
-    }
+      FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+      return `Атомарный захват перед вызовом адаптера предотвратил гонку: adapterCalls=${adapterCalls}.`;
+    },
+  );
 
-    // -------------------------------------------------------------------------
-    // TEST 3: Восстановление после частичного сбоя между фиксацией оплаты и выдачей
-    // -------------------------------------------------------------------------
-    {
-      const order = await OrderService.createOrder({
-        telegramUser: {
-          id: testTgId1,
-          username: 'stage1_tester',
-          first_name: 'Stage1',
-          last_name: 'Tester',
+  await runTest(
+    'F-03',
+    'Fulfillment',
+    'Падение сервера во время внешней обработки (сверка checkExternalStatus и карантин неидемпотентного провайдера)',
+    async () => {
+      // Сценарий А: Внешний запрос реально выполнился до падения сервера, провайдер подтверждает через checkExternalStatus
+      const crashRecoveryAdapter: FulfillmentProviderAdapter = {
+        providerName: 'ProviderWithStatusCheck',
+        supportsIdempotency: true,
+        isConfigured: () => true,
+        requestFulfillment: async () => {
+          throw new Error('Should not be called if checkExternalStatus returns alreadyExecuted=true');
         },
+        checkExternalStatus: async (_ord, key) => ({
+          alreadyExecuted: true,
+          status: 'completed',
+          details: `Выдача подтверждена провайдером по ключу ${key}`,
+          externalReference: `ext_verified_${key}`,
+        }),
+      };
+      FulfillmentService.setAdapter(crashRecoveryAdapter);
+
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+      });
+      await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order.orderId,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        telegramPaymentChargeId: 'chg_f03_crash',
+      });
+
+      // Имитируем состояние, когда сервер упал после захвата 'processing', не успев сохранить externalExecutionReference
+      const pastIso = new Date(Date.now() - 5000).toISOString();
+      await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
+        fulfillmentStatus: 'processing',
+        fulfillmentStartedAt: pastIso,
+        fulfillmentAttempts: 1,
+        externalExecutionReference: undefined,
+      });
+
+      const messages: Array<{ chatId: number | string; text: string }> = [];
+      const bot = createMockBot(messages);
+
+      const recovered = await FulfillmentService.recoverPendingFulfillments(bot);
+      const updatedOrder = await OrderService.getOrderById(order.orderId);
+      assert.ok(recovered.length >= 1);
+      assert.equal(updatedOrder?.fulfillmentStatus, 'completed');
+      assert.ok(updatedOrder?.externalExecutionReference?.startsWith('ext_verified_'));
+
+      // Сценарий Б: Неидемпотентный провайдер без checkExternalStatus — перевод в карантин ручной сверки (без двойной выдачи!)
+      let unsafeCalls = 0;
+      const nonIdempotentAdapter: FulfillmentProviderAdapter = {
+        providerName: 'LegacyNonIdempotentProvider',
+        supportsIdempotency: false,
+        isConfigured: () => true,
+        requestFulfillment: async () => {
+          unsafeCalls++;
+          return { handledAutomatically: true, status: 'completed', details: 'Done' };
+        },
+      };
+      FulfillmentService.setAdapter(nonIdempotentAdapter);
+
+      const order2 = await OrderService.createOrder({
+        telegramUser: buyer1,
         productId: 'gift_star_box',
         quantity: 1,
       });
-      createdOrderIds.add(order.orderId);
-
-      const chargeId = `chg_recovery_${Date.now()}`;
-      createdPaymentIds.add(PaymentService.getPaymentDocId(chargeId));
-
-      // Шаг 1: Транзакция оплаты успешно фиксируется в Firestore
-      const paymentRes = await PaymentService.processSuccessfulPayment({
-        telegramUserId: testTgId1,
-        invoicePayload: order.orderId,
+      await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order2.orderId,
         currency: 'XTR',
-        totalAmount: order.totalPrice,
-        telegramPaymentChargeId: chargeId,
+        totalAmount: order2.totalPrice,
+        telegramPaymentChargeId: 'chg_f03_quarantine',
       });
-      assert.equal(paymentRes.alreadyProcessed, false);
-      assert.equal(paymentRes.order.paymentStatus, 'paid');
-      assert.equal(paymentRes.order.fulfillmentStatus, 'paid');
+      await firestoreRepo.updateDoc<Order>('orders', order2.orderId, {
+        fulfillmentStatus: 'processing',
+        fulfillmentStartedAt: pastIso,
+        fulfillmentAttempts: 1,
+        externalExecutionReference: undefined,
+      });
 
-      // Шаг 2: Имитируем сбой в адаптере выдачи ДО перевода заказа в processing
-      const failingAdapter: FulfillmentProviderAdapter = {
-        providerName: 'SimulatedFailingAdapter',
+      await FulfillmentService.recoverPendingFulfillments(bot);
+      const quarantinedOrder = await OrderService.getOrderById(order2.orderId);
+      assert.equal(unsafeCalls, 0, 'Неидемпотентный адаптер НЕ должен вызываться повторно после крэша');
+      assert.equal(quarantinedOrder?.fulfillmentStatus, 'failed');
+      assert.equal(quarantinedOrder?.needsManualReconciliation, true);
+
+      FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+      return 'Сверка checkExternalStatus восстановила выполненный заказ, а неидемпотентный заказ без сверки переведён в карантин ручной проверки (unsafeCalls=0).';
+    },
+  );
+
+  await runTest(
+    'F-04',
+    'Fulfillment',
+    'Восстановление зависшего заказа и ограничение числа попыток (MAX_FULFILLMENT_ATTEMPTS=3)',
+    async () => {
+      let attemptsMade = 0;
+      const alwaysFailingAdapter: FulfillmentProviderAdapter = {
+        providerName: 'AlwaysFailingAdapter',
+        supportsIdempotency: true,
         isConfigured: () => true,
         requestFulfillment: async () => {
-          throw new Error('Simulated transient fulfillment outage');
+          attemptsMade++;
+          throw new Error(`Provider timeout on attempt #${attemptsMade}`);
         },
       };
+      FulfillmentService.setAdapter(alwaysFailingAdapter);
 
-      FulfillmentService.setAdapter(failingAdapter);
-      const sentNotifications: Array<{ chatId: number | string; text: string }> = [];
-      const mockBot = createMockBot(sentNotifications);
-
-      let fulfillmentFailed = false;
-      try {
-        await FulfillmentService.initiateFulfillment(paymentRes.order, mockBot);
-      } catch {
-        fulfillmentFailed = true;
-      }
-      assert.equal(fulfillmentFailed, true, 'Ожидался сбой выдачи при неисправном адаптере');
-
-      // Восстанавливаем штатный адаптер
-      FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
-
-      // Проверяем, что заказ остался в статусе paid / paid (не потерян, но выдача не завершена)
-      const stuckOrder = await OrderService.getOrderById(order.orderId);
-      assert.equal(stuckOrder?.paymentStatus, 'paid');
-      assert.equal(stuckOrder?.fulfillmentStatus, 'paid');
-
-      const userBeforeRetry = await UserService.getUserById(testUserId1);
-
-      // Шаг 3: Повторная доставка апдейта successful_payment (или вызов восстановления)
-      const retryRes = await PaymentService.processSuccessfulPayment({
-        telegramUserId: testTgId1,
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
         invoicePayload: order.orderId,
         currency: 'XTR',
         totalAmount: order.totalPrice,
-        telegramPaymentChargeId: chargeId,
+        telegramPaymentChargeId: 'chg_f04_retries',
       });
 
-      assert.equal(retryRes.alreadyProcessed, true, 'Оплата уже была зафиксирована');
-      assert.equal(
-        retryRes.needsFulfillmentRecovery,
-        true,
-        'Флаг needsFulfillmentRecovery обязан сигнализировать о необходимости довыполнить выдачу',
-      );
+      const bot = createMockBot([]);
 
-      // Восстанавливаем выдачу через initiateFulfillment (как это делает paymentHandler)
-      const recoveredOrder = await FulfillmentService.initiateFulfillment(
-        retryRes.order,
-        mockBot,
-      );
-      assert.equal(
-        recoveredOrder.fulfillmentStatus,
-        'processing',
-        'После восстановления заказ должен перейти в статус processing',
-      );
-
-      const userAfterRetry = await UserService.getUserById(testUserId1);
-      assert.equal(
-        userAfterRetry?.totalOrders,
-        userBeforeRetry?.totalOrders,
-        'Восстановление выдачи НЕ должно повторно инкрементировать статистику покупок',
-      );
-
-      // Шаг 4: Ещё один повторный вызов — теперь needsFulfillmentRecovery === false
-      const thirdRes = await PaymentService.processSuccessfulPayment({
-        telegramUserId: testTgId1,
-        invoicePayload: order.orderId,
-        currency: 'XTR',
-        totalAmount: order.totalPrice,
-        telegramPaymentChargeId: chargeId,
-      });
-      assert.equal(thirdRes.alreadyProcessed, true);
-      assert.equal(thirdRes.needsFulfillmentRecovery, false);
-
-      results.push({
-        name: 'HIGH-01.3: Восстановление после частичного сбоя между фиксацией оплаты и выдачей',
-        passed: true,
-        details: `При сбое адаптера после коммита оплаты повторный вызов определил needsFulfillmentRecovery=true и довёл заказ #${order.orderId} до processing без двойного списания.`,
-      });
-    }
-
-    // -------------------------------------------------------------------------
-    // TEST 4: Серверные запросы Firestore (where, orderBy, limit, offset) — HIGH-02
-    // -------------------------------------------------------------------------
-    {
-      const activeStars = await ProductService.getProductsByCategory('stars', false, 10, 0);
-      assert.ok(activeStars.length > 0, 'Категория stars должна содержать активные товары');
-      for (let i = 0; i < activeStars.length; i++) {
-        assert.equal(activeStars[i].category, 'stars');
-        assert.equal(activeStars[i].isActive, true);
-        if (i > 0) {
-          assert.ok(
-            activeStars[i].price >= activeStars[i - 1].price,
-            'Товары должны быть отсортированы по цене по возрастанию',
-          );
-        }
-      }
-
-      const userOrdersPage1 = await OrderService.getUserOrders(testTgId1, 2, 0);
-      const userOrdersPage2 = await OrderService.getUserOrders(testTgId1, 2, 2);
-      assert.equal(userOrdersPage1.length, 2, 'Первая страница заказов пользователя (limit=2) должна вернуть 2 заказа');
-      assert.equal(userOrdersPage2.length, 1, 'Вторая страница заказов пользователя (offset=2) должна вернуть 1 заказ');
-      assert.notEqual(userOrdersPage1[0].orderId, userOrdersPage2[0].orderId);
-
-      const processingOrders = await OrderService.getAllOrders('processing', 20, 0);
-      assert.ok(
-        processingOrders.some((o) => createdOrderIds.has(o.orderId)),
-        'Фильтр getAllOrders("processing") должен находить тестовые заказы в обработке',
-      );
-
-      const paymentsPage = await PaymentService.getAllPayments(10, 0);
-      assert.ok(paymentsPage.length >= 3, 'getAllPayments должен возвращать созданные платежи');
-
-      results.push({
-        name: 'HIGH-02: Серверные запросы Firestore (where, orderBy, limit, offset) и пагинация',
-        passed: true,
-        details: `Проверены серверная фильтрация, сортировка и пагинация для products (${activeStars.length}), orders (page1=${userOrdersPage1.length}, page2=${userOrdersPage2.length}) и payments (${paymentsPage.length}).`,
-      });
-    }
-
-    // -------------------------------------------------------------------------
-    // TEST 5: Проброс ошибок записи и транзакций Firestore — MEDIUM-01
-    // -------------------------------------------------------------------------
-    {
-      let caughtRollbackError = false;
-      try {
-        await firestoreRepo.runTransaction(async (tx) => {
-          const existingUser = await tx.get<StoreUser>('users', testUserId1);
-          assert.ok(existingUser);
-          tx.set<StoreUser>('users', testUserId1, {
-            ...existingUser,
-            totalOrders: 999999,
-          });
-          throw new Error('Simulated transaction write failure (MEDIUM-01 test)');
+      // Попытка 1, 2, 3
+      for (let i = 1; i <= 3; i++) {
+        await assert.rejects(async () => {
+          await FulfillmentService.initiateFulfillment(paid.order, bot);
         });
-      } catch (err) {
-        caughtRollbackError =
-          err instanceof Error && err.message.includes('Simulated transaction write failure');
       }
 
-      assert.equal(
-        caughtRollbackError,
-        true,
-        'Ошибка внутри транзакции Firestore обязана пробрасываться вызывающему коду (не проглатываться)',
-      );
+      const after3 = await OrderService.getOrderById(order.orderId);
+      assert.equal(after3?.fulfillmentAttempts, 3);
+      assert.equal(after3?.fulfillmentStatus, 'failed');
+      assert.equal(after3?.needsManualReconciliation, true);
 
-      const userAfterRollback = await UserService.getUserById(testUserId1);
-      assert.notEqual(
-        userAfterRollback?.totalOrders,
-        999999,
-        'При выбросе ошибки транзакция обязана откатить изменения',
-      );
+      // 4-й вызов не вызывает внешний адаптер, оставляя заказ в failed
+      const fourth = await FulfillmentService.initiateFulfillment(after3!, bot);
+      assert.equal(attemptsMade, 3);
+      assert.equal(fourth.fulfillmentStatus, 'failed');
 
-      results.push({
-        name: 'MEDIUM-01: Корректная обработка, откат и проброс ошибок записи Firestore',
-        passed: true,
-        details: 'Ошибка внутри транзакции корректно перехвачена вызывающим кодом, несохранённые изменения (totalOrders=999999) полностью откатились.',
+      FulfillmentService.setAdapter(new ManualAdminFulfillmentAdapter());
+      return `После ${attemptsMade} неудачных попыток заказ переведён в финальный статус failed (needsManualReconciliation=true) и не застревает в processing.`;
+    },
+  );
+
+  await runTest(
+    'F-05',
+    'Fulfillment',
+    'Ошибка уведомления Telegram не отменяет подтверждённую оплату или успешную выдачу',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
       });
-    }
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order.orderId,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        telegramPaymentChargeId: 'chg_f05_notify_fail',
+      });
 
-    // -------------------------------------------------------------------------
-    // TEST 6: Защита .data/ в .gitignore и отсутствие локального зеркала при активном Cloud Firestore — MEDIUM-SEC-01
-    // -------------------------------------------------------------------------
-    {
-      const gitignoreContent = fs.readFileSync(
+      const failingBot = createMockBot([], true); // Telegram API бросает 502
+
+      const inProcessing = await FulfillmentService.initiateFulfillment(
+        paid.order,
+        failingBot,
+      );
+      assert.equal(inProcessing.paymentStatus, 'paid');
+      assert.equal(inProcessing.fulfillmentStatus, 'processing');
+      assert.equal(inProcessing.adminNotifiedAt, undefined);
+
+      const completed = await FulfillmentService.completeOrder({
+        orderId: order.orderId,
+        adminNote: 'Код активации: STARS-999-XYZ',
+        adminTelegramId: 777000111,
+        bot: failingBot,
+      });
+      assert.equal(completed.paymentStatus, 'completed');
+      assert.equal(completed.fulfillmentStatus, 'completed');
+      assert.equal(completed.buyerNotifiedAt, undefined);
+      return 'При падении Telegram API оплата и выдача сохранены в БД (completed), флаги уведомлений ждут повторной отправки.';
+    },
+  );
+
+  await runTest(
+    'F-06',
+    'Fulfillment',
+    'Повторная отправка уведомления после восстановления связи (retryOrderNotifications)',
+    async () => {
+      const orders = await OrderService.getUserOrders(buyer1.id);
+      const unnotifiedCompleted = orders.find(
+        (o) => o.fulfillmentStatus === 'completed' && !o.buyerNotifiedAt,
+      );
+      assert.ok(unnotifiedCompleted);
+
+      const deliveredMessages: Array<{ chatId: number | string; text: string }> = [];
+      const workingBot = createMockBot(deliveredMessages, false);
+
+      const retryRes = await FulfillmentService.retryOrderNotifications(
+        unnotifiedCompleted.orderId,
+        workingBot,
+      );
+
+      assert.equal(retryRes.adminNotified, true);
+      assert.equal(retryRes.buyerNotified, true);
+      assert.ok(
+        deliveredMessages.some((m) => m.text.includes('STARS-999-XYZ')),
+        'Покупатель должен получить код активации в повторном уведомлении',
+      );
+      return `Уведомления админу и покупателю успешно доставлены при повторе (сообщение содержит код активации).`;
+    },
+  );
+
+  await runTest(
+    'F-07',
+    'Fulfillment',
+    'Защита от двойной выдачи при повторном запуске recovery и completeOrder',
+    async () => {
+      const orders = await OrderService.getUserOrders(buyer1.id);
+      const completedOrder = orders.find((o) => o.fulfillmentStatus === 'completed')!;
+
+      const messages: Array<{ chatId: number | string; text: string }> = [];
+      const bot = createMockBot(messages);
+
+      // Повторный вызов completeOrder и recoverPendingFulfillments
+      const again = await FulfillmentService.completeOrder({
+        orderId: completedOrder.orderId,
+        adminNote: 'Повторное нажатие',
+        bot,
+      });
+      await FulfillmentService.recoverPendingFulfillments(bot);
+
+      assert.equal(again.fulfillmentStatus, 'completed');
+      assert.equal(
+        messages.length,
+        0,
+        'Повторный вызов для уже уведомлённого и выданного заказа не отправляет дублирующих сообщений',
+      );
+      return 'Повторный completeOrder и recoverPendingFulfillments не приводят к повторной выдаче или дублированию сообщений.';
+    },
+  );
+
+  // ===========================================================================
+  // 3. SECURITY TESTS
+  // ===========================================================================
+  await runTest(
+    'S-01',
+    'Security',
+    'Отсутствие WEBHOOK_SECRET блокирует webhook-запуск и запросы',
+    async () => {
+      const prevMode = process.env.BOT_MODE;
+      const prevSecret = process.env.WEBHOOK_SECRET;
+      const prevUrl = process.env.WEBHOOK_URL;
+
+      try {
+        process.env.BOT_MODE = 'webhook';
+        process.env.WEBHOOK_URL = 'https://example.run.app';
+        process.env.WEBHOOK_SECRET = '';
+
+        await assert.rejects(
+          async () => {
+            await botManager.start();
+          },
+          /WEBHOOK_SECRET обязательна/,
+        );
+
+        const { res, getStatus } = createMockExpressRes();
+        const req = {
+          header: () => undefined,
+          body: { update_id: 1001 },
+        } as unknown as Request;
+
+        await botManager.handleWebhookRequest(req, res);
+        assert.equal(getStatus(), 503);
+      } finally {
+        process.env.BOT_MODE = prevMode;
+        process.env.WEBHOOK_SECRET = prevSecret;
+        process.env.WEBHOOK_URL = prevUrl;
+      }
+      return 'Запуск в режиме webhook без WEBHOOK_SECRET завершается с ошибкой конфигурации, запросы отклоняются с кодом 503.';
+    },
+  );
+
+  await runTest(
+    'S-02',
+    'Security',
+    'Отклонение запросов с неправильным X-Telegram-Bot-Api-Secret-Token и поддельных updates',
+    async () => {
+      const prevSecret = process.env.WEBHOOK_SECRET;
+      try {
+        process.env.WEBHOOK_SECRET = 'super_secret_webhook_token_123456';
+
+        assert.equal(
+          verifyWebhookSecretToken('super_secret_webhook_token_123456', 'wrong_token'),
+          false,
+        );
+        assert.equal(
+          verifyWebhookSecretToken(
+            'super_secret_webhook_token_123456',
+            'super_secret_webhook_token_123456',
+          ),
+          true,
+        );
+        assert.equal(isValidTelegramUpdatePayload({ foo: 'bar' }), false);
+        assert.equal(isValidTelegramUpdatePayload({ update_id: 42 }), true);
+
+        const { res, getStatus } = createMockExpressRes();
+        const forgedReq = {
+          header: (name: string) =>
+            name === 'X-Telegram-Bot-Api-Secret-Token' ? 'forged_token' : undefined,
+          body: {
+            update_id: 9999,
+            message: {
+              successful_payment: {
+                currency: 'XTR',
+                total_amount: 10,
+                invoice_payload: 'ord_forged',
+                telegram_payment_charge_id: 'chg_forged',
+              },
+            },
+          },
+        } as unknown as Request;
+
+        await botManager.handleWebhookRequest(forgedReq, res);
+        assert.equal(getStatus(), 401);
+      } finally {
+        process.env.WEBHOOK_SECRET = prevSecret;
+      }
+      return 'Запрос с неверным X-Telegram-Bot-Api-Secret-Token отклонён со статусом 401 Unauthorized до вызова handleUpdate.';
+    },
+  );
+
+  await runTest(
+    'S-03',
+    'Security',
+    'Блокировка неавторизованного admin callback (ensureAdmin)',
+    async () => {
+      let alertShown = '';
+      const fakeAdminCtx = {
+        from: { id: 999888777, first_name: 'Hacker' },
+        callbackQuery: { id: 'cb_1', data: 'adm:orders:all' },
+        answerCbQuery: async (text: string) => {
+          alertShown = text;
+          return true;
+        },
+      } as unknown as Context;
+
+      const allowed = await ensureAdmin(fakeAdminCtx);
+      assert.equal(allowed, false);
+      assert.ok(alertShown.includes('только администраторам'));
+      return 'Неавторизованный callback к админ-панели заблокирован (allowed=false).';
+    },
+  );
+
+  await runTest(
+    'S-04',
+    'Security',
+    'Защита от доступа к чужому заказу в pre_checkout и карточке заказа',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      const preCheckoutOtherUser = await PaymentService.validatePreCheckout({
+        invoicePayload: order.orderId,
+        telegramUserId: buyer2.id,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+      });
+      assert.equal(preCheckoutOtherUser.ok, false);
+      assert.ok(
+        preCheckoutOtherUser.errorMessage?.includes('принадлежит другому пользователю'),
+      );
+      return 'Доступ чужого пользователя к заказу отклонён.';
+    },
+  );
+
+  // ===========================================================================
+  // 4. DATABASE TESTS
+  // ===========================================================================
+  await runTest(
+    'D-01',
+    'Database',
+    'Fail-safe при недоступности Firebase: запрет создания заказов и обработки платежей',
+    async () => {
+      firestoreRepo.setSimulatedFailure({ unavailable: true });
+      try {
+        await assert.rejects(
+          async () => {
+            await OrderService.createOrder({
+              telegramUser: buyer1,
+              productId: 'stars_pack_50',
+              quantity: 1,
+            });
+          },
+          (err: unknown) => err instanceof StorageUnavailableError,
+        );
+
+        const preCheck = await PaymentService.validatePreCheckout({
+          invoicePayload: 'ord_any',
+          telegramUserId: buyer1.id,
+          currency: 'XTR',
+          totalAmount: 10,
+        });
+        assert.equal(preCheck.ok, false);
+        assert.ok(preCheck.errorMessage?.includes('временно недоступно'));
+      } finally {
+        firestoreRepo.setSimulatedFailure({});
+      }
+      return 'При недоступности БД выбрасывается StorageUnavailableError, заказы и pre_checkout безопасно блокируются.';
+    },
+  );
+
+  await runTest(
+    'D-02',
+    'Database',
+    'Проброс ошибки чтения Firestore (не проглатывается)',
+    async () => {
+      firestoreRepo.setSimulatedFailure({
+        readError: 'Simulated Firestore UNAVAILABLE on read',
+      });
+      try {
+        await assert.rejects(
+          async () => {
+            await ProductService.getProductById('stars_pack_50');
+          },
+          /Simulated Firestore UNAVAILABLE on read/,
+        );
+      } finally {
+        firestoreRepo.setSimulatedFailure({});
+      }
+      return 'Ошибка чтения Firestore корректно передана вызывающему коду.';
+    },
+  );
+
+  await runTest(
+    'D-03',
+    'Database',
+    'Проброс ошибки записи Firestore (не проглатывается)',
+    async () => {
+      firestoreRepo.setSimulatedFailure({
+        writeError: 'Simulated Firestore PERMISSION_DENIED on write',
+      });
+      try {
+        await assert.rejects(
+          async () => {
+            await ProductService.createProduct({
+              name: 'Test Item',
+              category: 'stars',
+              description: 'Test',
+              price: 15,
+            });
+          },
+          /Simulated Firestore PERMISSION_DENIED on write/,
+        );
+      } finally {
+        firestoreRepo.setSimulatedFailure({});
+      }
+      return 'Ошибка записи Firestore корректно передана вызывающему коду.';
+    },
+  );
+
+  await runTest(
+    'D-04',
+    'Database',
+    'Cursor pagination (startAfter) без дублей и пропусков',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      for (let i = 1; i <= 5; i++) {
+        await OrderService.createOrder({
+          telegramUser: buyer1,
+          productId: 'stars_pack_50',
+          quantity: 1,
+        });
+        await new Promise((r) => setTimeout(r, 5));
+      }
+
+      const page1 = await firestoreRepo.queryDocsPaginated<Order>('orders', {
+        where: [{ field: 'userTelegramId', op: '==', value: buyer1.id }],
+        orderBy: { field: 'createdAt', direction: 'desc' },
+        limit: 2,
+      });
+      assert.equal(page1.items.length, 2);
+      assert.equal(page1.hasMore, true);
+      assert.ok(page1.nextCursor);
+
+      const page2 = await firestoreRepo.queryDocsPaginated<Order>('orders', {
+        where: [{ field: 'userTelegramId', op: '==', value: buyer1.id }],
+        orderBy: { field: 'createdAt', direction: 'desc' },
+        startAfter: page1.nextCursor,
+        limit: 2,
+      });
+      assert.equal(page2.items.length, 2);
+      assert.equal(page2.hasMore, true);
+
+      const page3 = await firestoreRepo.queryDocsPaginated<Order>('orders', {
+        where: [{ field: 'userTelegramId', op: '==', value: buyer1.id }],
+        orderBy: { field: 'createdAt', direction: 'desc' },
+        startAfter: page2.nextCursor,
+        limit: 2,
+      });
+      assert.equal(page3.items.length, 1);
+      assert.equal(page3.hasMore, false);
+
+      const allIds = [
+        ...page1.items.map((o) => o.orderId),
+        ...page2.items.map((o) => o.orderId),
+        ...page3.items.map((o) => o.orderId),
+      ];
+      assert.equal(new Set(allIds).size, 5, 'Все 5 заказов должны быть уникальными без пересечений страниц');
+      return 'Постраничная выборка через курсор startAfter вернула 2 + 2 + 1 = 5 уникальных заказов в правильном порядке.';
+    },
+  );
+
+  await runTest(
+    'D-05',
+    'Database',
+    'Валидация firestore.indexes.json и .gitignore',
+    async () => {
+      const indexesPath = path.resolve(process.cwd(), 'firestore.indexes.json');
+      const indexesRaw = fs.readFileSync(indexesPath, 'utf-8');
+      const parsed = JSON.parse(indexesRaw) as {
+        indexes: Array<{ collectionGroup: string; fields: Array<{ fieldPath: string }> }>;
+      };
+
+      assert.ok(Array.isArray(parsed.indexes));
+      assert.ok(parsed.indexes.length >= 10);
+
+      const gitignore = fs.readFileSync(
         path.resolve(process.cwd(), '.gitignore'),
         'utf-8',
       );
-      assert.ok(
-        gitignoreContent.includes('.data/'),
-        '.gitignore обязан содержать директорию .data/',
-      );
+      assert.ok(gitignore.includes('.data/'));
+      assert.ok(gitignore.includes('.env'));
+      return `Проверено ${parsed.indexes.length} составных индексов в firestore.indexes.json и правила защиты .gitignore.`;
+    },
+  );
 
-      const mirrorPath = path.resolve(process.cwd(), '.data', 'firestore-mirror.json');
-      if (repoStatus.adminSdkConnected) {
-        assert.equal(
-          fs.existsSync(mirrorPath),
-          false,
-          'При активном Cloud Firestore локальный файл .data/firestore-mirror.json должен быть удалён/отключён',
-        );
-      } else if (fs.existsSync(mirrorPath)) {
-        const stat = fs.statSync(mirrorPath);
-        const mode = stat.mode & 0o777;
-        assert.equal(mode, 0o600, 'Права доступа к локальному резервному файлу должны быть 0o600');
-      }
-
-      results.push({
-        name: 'MEDIUM-SEC-01: Исключение .data/ из Git и защита локальных резервных данных',
-        passed: true,
-        details: `.gitignore содержит .data/; при активном Cloud Firestore (${repoStatus.adminSdkConnected}) локальный зеркальный файл отключён и отсутствует.`,
-      });
-    }
-  } finally {
-    await cleanupTransactionsForOrders(Array.from(createdOrderIds));
-    await cleanupTestArtifacts();
+  console.log('\n================================================================');
+  console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
+  for (const r of testResults) {
+    console.log(
+      `✅ [${r.status}] [${r.id}] (${r.category}) ${r.name}\n   └─ Среда: ${r.environment} | Emulator: ${r.emulatorUsed ? 'Да' : 'Нет (Isolated Mock)'}\n   └─ Детали: ${r.details}`,
+    );
   }
-
-  console.log('\n==========================================================');
-  console.log('📊 ИТОГИ АВТОТЕСТОВ ЭТАПА 1:');
-  for (const r of results) {
-    console.log(`✅ [PASS] ${r.name}`);
-    console.log(`   └─ ${r.details}`);
-  }
-  console.log('==========================================================\n');
+  console.log('================================================================\n');
 }
 
-runStage1Tests()
+runFullAuditTestSuite()
   .then(() => {
     process.exit(0);
   })
   .catch((err) => {
-    console.error('❌ ТЕСТЫ ЭТАПА 1 ЗАВЕРШИЛИСЬ С ОШИБКОЙ:', err);
+    console.error('❌ ТЕСТЫ ЗАВЕРШИЛИСЬ С ОШИБКОЙ:', err);
     process.exit(1);
   });

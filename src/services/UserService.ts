@@ -58,16 +58,19 @@ export class UserService {
   }
 
   /**
-   * Server-side ordered and paginated users query (HIGH-02).
+   * Server-side ordered and cursor-paginated users query.
    */
   public static async getAllUsers(
     limit = 100,
-    offset = 0,
+    startAfterCursor?: unknown,
   ): Promise<StoreUser[]> {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
     return firestoreRepo.queryDocs<StoreUser>('users', {
       orderBy: { field: 'createdAt', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
-      offset,
     });
   }
 

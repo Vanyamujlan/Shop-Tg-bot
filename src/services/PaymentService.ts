@@ -1,5 +1,11 @@
 import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
-import { Order, PaymentRecord, StoreTransaction, StoreUser } from '../types.ts';
+import {
+  Order,
+  PaymentRecord,
+  Product,
+  StoreTransaction,
+  StoreUser,
+} from '../types.ts';
 import { OrderService } from './OrderService.ts';
 import { ProductService } from './ProductService.ts';
 import { UserService } from './UserService.ts';
@@ -24,7 +30,7 @@ export class PaymentService {
 
   /**
    * Validates pre_checkout_query within Telegram's strict timeout window.
-   * Ensures order exists, belongs to the buyer, is still pending, and price matches DB.
+   * Ensures storage is healthy, order exists, belongs to the buyer, is still pending, and price matches DB.
    */
   public static async validatePreCheckout(params: {
     invoicePayload: string;
@@ -33,6 +39,8 @@ export class PaymentService {
     totalAmount: number;
   }): Promise<PreCheckoutValidationResult> {
     try {
+      firestoreRepo.assertReadyForOrdersAndPayments();
+
       if (params.currency !== 'XTR') {
         return {
           ok: false,
@@ -104,16 +112,12 @@ export class PaymentService {
   }
 
   /**
-   * Processes successful_payment atomically inside a single Firestore transaction (HIGH-01):
-   * 1. Checks duplicate payment by paymentId / telegramPaymentChargeId
-   * 2. Writes PaymentRecord
-   * 3. Updates Order status to 'paid'
-   * 4. Updates StoreUser purchase statistics (totalOrders, totalSpentStars)
-   * 5. Writes 'payment_received' audit transaction
-   *
-   * Also returns `needsFulfillmentRecovery: true` if a previous attempt committed the
-   * payment transaction but crashed before FulfillmentService moved `fulfillmentStatus`
-   * from `'paid'` to `'processing'` / `'completed'`.
+   * Processes successful_payment atomically inside a single Firestore transaction:
+   * - All reads execute strictly BEFORE any writes.
+   * - Validates telegram_payment_charge_id, order existence, buyer ownership, amount, currency (XTR),
+   *   product correspondence, and order status.
+   * - Prevents duplicate payments on repeated or concurrent updates.
+   * - Performs zero external network side-effects inside the transaction.
    */
   public static async processSuccessfulPayment(params: {
     telegramUserId: number;
@@ -123,7 +127,13 @@ export class PaymentService {
     telegramPaymentChargeId: string;
     providerPaymentChargeId?: string;
   }): Promise<ProcessSuccessfulPaymentResult> {
-    if (!params.telegramPaymentChargeId) {
+    firestoreRepo.assertReadyForOrdersAndPayments();
+
+    if (
+      !params.telegramPaymentChargeId ||
+      typeof params.telegramPaymentChargeId !== 'string' ||
+      !params.telegramPaymentChargeId.trim()
+    ) {
       throw new Error('Отсутствует telegram_payment_charge_id в платеже.');
     }
 
@@ -131,10 +141,19 @@ export class PaymentService {
       throw new Error(`Неподдерживаемая валюта платежа: ${params.currency}`);
     }
 
+    if (
+      !Number.isInteger(params.totalAmount) ||
+      params.totalAmount <= 0
+    ) {
+      throw new Error(`Некорректная сумма платежа: ${params.totalAmount}`);
+    }
+
     const paymentId = this.getPaymentDocId(params.telegramPaymentChargeId);
 
     return firestoreRepo.runTransaction<ProcessSuccessfulPaymentResult>(async (tx) => {
-      // --- ALL READS FIRST (Firestore transaction requirement) ---
+      // =========================================================================
+      // STEP 1: ALL READS FIRST (Firestore transaction requirement)
+      // =========================================================================
       const existingPayment = await tx.get<PaymentRecord>('payments', paymentId);
 
       if (existingPayment) {
@@ -142,10 +161,15 @@ export class PaymentService {
         if (!existingOrder) {
           throw new Error(`Заказ ${existingPayment.orderId} для платежа не найден.`);
         }
+        if (existingOrder.userTelegramId !== params.telegramUserId) {
+          throw new Error('Попытка подтверждения чужого платежа.');
+        }
+
         const needsFulfillmentRecovery =
           existingOrder.paymentStatus === 'paid' &&
           (existingOrder.fulfillmentStatus === 'paid' ||
-            existingOrder.fulfillmentStatus === 'pending');
+            existingOrder.fulfillmentStatus === 'pending' ||
+            existingOrder.fulfillmentStatus === 'failed');
 
         return {
           alreadyProcessed: true,
@@ -164,9 +188,21 @@ export class PaymentService {
         throw new Error('Несовпадение владельца заказа при подтверждении оплаты.');
       }
 
+      if (order.currency !== 'XTR') {
+        throw new Error(`Неверная валюта в заказе: ${order.currency}`);
+      }
+
       if (order.totalPrice !== params.totalAmount) {
         throw new Error(
           `Несовпадение суммы оплаты: ожидалось ${order.totalPrice} XTR, получено ${params.totalAmount} XTR.`,
+        );
+      }
+
+      // Check product correspondence in DB before writes
+      const product = await tx.get<Product>('products', order.productId);
+      if (!product || product.id !== order.productId) {
+        throw new Error(
+          `Товар "${order.productId}" для заказа #${order.orderId} не найден в каталоге.`,
         );
       }
 
@@ -188,7 +224,8 @@ export class PaymentService {
           const needsFulfillmentRecovery =
             order.paymentStatus === 'paid' &&
             (order.fulfillmentStatus === 'paid' ||
-              order.fulfillmentStatus === 'pending');
+              order.fulfillmentStatus === 'pending' ||
+              order.fulfillmentStatus === 'failed');
 
           return {
             alreadyProcessed: true,
@@ -205,7 +242,9 @@ export class PaymentService {
 
       const existingUser = await tx.get<StoreUser>('users', order.userId);
 
-      // --- ATOMIC WRITES ---
+      // =========================================================================
+      // STEP 2: ATOMIC WRITES (Zero reads after this point)
+      // =========================================================================
       const now = new Date().toISOString();
 
       const paymentRecord: PaymentRecord = {
@@ -229,6 +268,9 @@ export class PaymentService {
           order.fulfillmentStatus === 'pending' ? 'paid' : order.fulfillmentStatus,
         telegramPaymentChargeId: params.telegramPaymentChargeId,
         providerPaymentChargeId: params.providerPaymentChargeId || '',
+        fulfillmentAttempts: order.fulfillmentAttempts ?? 0,
+        fulfillmentIdempotencyKey:
+          order.fulfillmentIdempotencyKey || `fulfill_${order.orderId}`,
         paidAt: now,
         updatedAt: now,
       };
@@ -285,14 +327,28 @@ export class PaymentService {
     });
   }
 
-  public static async markPaymentRefunded(orderId: string): Promise<Order | null> {
+  /**
+   * Atomically updates payment, order, and transaction records on refund.
+   */
+  public static async markPaymentRefunded(
+    orderId: string,
+    adminTelegramId?: number,
+  ): Promise<Order | null> {
+    firestoreRepo.assertReadyForOrdersAndPayments();
+
     return firestoreRepo.runTransaction<Order | null>(async (tx) => {
+      // All reads first
       const order = await tx.get<Order>('orders', orderId);
       if (!order || !order.telegramPaymentChargeId) return null;
+
+      if (order.paymentStatus === 'refunded') {
+        return order;
+      }
 
       const paymentId = this.getPaymentDocId(order.telegramPaymentChargeId);
       const existingPayment = await tx.get<PaymentRecord>('payments', paymentId);
 
+      // Atomic writes
       const now = new Date().toISOString();
       if (existingPayment) {
         tx.set<PaymentRecord>('payments', paymentId, {
@@ -300,14 +356,33 @@ export class PaymentService {
           status: 'refunded',
           refundedAt: now,
         });
+      } else {
+        tx.set<PaymentRecord>('payments', paymentId, {
+          paymentId,
+          telegramPaymentChargeId: order.telegramPaymentChargeId,
+          providerPaymentChargeId: order.providerPaymentChargeId || '',
+          orderId: order.orderId,
+          userId: order.userId,
+          userTelegramId: order.userTelegramId,
+          totalAmount: order.totalPrice,
+          currency: 'XTR',
+          invoicePayload: order.orderId,
+          status: 'refunded',
+          createdAt: order.paidAt || now,
+          refundedAt: now,
+        });
       }
 
+      const adminSuffix = adminTelegramId ? ` (админ ID: ${adminTelegramId})` : '';
       const updatedOrder: Order = {
         ...order,
         paymentStatus: 'refunded',
         fulfillmentStatus: 'refunded',
         fulfillmentNote:
-          'Выполнен официальный возврат Telegram Stars (refundStarPayment).',
+          `Выполнен официальный возврат Telegram Stars (refundStarPayment)${adminSuffix}.`.slice(
+            0,
+            500,
+          ),
         updatedAt: now,
       };
 
@@ -323,10 +398,11 @@ export class PaymentService {
         type: 'payment_refunded',
         amount: order.totalPrice,
         currency: 'XTR',
-        details: `Возврат ${order.totalPrice} XTR (charge_id: ${order.telegramPaymentChargeId})`.slice(
-          0,
-          500,
-        ),
+        details:
+          `Возврат ${order.totalPrice} XTR (charge_id: ${order.telegramPaymentChargeId})${adminSuffix}`.slice(
+            0,
+            500,
+          ),
         createdAt: now,
       });
 
@@ -335,16 +411,19 @@ export class PaymentService {
   }
 
   /**
-   * Server-side ordered and paginated payments query (HIGH-02).
+   * Server-side ordered and cursor-paginated payments query.
    */
   public static async getAllPayments(
     limit = 100,
-    offset = 0,
+    startAfterCursor?: unknown,
   ): Promise<PaymentRecord[]> {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
     return firestoreRepo.queryDocs<PaymentRecord>('payments', {
       orderBy: { field: 'createdAt', direction: 'desc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
-      offset,
     });
   }
 }

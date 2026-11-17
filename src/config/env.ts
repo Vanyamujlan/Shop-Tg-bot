@@ -57,6 +57,8 @@ export function cleanEnvValue(key: string, raw: string | undefined): string {
 
 export interface AppConfig {
   port: number;
+  nodeEnv: 'development' | 'production' | 'test';
+  allowLocalFallback: boolean;
   telegramBotToken: string;
   botMode: 'polling' | 'webhook';
   webhookUrl: string;
@@ -108,8 +110,25 @@ function resolveFirebaseProjectId(
 }
 
 export function getEnvConfig(): AppConfig {
-  dotenv.config({ override: true, quiet: true });
+  if (process.env.NODE_ENV !== 'test') {
+    dotenv.config({ quiet: true });
+  }
   const appletConfig = loadAppletFirebaseConfig();
+
+  const rawNodeEnv = cleanEnvValue('NODE_ENV', process.env.NODE_ENV).toLowerCase();
+  const nodeEnv: 'development' | 'production' | 'test' =
+    rawNodeEnv === 'test'
+      ? 'test'
+      : rawNodeEnv === 'development'
+        ? 'development'
+        : 'production';
+
+  const rawAllowFallback = cleanEnvValue(
+    'ALLOW_LOCAL_FALLBACK',
+    process.env.ALLOW_LOCAL_FALLBACK,
+  ).toLowerCase();
+  const allowLocalFallback =
+    nodeEnv === 'test' || rawAllowFallback === 'true' || rawAllowFallback === '1';
 
   const botModeCleaned = cleanEnvValue('BOT_MODE', process.env.BOT_MODE).toLowerCase();
   const botMode: 'polling' | 'webhook' =
@@ -137,6 +156,8 @@ export function getEnvConfig(): AppConfig {
 
   return {
     port: Number(process.env.PORT || 3000),
+    nodeEnv,
+    allowLocalFallback,
     telegramBotToken: cleanEnvValue(
       'TELEGRAM_BOT_TOKEN',
       process.env.TELEGRAM_BOT_TOKEN,

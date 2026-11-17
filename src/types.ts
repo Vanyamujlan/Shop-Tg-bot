@@ -81,6 +81,15 @@ export interface Order {
   telegramPaymentChargeId?: string;
   providerPaymentChargeId?: string;
   fulfillmentNote?: string;
+  fulfillmentStartedAt?: string;
+  fulfillmentAttempts?: number;
+  fulfillmentLastError?: string;
+  fulfillmentNextRetryAt?: string;
+  fulfillmentIdempotencyKey?: string;
+  externalExecutionReference?: string;
+  needsManualReconciliation?: boolean;
+  adminNotifiedAt?: string;
+  buyerNotifiedAt?: string;
   createdAt: string;
   paidAt?: string;
   completedAt?: string;
@@ -107,8 +116,11 @@ export type TransactionType =
   | 'pre_checkout_ok'
   | 'payment_received'
   | 'fulfillment_completed'
+  | 'fulfillment_failed'
+  | 'fulfillment_retry'
   | 'order_cancelled'
   | 'payment_refunded'
+  | 'admin_action'
   | 'error';
 
 export interface StoreTransaction {

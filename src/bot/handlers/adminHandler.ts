@@ -38,8 +38,47 @@ import {
 } from './userHandler.ts';
 
 const adminSessions = new Map<number, AdminInteractiveSession>();
+const ADMIN_SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const MAX_ADMIN_SESSIONS = 200;
 
-async function ensureAdmin(ctx: Context): Promise<boolean> {
+function pruneAdminSessions(now = Date.now()): void {
+  for (const [adminId, session] of adminSessions.entries()) {
+    if (now - session.createdAt > ADMIN_SESSION_TTL_MS) {
+      adminSessions.delete(adminId);
+    }
+  }
+  while (adminSessions.size > MAX_ADMIN_SESSIONS) {
+    const oldestKey = adminSessions.keys().next().value;
+    if (oldestKey === undefined) break;
+    adminSessions.delete(oldestKey);
+  }
+}
+
+export function setAdminSession(
+  adminId: number,
+  session: AdminInteractiveSession,
+): void {
+  pruneAdminSessions();
+  adminSessions.set(adminId, session);
+}
+
+export function getAdminSession(
+  adminId: number,
+): AdminInteractiveSession | undefined {
+  const session = adminSessions.get(adminId);
+  if (!session) return undefined;
+  if (Date.now() - session.createdAt > ADMIN_SESSION_TTL_MS) {
+    adminSessions.delete(adminId);
+    return undefined;
+  }
+  return session;
+}
+
+export function clearAdminSession(adminId: number): void {
+  adminSessions.delete(adminId);
+}
+
+export async function ensureAdmin(ctx: Context): Promise<boolean> {
   const telegramId = ctx.from?.id;
   const isAdmin = await UserService.isAdmin(telegramId);
   if (!isAdmin) {
@@ -57,6 +96,28 @@ async function ensureAdmin(ctx: Context): Promise<boolean> {
   return true;
 }
 
+async function logAdminAudit(
+  adminTelegramId: number,
+  orderId: string,
+  amount: number,
+  details: string,
+): Promise<void> {
+  try {
+    await OrderService.logTransaction({
+      orderId,
+      userId: `tg_${adminTelegramId}`,
+      type: 'admin_action',
+      amount,
+      details: `[Админ ${adminTelegramId}] ${details}`,
+    });
+  } catch (error) {
+    console.warn(
+      '[AdminHandler] Не удалось записать аудит действия админа:',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
 export function registerAdminHandlers(
   bot: Telegraf,
   getBotStatus: () => BotConnectionStatus,
@@ -64,7 +125,7 @@ export function registerAdminHandlers(
   // Команда /admin
   bot.command('admin', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    adminSessions.delete(ctx.from!.id);
+    clearAdminSession(ctx.from!.id);
     await safeRespondOrEdit(
       ctx,
       [
@@ -79,7 +140,8 @@ export function registerAdminHandlers(
   // Главная страница админ-панели
   bot.action('adm:home', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    adminSessions.delete(ctx.from!.id);
+    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:home')) return;
+    clearAdminSession(ctx.from!.id);
     await safeRespondOrEdit(
       ctx,
       [
@@ -98,10 +160,10 @@ export function registerAdminHandlers(
 
     const [users, orders, products, payments, recentTransactions] =
       await Promise.all([
-        UserService.getAllUsers(),
-        OrderService.getAllOrders(),
-        ProductService.getAllProducts(true),
-        PaymentService.getAllPayments(),
+        UserService.getAllUsers(200),
+        OrderService.getAllOrders(undefined, 200),
+        ProductService.getAllProducts(true, 200),
+        PaymentService.getAllPayments(200),
         OrderService.getRecentTransactions(6),
       ]);
 
@@ -133,13 +195,15 @@ export function registerAdminHandlers(
   });
 
   // 2. Список заказов (с фильтрацией)
-  bot.action(/^adm:orders:(all|paid|processing|completed)$/, async (ctx) => {
+  bot.action(/^adm:orders:(all|paid|processing|completed|failed)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const filterRaw = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:orders:${filterRaw}`)) return;
+
     const filter =
       filterRaw === 'all' ? undefined : (filterRaw as OrderStatus);
 
-    const orders = await OrderService.getAllOrders(filter);
+    const orders = await OrderService.getAllOrders(filter, 50);
     const header =
       orders.length === 0
         ? `📦 <b>Управление заказами (${filterRaw})</b>\n\nЗаказов по выбранному фильтру пока нет.`
@@ -152,9 +216,11 @@ export function registerAdminHandlers(
   bot.action(/^adm:ord:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord:${orderId}`)) return;
+
     const order = await OrderService.getOrderById(orderId);
     if (!order) {
-      await ctx.answerCbQuery('Заказ не найден.', { show_alert: true });
+      await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
       return;
     }
 
@@ -169,16 +235,27 @@ export function registerAdminHandlers(
   bot.action(/^adm:ord_proc:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_proc:${orderId}`, 1500)) {
+      return;
+    }
+
     const updated = await OrderService.updateOrderStatus({
       orderId,
       fulfillmentStatus: 'processing',
       fulfillmentNote: 'Администратор взял заказ в обработку.',
     });
     if (!updated) {
-      await ctx.answerCbQuery('Заказ не найден.', { show_alert: true });
+      await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
       return;
     }
-    await ctx.answerCbQuery('Статус изменён на «В обработке»');
+
+    await logAdminAudit(
+      ctx.from!.id,
+      orderId,
+      updated.totalPrice,
+      'Взял заказ в обработку (processing)',
+    );
+    await safeAnswerCbQuery(ctx, 'Статус изменён на «В обработке»');
     await safeRespondOrEdit(
       ctx,
       formatAdminOrderCard(updated),
@@ -186,19 +263,26 @@ export function registerAdminHandlers(
     );
   });
 
-  // Подтвердить выдачу заказа (completed) + уведомить покупателя
+  // Быстрое подтверждение выдачи заказа (completed) + уведомление покупателя
   bot.action(/^adm:ord_done:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_done:${orderId}`, 2000)) {
+      return;
+    }
 
     try {
       const completed = await FulfillmentService.completeOrder({
         orderId,
         adminNote: 'Товар выдан администратором. Приятного пользования!',
+        adminTelegramId: ctx.from!.id,
         bot,
       });
 
-      await ctx.answerCbQuery('Заказ отмечен как выполненный, покупатель уведомлён!');
+      await safeAnswerCbQuery(
+        ctx,
+        'Заказ отмечен как выполненный, покупатель уведомлён!',
+      );
       await safeRespondOrEdit(
         ctx,
         formatAdminOrderCard(completed),
@@ -206,7 +290,74 @@ export function registerAdminHandlers(
       );
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      await ctx.answerCbQuery(msg.slice(0, 180), { show_alert: true });
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
+  });
+
+  // Выдача заказа с персональным сообщением, ссылкой или кодом активации
+  bot.action(/^adm:ord_note:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_note:${orderId}`)) {
+      return;
+    }
+
+    const order = await OrderService.getOrderById(orderId);
+    if (!order) {
+      await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
+      return;
+    }
+
+    setAdminSession(ctx.from!.id, {
+      action: 'complete_order_note',
+      targetId: orderId,
+      createdAt: Date.now(),
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      [
+        `📝 <b>Выдача заказа #${escapeHtml(order.orderId)} с кодом или сообщением</b>`,
+        `Товар: <b>${escapeHtml(order.productName)}</b>`,
+        `Покупатель: <code>${order.userTelegramId}</code>`,
+        '',
+        'Отправьте в чат текст, ссылку или код активации — он будет сохранён в заказе и сразу отправлен покупателю вместе с уведомлением о выполнении заказа:',
+      ].join('\n'),
+      Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Отмена', `adm:ord:${order.orderId}`)],
+      ]),
+    );
+  });
+
+  // Повторная отправка уведомлений по заказу (админу и покупателю)
+  bot.action(/^adm:ord_notify:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_notify:${orderId}`, 1500)) {
+      return;
+    }
+
+    try {
+      const res = await FulfillmentService.retryOrderNotifications(orderId, bot);
+      await logAdminAudit(
+        ctx.from!.id,
+        orderId,
+        res.order.totalPrice,
+        'Повторная отправка уведомлений по заказу',
+      );
+      await safeAnswerCbQuery(
+        ctx,
+        `Уведомления отправлены (админ: ${res.adminNotified ? 'да' : 'нет'}, покупатель: ${res.buyerNotified ? 'да' : 'нет'})`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(res.order),
+        buildAdminOrderActionKeyboard(res.order),
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
     }
   });
 
@@ -214,20 +365,27 @@ export function registerAdminHandlers(
   bot.action(/^adm:ord_refund:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_refund:${orderId}`, 2500)) {
+      return;
+    }
+
     const order = await OrderService.getOrderById(orderId);
 
     if (!order || !order.telegramPaymentChargeId) {
-      await ctx.answerCbQuery(
+      await safeAnswerCbQuery(
+        ctx,
         'У заказа отсутствует telegram_payment_charge_id для возврата.',
-        { show_alert: true },
+        true,
       );
       return;
     }
 
     if (order.paymentStatus === 'refunded') {
-      await ctx.answerCbQuery('По этому заказу уже выполнен возврат.', {
-        show_alert: true,
-      });
+      await safeAnswerCbQuery(
+        ctx,
+        'По этому заказу уже выполнен возврат.',
+        true,
+      );
       return;
     }
 
@@ -241,7 +399,10 @@ export function registerAdminHandlers(
         telegram_payment_charge_id: order.telegramPaymentChargeId,
       });
 
-      const refundedOrder = await PaymentService.markPaymentRefunded(order.orderId);
+      const refundedOrder = await PaymentService.markPaymentRefunded(
+        order.orderId,
+        ctx.from!.id,
+      );
 
       // Уведомляем покупателя о возврате
       try {
@@ -254,9 +415,11 @@ export function registerAdminHandlers(
         // Ignore if user blocked the bot
       }
 
-      await ctx.answerCbQuery('Возврат Telegram Stars успешно выполнен!', {
-        show_alert: true,
-      });
+      await safeAnswerCbQuery(
+        ctx,
+        'Возврат Telegram Stars успешно выполнен!',
+        true,
+      );
 
       if (refundedOrder) {
         await safeRespondOrEdit(
@@ -268,9 +431,11 @@ export function registerAdminHandlers(
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error('[AdminHandler] Ошибка refundStarPayment:', msg);
-      await ctx.answerCbQuery(`Ошибка API возврата: ${msg.slice(0, 150)}`, {
-        show_alert: true,
-      });
+      await safeAnswerCbQuery(
+        ctx,
+        `Ошибка API возврата: ${msg.slice(0, 150)}`,
+        true,
+      );
     }
   });
 
@@ -278,13 +443,24 @@ export function registerAdminHandlers(
   bot.action(/^adm:ord_cancel:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_cancel:${orderId}`, 1500)) {
+      return;
+    }
+
     const updated = await OrderService.updateOrderStatus({
       orderId,
       paymentStatus: 'cancelled',
       fulfillmentStatus: 'cancelled',
-      fulfillmentNote: 'Отменён администратором.',
+      fulfillmentNote: `Отменён администратором (ID: ${ctx.from!.id}).`,
     });
     if (!updated) return;
+
+    await logAdminAudit(
+      ctx.from!.id,
+      orderId,
+      updated.totalPrice,
+      'Отменил заказ',
+    );
 
     await safeRespondOrEdit(
       ctx,
@@ -296,7 +472,8 @@ export function registerAdminHandlers(
   // 3. Управление товарами
   bot.action('adm:products', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    adminSessions.delete(ctx.from!.id);
+    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:products')) return;
+    clearAdminSession(ctx.from!.id);
     const products = await ProductService.getAllProducts(true);
     await safeRespondOrEdit(
       ctx,
@@ -316,9 +493,11 @@ export function registerAdminHandlers(
   bot.action(/^adm:prod:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const productId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:prod:${productId}`)) return;
+
     const product = await ProductService.getProductById(productId);
     if (!product) {
-      await ctx.answerCbQuery('Товар не найден.', { show_alert: true });
+      await safeAnswerCbQuery(ctx, 'Товар не найден.', true);
       return;
     }
 
@@ -338,13 +517,25 @@ export function registerAdminHandlers(
   bot.action(/^adm:ptoggle:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const productId = ctx.match[1];
-    const updated = await ProductService.toggleProductActive(productId);
-    if (!updated) {
-      await ctx.answerCbQuery('Товар не найден.', { show_alert: true });
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ptoggle:${productId}`, 1200)) {
       return;
     }
 
-    await ctx.answerCbQuery(
+    const updated = await ProductService.toggleProductActive(productId);
+    if (!updated) {
+      await safeAnswerCbQuery(ctx, 'Товар не найден.', true);
+      return;
+    }
+
+    await logAdminAudit(
+      ctx.from!.id,
+      productId,
+      updated.price,
+      `${updated.isActive ? 'Включил' : 'Отключил'} товар "${updated.name}"`,
+    );
+
+    await safeAnswerCbQuery(
+      ctx,
       updated.isActive ? 'Товар включён в каталоге!' : 'Товар скрыт из каталога.',
     );
     await safeRespondOrEdit(
@@ -363,8 +554,13 @@ export function registerAdminHandlers(
   bot.action(/^adm:pdel:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const productId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:pdel:${productId}`, 2000)) {
+      return;
+    }
+
     await ProductService.deleteProduct(productId);
-    await ctx.answerCbQuery('Товар удалён из каталога.');
+    await logAdminAudit(ctx.from!.id, productId, 0, `Удалил товар ${productId}`);
+    await safeAnswerCbQuery(ctx, 'Товар удалён из каталога.');
     const products = await ProductService.getAllProducts(true);
     await safeRespondOrEdit(
       ctx,
@@ -380,7 +576,7 @@ export function registerAdminHandlers(
     const product = await ProductService.getProductById(productId);
     if (!product) return;
 
-    adminSessions.set(ctx.from!.id, {
+    setAdminSession(ctx.from!.id, {
       action: 'edit_price',
       targetId: productId,
       createdAt: Date.now(),
@@ -407,7 +603,7 @@ export function registerAdminHandlers(
     const product = await ProductService.getProductById(productId);
     if (!product) return;
 
-    adminSessions.set(ctx.from!.id, {
+    setAdminSession(ctx.from!.id, {
       action: 'edit_name',
       targetId: productId,
       createdAt: Date.now(),
@@ -429,7 +625,7 @@ export function registerAdminHandlers(
     const product = await ProductService.getProductById(productId);
     if (!product) return;
 
-    adminSessions.set(ctx.from!.id, {
+    setAdminSession(ctx.from!.id, {
       action: 'edit_description',
       targetId: productId,
       createdAt: Date.now(),
@@ -447,7 +643,7 @@ export function registerAdminHandlers(
   // Добавление нового товара — шаг 1 (выбор категории)
   bot.action('adm:prod_add_start', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    adminSessions.delete(ctx.from!.id);
+    clearAdminSession(ctx.from!.id);
     await safeRespondOrEdit(
       ctx,
       '➕ <b>Добавление нового товара</b>\n\nШаг 1 из 4: Выберите категорию товара:',
@@ -459,7 +655,7 @@ export function registerAdminHandlers(
     if (!(await ensureAdmin(ctx))) return;
     const category = ctx.match[1] as ProductCategory;
 
-    adminSessions.set(ctx.from!.id, {
+    setAdminSession(ctx.from!.id, {
       action: 'add_product_name',
       draftProduct: { category },
       createdAt: Date.now(),
@@ -481,11 +677,12 @@ export function registerAdminHandlers(
   // 4. Управление пользователями и блокировками
   bot.action('adm:users', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    const users = await UserService.getAllUsers();
+    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:users')) return;
+    const users = await UserService.getAllUsers(50);
     await safeRespondOrEdit(
       ctx,
       [
-        `👥 <b>Пользователи магазина (всего: ${users.length})</b>`,
+        `👥 <b>Пользователи магазина (показано: ${users.length})</b>`,
         '',
         'Нажмите на пользователя для просмотра профиля, отправки сообщения или блокировки:',
       ].join('\n'),
@@ -498,7 +695,7 @@ export function registerAdminHandlers(
     const targetTgId = Number(ctx.match[1]);
     const user = await UserService.getUserByTelegramId(targetTgId);
     if (!user) {
-      await ctx.answerCbQuery('Пользователь не найден.', { show_alert: true });
+      await safeAnswerCbQuery(ctx, 'Пользователь не найден.', true);
       return;
     }
     const isTargetAdmin = await UserService.isAdmin(targetTgId);
@@ -512,10 +709,12 @@ export function registerAdminHandlers(
   bot.action(/^adm:ublock:(\d+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const targetTgId = Number(ctx.match[1]);
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ublock:${targetTgId}`, 1500)) {
+      return;
+    }
+
     if (targetTgId === ctx.from!.id) {
-      await ctx.answerCbQuery('Нельзя заблокировать самого себя.', {
-        show_alert: true,
-      });
+      await safeAnswerCbQuery(ctx, 'Нельзя заблокировать самого себя.', true);
       return;
     }
 
@@ -528,7 +727,15 @@ export function registerAdminHandlers(
     );
     if (!updated) return;
 
-    await ctx.answerCbQuery(
+    await logAdminAudit(
+      ctx.from!.id,
+      `user_${targetTgId}`,
+      0,
+      `${updated.isBlocked ? 'Заблокировал' : 'Разблокировал'} пользователя ${targetTgId}`,
+    );
+
+    await safeAnswerCbQuery(
+      ctx,
       updated.isBlocked
         ? 'Пользователь заблокирован.'
         : 'Пользователь разблокирован.',
@@ -545,7 +752,7 @@ export function registerAdminHandlers(
   // 5. Отправка сообщения пользователю
   bot.action('adm:msg_user_start', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    adminSessions.set(ctx.from!.id, {
+    setAdminSession(ctx.from!.id, {
       action: 'message_user',
       createdAt: Date.now(),
     });
@@ -566,7 +773,7 @@ export function registerAdminHandlers(
   bot.action(/^adm:msg_to:(\d+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const targetTgId = ctx.match[1];
-    adminSessions.set(ctx.from!.id, {
+    setAdminSession(ctx.from!.id, {
       action: 'message_user',
       targetId: targetTgId,
       createdAt: Date.now(),
@@ -581,12 +788,15 @@ export function registerAdminHandlers(
   // 6. Статус интеграций и просмотр ошибок
   bot.action('adm:integrations', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
+    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:integrations')) return;
     const botStatus = getBotStatus();
     const dbStatus = firestoreRepo.getStatus();
     const fulfillmentInfo = FulfillmentService.getAdapterInfo();
     const envConfig = getEnvConfig();
     const recentTx = await OrderService.getRecentTransactions(20);
-    const errorTx = recentTx.filter((t) => t.type === 'error').slice(0, 5);
+    const errorTx = recentTx
+      .filter((t) => t.type === 'error' || t.type === 'fulfillment_failed')
+      .slice(0, 5);
 
     const errorLines =
       errorTx.length > 0
@@ -613,11 +823,15 @@ export function registerAdminHandlers(
       `🔐 <b>Firebase Admin SDK:</b> ${
         dbStatus.adminSdkConnected
           ? '✅ Прямое подключение активно'
-          : 'ℹ️ Резервный режим синхронизации (добавьте FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY для прямого Admin SDK)'
+          : dbStatus.degradedMode
+            ? '🚨 Защитный режим недоступности БД (заказы приостановлены)'
+            : 'ℹ️ Локальный dev/test режим'
       }`,
       `🚚 <b>Модуль выдачи (FulfillmentService):</b> <code>${escapeHtml(
         fulfillmentInfo.name,
-      )}</code>`,
+      )}</code> (recovery worker: ${
+        FulfillmentService.isRecoveryWorkerActive() ? 'активен' : 'остановлен'
+      })`,
       `👑 <b>Администраторов в ADMIN_IDS:</b> ${envConfig.adminIds.length}`,
       '',
       '⚠️ <b>Последние системные ошибки:</b>',
@@ -630,32 +844,57 @@ export function registerAdminHandlers(
   // Обработка текстового ввода для активных админ-сессий
   bot.on('text', async (ctx, next) => {
     if (!ctx.from) return next();
-    const session = adminSessions.get(ctx.from.id);
+    const session = getAdminSession(ctx.from.id);
     if (!session) return next();
 
     const text = ctx.message.text.trim();
     if (text.startsWith('/')) {
-      adminSessions.delete(ctx.from.id);
+      clearAdminSession(ctx.from.id);
       return next();
     }
 
     if (!(await ensureAdmin(ctx))) {
-      adminSessions.delete(ctx.from.id);
+      clearAdminSession(ctx.from.id);
       return;
     }
 
     try {
+      if (session.action === 'complete_order_note' && session.targetId) {
+        const orderId = session.targetId;
+        clearAdminSession(ctx.from.id);
+        const completed = await FulfillmentService.completeOrder({
+          orderId,
+          adminNote: text,
+          adminTelegramId: ctx.from.id,
+          bot,
+        });
+        await ctx.reply(
+          `✅ <b>Заказ #${escapeHtml(completed.orderId)} выполнен, сообщение отправлено покупателю!</b>\n\n${formatAdminOrderCard(completed)}`,
+          {
+            parse_mode: 'HTML',
+            ...buildAdminOrderActionKeyboard(completed),
+          },
+        );
+        return;
+      }
+
       if (session.action === 'edit_price' && session.targetId) {
         const price = Number(text);
         const updated = await ProductService.updateProductPrice(
           session.targetId,
           price,
         );
-        adminSessions.delete(ctx.from.id);
+        clearAdminSession(ctx.from.id);
         if (!updated) {
           await ctx.reply('❌ Товар не найден.');
           return;
         }
+        await logAdminAudit(
+          ctx.from.id,
+          updated.id,
+          updated.price,
+          `Изменил цену товара "${updated.name}" на ${updated.price} XTR`,
+        );
         await ctx.reply(
           `✅ <b>Цена товара обновлена!</b>\n\n${formatProductCardMessage(updated)}`,
           {
@@ -671,8 +910,14 @@ export function registerAdminHandlers(
           session.targetId,
           { name: text },
         );
-        adminSessions.delete(ctx.from.id);
+        clearAdminSession(ctx.from.id);
         if (!updated) return;
+        await logAdminAudit(
+          ctx.from.id,
+          updated.id,
+          updated.price,
+          `Изменил название товара на "${updated.name}"`,
+        );
         await ctx.reply(
           `✅ <b>Название товара обновлено!</b>\n\n${formatProductCardMessage(updated)}`,
           {
@@ -688,8 +933,14 @@ export function registerAdminHandlers(
           session.targetId,
           { description: text },
         );
-        adminSessions.delete(ctx.from.id);
+        clearAdminSession(ctx.from.id);
         if (!updated) return;
+        await logAdminAudit(
+          ctx.from.id,
+          updated.id,
+          updated.price,
+          `Изменил описание товара "${updated.name}"`,
+        );
         await ctx.reply(
           `✅ <b>Описание товара обновлено!</b>\n\n${formatProductCardMessage(updated)}`,
           {
@@ -703,7 +954,7 @@ export function registerAdminHandlers(
       if (session.action === 'add_product_name' && session.draftProduct) {
         session.draftProduct.name = text.slice(0, 120);
         session.action = 'add_product_description';
-        adminSessions.set(ctx.from.id, session);
+        setAdminSession(ctx.from.id, session);
         await ctx.reply(
           '➕ <b>Шаг 3 из 4:</b> Отправьте в чат <b>описание</b> нового товара:',
           { parse_mode: 'HTML' },
@@ -714,7 +965,7 @@ export function registerAdminHandlers(
       if (session.action === 'add_product_description' && session.draftProduct) {
         session.draftProduct.description = text.slice(0, 1000);
         session.action = 'add_product_price';
-        adminSessions.set(ctx.from.id, session);
+        setAdminSession(ctx.from.id, session);
         await ctx.reply(
           '➕ <b>Шаг 4 из 4:</b> Отправьте <b>цену товара в Telegram Stars (XTR)</b> (целое число от 1 до 100000):',
           { parse_mode: 'HTML' },
@@ -730,7 +981,13 @@ export function registerAdminHandlers(
           description: session.draftProduct.description || 'Цифровой товар Telegram',
           price,
         });
-        adminSessions.delete(ctx.from.id);
+        clearAdminSession(ctx.from.id);
+        await logAdminAudit(
+          ctx.from.id,
+          created.id,
+          created.price,
+          `Создал новый товар "${created.name}" (${created.price} XTR)`,
+        );
         await ctx.reply(
           `🎉 <b>Новый товар успешно добавлен в каталог!</b>\n\n${formatProductCardMessage(
             created,
@@ -773,7 +1030,13 @@ export function registerAdminHandlers(
           `📩 <b>Сообщение от администрации магазина:</b>\n\n${escapeHtml(msgBody)}`,
           { parse_mode: 'HTML' },
         );
-        adminSessions.delete(ctx.from.id);
+        clearAdminSession(ctx.from.id);
+        await logAdminAudit(
+          ctx.from.id,
+          `msg_${targetTgId}`,
+          0,
+          `Отправил сообщение покупателю ${targetTgId}`,
+        );
         await ctx.reply(
           `✅ Сообщение успешно доставлено пользователю <code>${targetTgId}</code>.`,
           {

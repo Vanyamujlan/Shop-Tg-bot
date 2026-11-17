@@ -1,5 +1,6 @@
 import { Context, Telegraf } from 'telegraf';
 import { ProductCategory } from '../../types.ts';
+import { StorageUnavailableError } from '../../db/firestore.ts';
 import { UserService } from '../../services/UserService.ts';
 import { ProductService } from '../../services/ProductService.ts';
 import { OrderService } from '../../services/OrderService.ts';
@@ -26,6 +27,25 @@ import {
 } from '../formatters.ts';
 
 const callbackDebounceMap = new Map<string, number>();
+const MAX_DEBOUNCE_ENTRIES = 2000;
+const DEBOUNCE_TTL_MS = 60_000;
+
+function pruneCallbackDebounceMap(now: number): void {
+  if (callbackDebounceMap.size <= MAX_DEBOUNCE_ENTRIES) {
+    return;
+  }
+  for (const [k, timestamp] of callbackDebounceMap.entries()) {
+    if (now - timestamp > DEBOUNCE_TTL_MS) {
+      callbackDebounceMap.delete(k);
+    }
+  }
+  // If still above max size, evict oldest entries
+  while (callbackDebounceMap.size > MAX_DEBOUNCE_ENTRIES) {
+    const oldestKey = callbackDebounceMap.keys().next().value;
+    if (!oldestKey) break;
+    callbackDebounceMap.delete(oldestKey);
+  }
+}
 
 export function isDuplicateCallbackClick(
   telegramUserId: number,
@@ -39,7 +59,16 @@ export function isDuplicateCallbackClick(
     return true;
   }
   callbackDebounceMap.set(key, now);
+  pruneCallbackDebounceMap(now);
   return false;
+}
+
+export function clearCallbackDebounceMap(): void {
+  callbackDebounceMap.clear();
+}
+
+export function getCallbackDebounceMapSize(): number {
+  return callbackDebounceMap.size;
 }
 
 export async function safeAnswerCbQuery(
@@ -85,26 +114,47 @@ export async function safeRespondOrEdit(
 }
 
 export function registerUserHandlers(bot: Telegraf): void {
-  // Middleware: register/update user and block banned users from buyer flows
+  // Middleware: register/update user, handle storage unavailability gracefully, and block banned users
   bot.use(async (ctx, next) => {
-    if (ctx.from) {
-      const user = await UserService.upsertFromTelegram(ctx.from);
-      const isAdmin = await UserService.isAdmin(ctx.from.id);
-      if (user.isBlocked && !isAdmin) {
+    try {
+      if (ctx.from) {
+        const isAdmin = await UserService.isAdmin(ctx.from.id);
+        const user = await UserService.upsertFromTelegram(ctx.from);
+        if (user.isBlocked && !isAdmin) {
+          if (ctx.callbackQuery) {
+            await safeAnswerCbQuery(
+              ctx,
+              'Ваш доступ к магазину ограничен.',
+              true,
+            );
+          } else if (ctx.message) {
+            await ctx.reply(
+              '🚫 <b>Доступ к магазину ограничен.</b>\nЕсли вы считаете, что произошла ошибка, обратитесь в поддержку (/paysupport).',
+              { parse_mode: 'HTML' },
+            );
+          }
+          return;
+        }
+      }
+      return await next();
+    } catch (error) {
+      if (error instanceof StorageUnavailableError) {
         if (ctx.callbackQuery) {
-          await ctx.answerCbQuery('Ваш доступ к магазину ограничен.', {
-            show_alert: true,
-          });
+          await safeAnswerCbQuery(
+            ctx,
+            '⚠️ База данных магазина временно недоступна. Попробуйте чуть позже.',
+            true,
+          );
         } else if (ctx.message) {
           await ctx.reply(
-            '🚫 <b>Доступ к магазину ограничен.</b>\nЕсли вы считаете, что произошла ошибка, обратитесь в поддержку (/paysupport).',
+            '⚠️ <b>Магазин временно находится в защитном режиме (база данных недоступна).</b>\nОформление новых заказов приостановлено для сохранности ваших средств. Попробуйте позже или обратитесь в /paysupport.',
             { parse_mode: 'HTML' },
           );
         }
         return;
       }
+      throw error;
     }
-    return next();
   });
 
   // /start — Главное меню
@@ -243,9 +293,7 @@ export function registerUserHandlers(bot: Telegraf): void {
 
     const product = await ProductService.getProductById(productId);
     if (!product || !product.isActive) {
-      await ctx.answerCbQuery('Товар не найден или временно отключён.', {
-        show_alert: true,
-      });
+      await safeAnswerCbQuery(ctx, 'Товар не найден или временно отключён.', true);
       await safeRespondOrEdit(
         ctx,
         formatCatalogOverviewMessage(),
@@ -259,7 +307,7 @@ export function registerUserHandlers(bot: Telegraf): void {
 
     if (product.imageUrl && product.imageUrl.startsWith('http')) {
       try {
-        await ctx.answerCbQuery();
+        await safeAnswerCbQuery(ctx);
         await ctx.replyWithPhoto(product.imageUrl, {
           caption,
           parse_mode: 'HTML',
@@ -283,9 +331,11 @@ export function registerUserHandlers(bot: Telegraf): void {
 
     const order = await OrderService.getOrderById(orderId);
     if (!order || order.userTelegramId !== ctx.from.id) {
-      await ctx.answerCbQuery('Заказ не найден или принадлежит другому пользователю.', {
-        show_alert: true,
-      });
+      await safeAnswerCbQuery(
+        ctx,
+        'Заказ не найден или принадлежит другому пользователю.',
+        true,
+      );
       return;
     }
 
@@ -305,14 +355,16 @@ export function registerUserHandlers(bot: Telegraf): void {
 
     const order = await OrderService.getOrderById(orderId);
     if (!order || order.userTelegramId !== ctx.from.id) {
-      await ctx.answerCbQuery('Заказ не найден.', { show_alert: true });
+      await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
       return;
     }
 
     if (order.paymentStatus !== 'pending') {
-      await ctx.answerCbQuery('Оплаченный заказ нельзя отменить самостоятельно.', {
-        show_alert: true,
-      });
+      await safeAnswerCbQuery(
+        ctx,
+        'Оплаченный заказ нельзя отменить самостоятельно.',
+        true,
+      );
       return;
     }
 

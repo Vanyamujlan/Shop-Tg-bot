@@ -47,6 +47,10 @@ export interface QueryOptions {
     field: string;
     direction?: 'asc' | 'desc';
   };
+  /**
+   * Cursor pagination: value of the orderBy field (or [orderByValue, docId]) to start after.
+   */
+  startAfter?: unknown;
   limit?: number;
   offset?: number;
 }
@@ -55,6 +59,7 @@ export interface PaginatedResult<T> {
   items: T[];
   hasMore: boolean;
   nextOffset: number;
+  nextCursor: unknown | null;
 }
 
 export interface RepoTransaction {
@@ -76,6 +81,21 @@ interface LocalDatabaseState {
   settings: Record<string, StoreSettings>;
 }
 
+export interface SimulatedFailureConfig {
+  unavailable?: boolean;
+  readError?: string | null;
+  writeError?: string | null;
+  transactionError?: string | null;
+}
+
+export class StorageUnavailableError extends Error {
+  public readonly code = 'STORAGE_UNAVAILABLE';
+  constructor(message: string) {
+    super(message);
+    this.name = 'StorageUnavailableError';
+  }
+}
+
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 export function sanitizeDocId(rawId: string): string {
@@ -84,6 +104,19 @@ export function sanitizeDocId(rawId: string): string {
     throw new Error(`Некорректный идентификатор документа: ${rawId}`);
   }
   return cleaned;
+}
+
+function getDocumentPrimaryKey(doc: Record<string, unknown>): string {
+  return String(
+    doc.orderId ??
+      doc.id ??
+      doc.userId ??
+      doc.paymentId ??
+      doc.transactionId ??
+      doc.adminId ??
+      doc.key ??
+      '',
+  );
 }
 
 function evaluateWhereFilter(
@@ -111,27 +144,67 @@ function evaluateWhereFilter(
   }
 }
 
-function applyInMemorySortAndPagination<T>(
+function applyInMemorySortAndCursorPagination<T>(
   docs: T[],
   options?: QueryOptions,
 ): T[] {
   let result = [...docs];
-  if (options?.orderBy) {
-    const { field, direction = 'asc' } = options.orderBy;
-    const factor = direction === 'desc' ? -1 : 1;
+  const orderField = options?.orderBy?.field;
+  const direction = options?.orderBy?.direction || 'asc';
+  const factor = direction === 'desc' ? -1 : 1;
+
+  if (orderField) {
     result.sort((a, b) => {
-      const va = (a as Record<string, unknown>)[field];
-      const vb = (b as Record<string, unknown>)[field];
+      const recA = a as Record<string, unknown>;
+      const recB = b as Record<string, unknown>;
+      const va = recA[orderField];
+      const vb = recB[orderField];
       if (typeof va === 'number' && typeof vb === 'number') {
-        return (va - vb) * factor;
+        const diff = (va - vb) * factor;
+        if (diff !== 0) return diff;
+      } else {
+        const cmp = String(va ?? '').localeCompare(String(vb ?? '')) * factor;
+        if (cmp !== 0) return cmp;
       }
-      return String(va ?? '').localeCompare(String(vb ?? '')) * factor;
+      return getDocumentPrimaryKey(recA).localeCompare(getDocumentPrimaryKey(recB));
     });
   }
-  const offset = Math.max(0, options?.offset ?? 0);
-  if (offset > 0) {
-    result = result.slice(offset);
+
+  // Cursor pagination (startAfter)
+  if (options?.startAfter !== undefined && options.startAfter !== null && orderField) {
+    const cursorVal = options.startAfter;
+    const cursorIndex = result.findIndex((item) => {
+      const rec = item as Record<string, unknown>;
+      const pk = getDocumentPrimaryKey(rec);
+      const fieldVal = rec[orderField];
+      if (typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal && 'value' in cursorVal) {
+        const typedCursor = cursorVal as { value: unknown; id: string };
+        return fieldVal === typedCursor.value && pk === typedCursor.id;
+      }
+      return fieldVal === cursorVal || pk === cursorVal;
+    });
+
+    if (cursorIndex >= 0) {
+      result = result.slice(cursorIndex + 1);
+    } else {
+      // Value comparison fallback if exact item was deleted
+      const compareVal =
+        typeof cursorVal === 'object' && cursorVal !== null && 'value' in cursorVal
+          ? (cursorVal as { value: unknown }).value
+          : cursorVal;
+      result = result.filter((item) => {
+        const fieldVal = (item as Record<string, unknown>)[orderField];
+        if (typeof fieldVal === 'number' && typeof compareVal === 'number') {
+          return direction === 'desc' ? fieldVal < compareVal : fieldVal > compareVal;
+        }
+        const cmp = String(fieldVal ?? '').localeCompare(String(compareVal ?? ''));
+        return direction === 'desc' ? cmp < 0 : cmp > 0;
+      });
+    }
+  } else if (options?.offset && options.offset > 0) {
+    result = result.slice(options.offset);
   }
+
   if (options?.limit !== undefined && options.limit > 0) {
     result = result.slice(0, options.limit);
   }
@@ -142,18 +215,34 @@ export class FirestoreRepository {
   private adminApp: AdminApp | null = null;
   private adminDb: AdminFirestore | null = null;
   private adminReady = false;
+  private degradedMode = false;
+  private isolatedTestMode = false;
+  private simulatedFailures: SimulatedFailureConfig = {};
   private adminStatusMessage = 'Не инициализирован';
+  private dataDir: string;
   private localFilePath: string;
   private localState: LocalDatabaseState;
+  private backupPreservedThisSession = false;
   private txMutex: Promise<void> = Promise.resolve();
 
   constructor() {
-    const dataDir = path.resolve(process.cwd(), '.data');
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    this.dataDir = path.resolve(process.cwd(), '.data');
+    this.localFilePath = path.join(this.dataDir, 'firestore-mirror.json');
+    this.ensureSecureDataDirPermissions();
+    this.localState = this.createEmptyState();
+  }
+
+  private ensureSecureDataDirPermissions(): void {
+    try {
+      if (fs.existsSync(this.dataDir)) {
+        fs.chmodSync(this.dataDir, 0o700);
+      }
+      if (fs.existsSync(this.localFilePath)) {
+        fs.chmodSync(this.localFilePath, 0o600);
+      }
+    } catch {
+      // Ignore chmod errors on non-POSIX filesystems
     }
-    this.localFilePath = path.join(dataDir, 'firestore-mirror.json');
-    this.localState = this.loadLocalState();
   }
 
   private createEmptyState(): LocalDatabaseState {
@@ -168,9 +257,148 @@ export class FirestoreRepository {
     };
   }
 
+  /**
+   * Enables strictly isolated in-memory test mode:
+   * - Never touches production Cloud Firestore
+   * - Never reads or writes .data/firestore-mirror.json
+   */
+  public enableIsolatedTestMode(seedDefaults = true): void {
+    this.isolatedTestMode = true;
+    this.adminReady = false;
+    this.degradedMode = false;
+    this.simulatedFailures = {};
+    this.localState = this.createEmptyState();
+    this.adminStatusMessage = 'Изолированный in-memory режим тестирования (без доступа к production Firestore)';
+
+    if (seedDefaults) {
+      const now = new Date().toISOString();
+      const config = getEnvConfig();
+      this.localState.settings.global = {
+        key: 'global',
+        storeName: 'Telegram Digital Store (Test)',
+        supportUsername: config.storeSupportUsername || 'support',
+        maintenanceMode: false,
+        updatedAt: now,
+      };
+      for (const adminTelegramId of config.adminIds) {
+        const adminDocId = `tg_${adminTelegramId}`;
+        this.localState.admins[adminDocId] = {
+          adminId: adminDocId,
+          telegramId: adminTelegramId,
+          role: 'superadmin',
+          addedAt: now,
+        };
+      }
+      for (const item of INITIAL_TEST_PRODUCTS) {
+        this.localState.products[item.id] = {
+          ...item,
+          createdAt: now,
+          updatedAt: now,
+        };
+      }
+    }
+  }
+
+  public disableIsolatedTestMode(): void {
+    this.isolatedTestMode = false;
+    this.simulatedFailures = {};
+  }
+
+  public setSimulatedFailure(config: SimulatedFailureConfig): void {
+    this.simulatedFailures = { ...config };
+  }
+
+  public isLocalFallbackAllowed(): boolean {
+    if (this.isolatedTestMode) return true;
+    const config = getEnvConfig();
+    return config.allowLocalFallback;
+  }
+
+  public isProductionStorageHealthy(): boolean {
+    if (this.simulatedFailures.unavailable) {
+      return false;
+    }
+    if (this.isolatedTestMode) {
+      return !this.degradedMode;
+    }
+    if (this.adminReady && this.adminDb && !this.degradedMode) {
+      return true;
+    }
+    return this.isLocalFallbackAllowed() && !this.degradedMode;
+  }
+
+  /**
+   * Fail-safe check before creating new orders or processing payments.
+   * Prevents silent fallback to local file in production if Cloud Firestore is down.
+   */
+  public assertReadyForOrdersAndPayments(): void {
+    if (this.simulatedFailures.unavailable) {
+      throw new StorageUnavailableError(
+        'Основное хранилище базы данных временно недоступно. Оформление заказов и обработка платежей приостановлены.',
+      );
+    }
+    if (this.isolatedTestMode) {
+      if (this.degradedMode) {
+        throw new StorageUnavailableError(
+          'Хранилище переведено в аварийный режим недоступности.',
+        );
+      }
+      return;
+    }
+    if (!this.adminReady || !this.adminDb || this.degradedMode) {
+      if (!this.isLocalFallbackAllowed()) {
+        throw new StorageUnavailableError(
+          'Production-хранилище Cloud Firestore недоступно. Оформление заказов и приём платежей временно заблокированы для сохранности данных.',
+        );
+      }
+    }
+  }
+
+  private checkSimulatedFailures(op: OperationType, pathStr: string): void {
+    if (this.simulatedFailures.unavailable) {
+      throw new StorageUnavailableError(
+        `Simulated storage unavailability on ${op} (${pathStr})`,
+      );
+    }
+    if (
+      (op === OperationType.GET || op === OperationType.LIST) &&
+      this.simulatedFailures.readError
+    ) {
+      throw new Error(this.simulatedFailures.readError);
+    }
+    if (
+      (op === OperationType.WRITE ||
+        op === OperationType.CREATE ||
+        op === OperationType.UPDATE ||
+        op === OperationType.DELETE) &&
+      this.simulatedFailures.writeError
+    ) {
+      throw new Error(this.simulatedFailures.writeError);
+    }
+  }
+
+  private assertStorageAvailable(op: OperationType, pathStr: string): void {
+    this.checkSimulatedFailures(op, pathStr);
+    if (this.isolatedTestMode) {
+      return;
+    }
+    if (this.adminReady && this.adminDb && !this.degradedMode) {
+      return;
+    }
+    if (!this.isLocalFallbackAllowed()) {
+      throw new StorageUnavailableError(
+        `Операция ${op} (${pathStr}) отклонена: Cloud Firestore не подключён в production-режиме (локальное хранилище отключено).`,
+      );
+    }
+  }
+
   private loadLocalState(): LocalDatabaseState {
+    if (this.isolatedTestMode || !this.isLocalFallbackAllowed()) {
+      return this.createEmptyState();
+    }
     try {
       if (fs.existsSync(this.localFilePath)) {
+        fs.chmodSync(this.localFilePath, 0o600);
         const raw = fs.readFileSync(this.localFilePath, 'utf-8');
         const parsed = JSON.parse(raw) as Partial<LocalDatabaseState>;
         return {
@@ -190,38 +418,48 @@ export class FirestoreRepository {
   }
 
   /**
-   * MEDIUM-SEC-01: Never persist plaintext user/payment records to local disk
-   * when Cloud Firestore (adminReady) is active. In offline fallback mode, write with 0o600 permissions.
+   * Saves local fallback state ONLY when explicitly in local fallback mode (never in production or isolated test mode).
+   * Never deletes or clobbers an existing backup without preserving a .bak copy first.
    */
   private saveLocalState(): void {
-    if (this.adminReady) {
+    if (this.adminReady || this.isolatedTestMode || !this.isLocalFallbackAllowed()) {
       return;
     }
     try {
+      if (!fs.existsSync(this.dataDir)) {
+        fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
+      }
+      fs.chmodSync(this.dataDir, 0o700);
+
+      if (fs.existsSync(this.localFilePath) && !this.backupPreservedThisSession) {
+        const backupPath = `${this.localFilePath}.bak`;
+        if (!fs.existsSync(backupPath)) {
+          fs.copyFileSync(this.localFilePath, backupPath);
+          fs.chmodSync(backupPath, 0o600);
+        }
+        this.backupPreservedThisSession = true;
+      }
+
       fs.writeFileSync(
         this.localFilePath,
         JSON.stringify(this.localState, null, 2),
         { encoding: 'utf-8', mode: 0o600 },
       );
+      fs.chmodSync(this.localFilePath, 0o600);
     } catch (error) {
       console.error('[Firestore] Ошибка сохранения локального кэша:', error);
-    }
-  }
-
-  private cleanupLocalMirrorFileIfCloudActive(): void {
-    if (!this.adminReady) return;
-    try {
-      if (fs.existsSync(this.localFilePath)) {
-        fs.unlinkSync(this.localFilePath);
-      }
-      this.localState = this.createEmptyState();
-    } catch (error) {
-      console.warn('[Firestore] Не удалось удалить локальный кэш-файл:', error);
+      throw error instanceof Error ? error : new Error(String(error));
     }
   }
 
   public async init(): Promise<void> {
     const config = getEnvConfig();
+    if (config.nodeEnv === 'test' || this.isolatedTestMode) {
+      this.enableIsolatedTestMode(true);
+      return;
+    }
+
+    this.ensureSecureDataDirPermissions();
     const connCheck = await testConnection();
 
     if (
@@ -260,18 +498,32 @@ export class FirestoreRepository {
         await probeRef.delete();
 
         this.adminReady = true;
-        this.cleanupLocalMirrorFileIfCloudActive();
+        this.degradedMode = false;
         this.adminStatusMessage = `Firebase Admin SDK активен (проект: ${config.firebaseProjectId}, БД: ${config.firebaseDatabaseId}, Read/Write/Delete проверены)`;
         console.log(`[Firestore] ${this.adminStatusMessage}`);
       } catch (error) {
         this.adminReady = false;
         const msg = error instanceof Error ? error.message : String(error);
-        this.adminStatusMessage = `Ошибка Firebase Admin SDK (${msg}). Используется резервное хранилище + проект ${config.firebaseProjectId}.`;
+        if (!this.isLocalFallbackAllowed()) {
+          this.degradedMode = true;
+          this.adminStatusMessage = `КРИТИЧЕСКАЯ ОШИБКА Firebase Admin SDK (${msg}). Магазин переведён в защитный режим недоступности БД (production fail-safe).`;
+          console.error(`[Firestore] ❌ ${this.adminStatusMessage}`);
+          return;
+        }
+        this.localState = this.loadLocalState();
+        this.adminStatusMessage = `Ошибка Firebase Admin SDK (${msg}). Включён dev/test локальный режим (${config.firebaseProjectId}).`;
         console.warn(`[Firestore] ${this.adminStatusMessage}`);
       }
     } else {
       this.adminReady = false;
-      this.adminStatusMessage = `${connCheck.details} (Для прямой серверной записи через Firebase Admin SDK укажите FIREBASE_CLIENT_EMAIL и FIREBASE_PRIVATE_KEY в Secrets; данные синхронизируются с локальным хранилищем сервера).`;
+      if (!this.isLocalFallbackAllowed()) {
+        this.degradedMode = true;
+        this.adminStatusMessage = `Отсутствуют серверные ключи Firebase Admin SDK в production-режиме (${connCheck.details}). Оформление заказов и платежи заблокированы до настройки ключей.`;
+        console.error(`[Firestore] ❌ ${this.adminStatusMessage}`);
+        return;
+      }
+      this.localState = this.loadLocalState();
+      this.adminStatusMessage = `${connCheck.details} (Активирован локальный dev/test режим).`;
       console.log(`[Firestore] ${this.adminStatusMessage}`);
     }
 
@@ -280,6 +532,8 @@ export class FirestoreRepository {
 
   public getStatus(): {
     adminSdkConnected: boolean;
+    degradedMode: boolean;
+    localFallbackAllowed: boolean;
     projectId: string;
     databaseId: string;
     statusMessage: string;
@@ -287,6 +541,8 @@ export class FirestoreRepository {
     const config = getEnvConfig();
     return {
       adminSdkConnected: this.adminReady,
+      degradedMode: this.degradedMode || Boolean(this.simulatedFailures.unavailable),
+      localFallbackAllowed: this.isLocalFallbackAllowed(),
       projectId: config.firebaseProjectId,
       databaseId: config.firebaseDatabaseId,
       statusMessage: this.adminStatusMessage,
@@ -294,6 +550,10 @@ export class FirestoreRepository {
   }
 
   private async seedInitialData(): Promise<void> {
+    if (!this.isProductionStorageHealthy()) {
+      return;
+    }
+
     const config = getEnvConfig();
     const now = new Date().toISOString();
 
@@ -333,13 +593,13 @@ export class FirestoreRepository {
         await this.setDoc<Product>('products', product.id, product);
       }
       console.log(
-        `[Firestore] Загружено ${INITIAL_TEST_PRODUCTS.length} тестовых товаров в каталог.`,
+        `[Firestore] Загружено ${INITIAL_TEST_PRODUCTS.length} стартовых товаров в каталог.`,
       );
     }
   }
 
   /**
-   * MEDIUM-01: Rethrows Firestore errors when adminReady is true instead of swallowing them.
+   * Logs and rethrows all Firestore errors without swallowing them.
    */
   private handleOrRethrow(
     error: unknown,
@@ -362,8 +622,9 @@ export class FirestoreRepository {
   ): Promise<T | null> {
     const safeId = sanitizeDocId(docId);
     const pathStr = `${collectionName}/${safeId}`;
+    this.assertStorageAvailable(OperationType.GET, pathStr);
 
-    if (this.adminReady && this.adminDb) {
+    if (!this.isolatedTestMode && this.adminReady && this.adminDb) {
       try {
         const snap = await this.adminDb.collection(collectionName).doc(safeId).get();
         if (!snap.exists) return null;
@@ -374,7 +635,8 @@ export class FirestoreRepository {
     }
 
     const bucket = this.localState[collectionName] as Record<string, unknown>;
-    return (bucket[safeId] as T) ?? null;
+    const found = bucket[safeId];
+    return found ? (JSON.parse(JSON.stringify(found)) as T) : null;
   }
 
   public async setDoc<T extends object>(
@@ -384,8 +646,9 @@ export class FirestoreRepository {
   ): Promise<void> {
     const safeId = sanitizeDocId(docId);
     const pathStr = `${collectionName}/${safeId}`;
+    this.assertStorageAvailable(OperationType.WRITE, pathStr);
 
-    if (this.adminReady && this.adminDb) {
+    if (!this.isolatedTestMode && this.adminReady && this.adminDb) {
       try {
         await this.adminDb.collection(collectionName).doc(safeId).set(data);
         return;
@@ -395,7 +658,7 @@ export class FirestoreRepository {
     }
 
     const bucket = this.localState[collectionName] as Record<string, unknown>;
-    bucket[safeId] = { ...data };
+    bucket[safeId] = JSON.parse(JSON.stringify(data));
     this.saveLocalState();
   }
 
@@ -405,6 +668,8 @@ export class FirestoreRepository {
     partial: Partial<T>,
   ): Promise<T | null> {
     const safeId = sanitizeDocId(docId);
+    const pathStr = `${collectionName}/${safeId}`;
+    this.assertStorageAvailable(OperationType.UPDATE, pathStr);
 
     return this.runTransaction<T | null>(async (tx) => {
       const existing = await tx.get<T>(collectionName, safeId);
@@ -426,8 +691,9 @@ export class FirestoreRepository {
   ): Promise<boolean> {
     const safeId = sanitizeDocId(docId);
     const pathStr = `${collectionName}/${safeId}`;
+    this.assertStorageAvailable(OperationType.DELETE, pathStr);
 
-    if (this.adminReady && this.adminDb) {
+    if (!this.isolatedTestMode && this.adminReady && this.adminDb) {
       try {
         await this.adminDb.collection(collectionName).doc(safeId).delete();
         return true;
@@ -444,13 +710,15 @@ export class FirestoreRepository {
   }
 
   /**
-   * HIGH-02: Server-side indexed Firestore queries with filtering, sorting, and pagination.
+   * Server-side indexed Firestore queries with where, orderBy, startAfter cursor, and limit.
    */
   public async queryDocs<T>(
     collectionName: CollectionName,
     options?: QueryOptions,
   ): Promise<T[]> {
-    if (this.adminReady && this.adminDb) {
+    this.assertStorageAvailable(OperationType.LIST, collectionName);
+
+    if (!this.isolatedTestMode && this.adminReady && this.adminDb) {
       try {
         let query: AdminQuery = this.adminDb.collection(collectionName);
         if (options?.where) {
@@ -464,7 +732,15 @@ export class FirestoreRepository {
             options.orderBy.direction || 'asc',
           );
         }
-        if (options?.offset && options.offset > 0) {
+        if (options?.startAfter !== undefined && options.startAfter !== null) {
+          const cursorVal =
+            typeof options.startAfter === 'object' &&
+            options.startAfter !== null &&
+            'value' in options.startAfter
+              ? (options.startAfter as { value: unknown }).value
+              : options.startAfter;
+          query = query.startAfter(cursorVal);
+        } else if (options?.offset && options.offset > 0) {
           query = query.offset(options.offset);
         }
         if (options?.limit && options.limit > 0) {
@@ -475,8 +751,6 @@ export class FirestoreRepository {
         return snap.docs.map((d) => d.data() as T);
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        // If a composite index is still building in Firestore, execute server-side single-field where filter
-        // and apply sort/pagination on the filtered subset without scanning the entire collection
         if (
           options?.where &&
           options.where.length > 0 &&
@@ -498,7 +772,7 @@ export class FirestoreRepository {
                 ),
               );
             }
-            return applyInMemorySortAndPagination(docs, options);
+            return applyInMemorySortAndCursorPagination(docs, options);
           } catch (fallbackError) {
             this.handleOrRethrow(fallbackError, OperationType.LIST, collectionName);
           }
@@ -508,7 +782,9 @@ export class FirestoreRepository {
     }
 
     const bucket = this.localState[collectionName] as Record<string, T>;
-    let docs = Object.values(bucket);
+    let docs = Object.values(bucket).map(
+      (item) => JSON.parse(JSON.stringify(item)) as T,
+    );
     if (options?.where) {
       docs = docs.filter((item) =>
         options.where!.every((f) =>
@@ -516,9 +792,12 @@ export class FirestoreRepository {
         ),
       );
     }
-    return applyInMemorySortAndPagination(docs, options);
+    return applyInMemorySortAndCursorPagination(docs, options);
   }
 
+  /**
+   * Cursor-based pagination (`startAfter`) with backward-compatible `nextOffset`.
+   */
   public async queryDocsPaginated<T>(
     collectionName: CollectionName,
     options?: QueryOptions,
@@ -528,17 +807,26 @@ export class FirestoreRepository {
 
     const fetched = await this.queryDocs<T>(collectionName, {
       ...options,
-      offset,
       limit: limit + 1,
     });
 
     const hasMore = fetched.length > limit;
     const items = hasMore ? fetched.slice(0, limit) : fetched;
 
+    let nextCursor: unknown | null = null;
+    if (hasMore && items.length > 0 && options?.orderBy?.field) {
+      const lastItem = items[items.length - 1] as Record<string, unknown>;
+      nextCursor = {
+        value: lastItem[options.orderBy.field],
+        id: getDocumentPrimaryKey(lastItem),
+      };
+    }
+
     return {
       items,
       hasMore,
       nextOffset: offset + items.length,
+      nextCursor,
     };
   }
 
@@ -550,28 +838,37 @@ export class FirestoreRepository {
   }
 
   /**
-   * HIGH-01: Atomic Firestore Transaction runner.
-   * Executes all reads and writes atomically in Cloud Firestore (or under an isolated
-   * rollback-safe mutex lock when running in offline/test mode).
+   * Atomic Firestore Transaction runner.
+   * Strictly enforces that all reads (`tx.get`) happen BEFORE any writes (`tx.set`).
    */
   public async runTransaction<R>(
     updateFn: (tx: RepoTransaction) => Promise<R>,
   ): Promise<R> {
-    if (this.adminReady && this.adminDb) {
+    this.assertStorageAvailable(OperationType.WRITE, 'transaction');
+    if (this.simulatedFailures.transactionError) {
+      throw new Error(this.simulatedFailures.transactionError);
+    }
+
+    if (!this.isolatedTestMode && this.adminReady && this.adminDb) {
       const db = this.adminDb;
       try {
         return await db.runTransaction(async (firestoreTx) => {
-          const stagedWrites = new Map<string, unknown>();
+          let hasWritten = false;
           const repoTx: RepoTransaction = {
             get: async <T>(
               collectionName: CollectionName,
               docId: string,
             ): Promise<T | null> => {
-              const safeId = sanitizeDocId(docId);
-              const key = `${collectionName}/${safeId}`;
-              if (stagedWrites.has(key)) {
-                return stagedWrites.get(key) as T;
+              if (hasWritten) {
+                throw new Error(
+                  'Нарушение контракта транзакции Firestore: все операции чтения (tx.get) должны выполняться до операций записи (tx.set).',
+                );
               }
+              this.checkSimulatedFailures(
+                OperationType.GET,
+                `${collectionName}/${docId}`,
+              );
+              const safeId = sanitizeDocId(docId);
               const ref = db.collection(collectionName).doc(safeId);
               const snap = await firestoreTx.get(ref);
               if (!snap.exists) return null;
@@ -582,9 +879,12 @@ export class FirestoreRepository {
               docId: string,
               data: T,
             ): void => {
+              this.checkSimulatedFailures(
+                OperationType.WRITE,
+                `${collectionName}/${docId}`,
+              );
+              hasWritten = true;
               const safeId = sanitizeDocId(docId);
-              const key = `${collectionName}/${safeId}`;
-              stagedWrites.set(key, { ...data });
               const ref = db.collection(collectionName).doc(safeId);
               firestoreTx.set(ref, data);
             },
@@ -597,7 +897,7 @@ export class FirestoreRepository {
       }
     }
 
-    // Serialized atomic transaction for offline/unit-test mode with full rollback on error
+    // Serialized atomic transaction for isolated test / local fallback mode with full rollback on error
     let releaseLock!: () => void;
     const prevMutex = this.txMutex;
     this.txMutex = new Promise<void>((resolve) => {
@@ -611,6 +911,7 @@ export class FirestoreRepository {
     ) as LocalDatabaseState;
 
     try {
+      let hasWritten = false;
       const stagedWrites = new Map<
         string,
         { collectionName: CollectionName; docId: string; data: unknown }
@@ -621,11 +922,16 @@ export class FirestoreRepository {
           collectionName: CollectionName,
           docId: string,
         ): Promise<T | null> => {
-          const safeId = sanitizeDocId(docId);
-          const key = `${collectionName}/${safeId}`;
-          if (stagedWrites.has(key)) {
-            return stagedWrites.get(key)!.data as T;
+          if (hasWritten) {
+            throw new Error(
+              'Нарушение контракта транзакции Firestore: все операции чтения (tx.get) должны выполняться до операций записи (tx.set).',
+            );
           }
+          this.checkSimulatedFailures(
+            OperationType.GET,
+            `${collectionName}/${docId}`,
+          );
+          const safeId = sanitizeDocId(docId);
           const bucket = this.localState[collectionName] as Record<string, unknown>;
           const val = bucket[safeId];
           return val ? (JSON.parse(JSON.stringify(val)) as T) : null;
@@ -635,6 +941,11 @@ export class FirestoreRepository {
           docId: string,
           data: T,
         ): void => {
+          this.checkSimulatedFailures(
+            OperationType.WRITE,
+            `${collectionName}/${docId}`,
+          );
+          hasWritten = true;
           const safeId = sanitizeDocId(docId);
           const key = `${collectionName}/${safeId}`;
           stagedWrites.set(key, {

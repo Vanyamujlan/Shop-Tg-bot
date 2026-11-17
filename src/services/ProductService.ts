@@ -3,32 +3,37 @@ import { Product, ProductCategory, FulfillmentType } from '../types.ts';
 
 export class ProductService {
   /**
-   * Server-side filtered and sorted products query (HIGH-02).
+   * Server-side filtered and cursor-paginated products query.
    */
   public static async getAllProducts(
     includeInactive = false,
     limit = 100,
-    offset = 0,
+    startAfterCursor?: unknown,
   ): Promise<Product[]> {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
     return firestoreRepo.queryDocs<Product>('products', {
       where: includeInactive
         ? []
         : [{ field: 'isActive', op: '==', value: true }],
       orderBy: { field: 'price', direction: 'asc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
-      offset,
     });
   }
 
   /**
-   * Server-side filtered and sorted category products query (HIGH-02).
+   * Server-side filtered and cursor-paginated category products query.
    */
   public static async getProductsByCategory(
     category: ProductCategory,
     includeInactive = false,
     limit = 50,
-    offset = 0,
+    startAfterCursor?: unknown,
   ): Promise<Product[]> {
+    const isLegacyOffset =
+      typeof startAfterCursor === 'number' && startAfterCursor > 0;
     return firestoreRepo.queryDocs<Product>('products', {
       where: includeInactive
         ? [{ field: 'category', op: '==', value: category }]
@@ -37,8 +42,9 @@ export class ProductService {
             { field: 'isActive', op: '==', value: true },
           ],
       orderBy: { field: 'price', direction: 'asc' },
+      startAfter: isLegacyOffset ? undefined : startAfterCursor,
+      offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
-      offset,
     });
   }
 

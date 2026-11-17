@@ -1,49 +1,77 @@
 import { Telegraf } from 'telegraf';
 import { getEnvConfig } from '../config/env.ts';
-import { firestoreRepo } from '../db/firestore.ts';
-import { Order } from '../types.ts';
+import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
+import { Order, StoreTransaction } from '../types.ts';
 import { OrderService } from './OrderService.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
 import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
 
+export interface FulfillmentRequestContext {
+  idempotencyKey: string;
+  attempt: number;
+}
+
+export interface FulfillmentAdapterResult {
+  handledAutomatically: boolean;
+  status: 'processing' | 'completed';
+  details: string;
+  externalReference?: string;
+}
+
 /**
  * Official Provider Adapter Interface.
  * Ready for future verified supplier integrations without rewriting the store logic.
- * Does NOT use unofficial Fragment methods, external web scraping, seed phrases, or private keys.
+ * Supports idempotency keys and optional status verification after crash recovery.
  */
 export interface FulfillmentProviderAdapter {
   readonly providerName: string;
+  readonly supportsIdempotency?: boolean;
   isConfigured(): boolean;
-  requestFulfillment(order: Order): Promise<{
-    handledAutomatically: boolean;
-    status: 'processing' | 'completed';
-    details: string;
+  requestFulfillment(
+    order: Order,
+    context?: FulfillmentRequestContext,
+  ): Promise<FulfillmentAdapterResult>;
+  checkExternalStatus?(
+    order: Order,
+    idempotencyKey: string,
+  ): Promise<{
+    alreadyExecuted: boolean;
+    status?: 'processing' | 'completed';
+    details?: string;
+    externalReference?: string;
   }>;
 }
 
 export class ManualAdminFulfillmentAdapter implements FulfillmentProviderAdapter {
   public readonly providerName = 'ManualAdminFulfillment (Безопасная ручная выдача)';
+  public readonly supportsIdempotency = true;
 
   public isConfigured(): boolean {
     return true;
   }
 
-  public async requestFulfillment(order: Order): Promise<{
-    handledAutomatically: boolean;
-    status: 'processing' | 'completed';
-    details: string;
-  }> {
+  public async requestFulfillment(
+    order: Order,
+    context?: FulfillmentRequestContext,
+  ): Promise<FulfillmentAdapterResult> {
     return {
       handledAutomatically: false,
       status: 'processing',
       details: `Заказ #${order.orderId} передан администратору на ручную выдачу.`,
+      externalReference: context?.idempotencyKey || `manual_${order.orderId}`,
     };
   }
 }
 
 export class FulfillmentService {
+  public static readonly MAX_FULFILLMENT_ATTEMPTS = 3;
+  public static baseRetryDelayMs = 2000;
+  public static staleProcessingLeaseMs = 60_000;
+
   private static adapter: FulfillmentProviderAdapter =
     new ManualAdminFulfillmentAdapter();
+  private static recoveryIntervalHandle: ReturnType<typeof setInterval> | null = null;
+  private static isRecoveryPassRunning = false;
 
   public static setAdapter(adapter: FulfillmentProviderAdapter): void {
     this.adapter = adapter;
@@ -56,154 +84,651 @@ export class FulfillmentService {
     };
   }
 
-  private static async sendAdminNotificationWithRetry(
-    bot: Telegraf,
-    adminId: number,
+  /**
+   * Sends admin notification with retry and records `adminNotifiedAt` on success.
+   * Never throws or rolls back confirmed payment/fulfillment if Telegram API fails.
+   */
+  public static async ensureAdminNotified(
     order: Order,
+    bot: Telegraf | null | undefined,
+    forceResend = false,
+  ): Promise<Order> {
+    if (!forceResend && order.adminNotifiedAt) {
+      return order;
+    }
+    if (!bot) {
+      return order;
+    }
+
+    const { adminIds } = getEnvConfig();
+    if (adminIds.length === 0) {
+      const now = new Date().toISOString();
+      return (
+        (await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
+          adminNotifiedAt: now,
+          updatedAt: now,
+        })) || order
+      );
+    }
+
+    let deliveredCount = 0;
+    for (const adminId of adminIds) {
+      const ok = await this.sendTelegramMessageWithRetry(
+        bot,
+        adminId,
+        `🔔 <b>Новый оплаченный заказ поступил на выдачу!</b>\n\n${formatAdminOrderCard(
+          order,
+        )}`,
+        {
+          parse_mode: 'HTML',
+          ...buildAdminOrderActionKeyboard(order),
+        },
+      );
+      if (ok) {
+        deliveredCount++;
+      }
+    }
+
+    if (deliveredCount > 0) {
+      const now = new Date().toISOString();
+      return (
+        (await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
+          adminNotifiedAt: now,
+          updatedAt: now,
+        })) || order
+      );
+    }
+
+    return order;
+  }
+
+  /**
+   * Sends buyer completion notification with retry and records `buyerNotifiedAt` on success.
+   * Never throws or cancels completed fulfillment if Telegram API fails.
+   */
+  public static async ensureBuyerNotified(
+    order: Order,
+    bot: Telegraf | null | undefined,
+    forceResend = false,
+  ): Promise<Order> {
+    if (!forceResend && order.buyerNotifiedAt) {
+      return order;
+    }
+    if (!bot) {
+      return order;
+    }
+
+    const ok = await this.sendTelegramMessageWithRetry(
+      bot,
+      order.userTelegramId,
+      formatOrderCompletedUserNotice(order),
+      { parse_mode: 'HTML' },
+    );
+
+    if (ok) {
+      const now = new Date().toISOString();
+      return (
+        (await firestoreRepo.updateDoc<Order>('orders', order.orderId, {
+          buyerNotifiedAt: now,
+          updatedAt: now,
+        })) || order
+      );
+    }
+
+    return order;
+  }
+
+  public static async retryOrderNotifications(
+    orderId: string,
+    bot: Telegraf,
+  ): Promise<{ order: Order; adminNotified: boolean; buyerNotified: boolean }> {
+    let order = await OrderService.getOrderById(orderId);
+    if (!order) {
+      throw new Error(`Заказ #${orderId} не найден.`);
+    }
+
+    order = await this.ensureAdminNotified(order, bot, true);
+    if (order.fulfillmentStatus === 'completed') {
+      order = await this.ensureBuyerNotified(order, bot, true);
+    }
+
+    return {
+      order,
+      adminNotified: Boolean(order.adminNotifiedAt),
+      buyerNotified: Boolean(order.buyerNotifiedAt),
+    };
+  }
+
+  private static async sendTelegramMessageWithRetry(
+    bot: Telegraf,
+    chatId: number | string,
+    htmlText: string,
+    extra: Record<string, unknown>,
     maxAttempts = 2,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let lastError: unknown;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        await bot.telegram.sendMessage(
-          adminId,
-          `🔔 <b>Новый оплаченный заказ поступил на выдачу!</b>\n\n${formatAdminOrderCard(
-            order,
-          )}`,
-          {
-            parse_mode: 'HTML',
-            ...buildAdminOrderActionKeyboard(order),
-          },
-        );
-        return;
+        await bot.telegram.sendMessage(chatId, htmlText, extra);
+        return true;
       } catch (error) {
         lastError = error;
         if (attempt < maxAttempts) {
-          await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+          await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
         }
       }
     }
 
     console.warn(
-      `[FulfillmentService] Не удалось отправить уведомление админу ${adminId}:`,
+      `[FulfillmentService] Не удалось отправить уведомление в чат ${chatId}:`,
       lastError instanceof Error ? lastError.message : String(lastError),
     );
+    return false;
   }
 
   /**
-   * Initiates fulfillment strictly AFTER verified successful_payment commit (HIGH-01).
-   * Atomically claims the order transition ('paid' -> 'processing' / 'completed') via
-   * Firestore transaction to guarantee idempotency and prevent duplicate fulfillment
-   * or duplicate admin notifications on retries or concurrent calls.
+   * Initiates fulfillment strictly AFTER verified successful_payment commit.
+   * 1. Atomically claims the order in Firestore BEFORE invoking the external adapter.
+   * 2. Prevents parallel workers from executing fulfillment for the same order.
+   * 3. Tracks start time, attempts count, idempotency key, and last error.
+   * 4. Handles crash recovery when external execution succeeded before state persistence.
+   * 5. Caps retries at MAX_FULFILLMENT_ATTEMPTS so orders never stay in 'processing' forever.
    */
   public static async initiateFulfillment(
-    order: Order,
-    bot: Telegraf,
+    orderInput: Order,
+    bot: Telegraf | null | undefined,
+    options?: { allowStaleTakeover?: boolean },
   ): Promise<Order> {
-    const latestBeforeAdapter =
-      (await OrderService.getOrderById(order.orderId)) || order;
+    const idempotencyKey =
+      orderInput.fulfillmentIdempotencyKey || `fulfill_${orderInput.orderId}`;
 
-    if (
-      latestBeforeAdapter.paymentStatus !== 'paid' &&
-      latestBeforeAdapter.paymentStatus !== 'processing' &&
-      latestBeforeAdapter.paymentStatus !== 'completed'
-    ) {
-      throw new Error(
-        `Невозможно запустить выдачу заказа #${order.orderId} без подтверждённой оплаты.`,
-      );
-    }
+    type ClaimOutcome =
+      | { action: 'already_completed'; order: Order }
+      | { action: 'already_processing'; order: Order }
+      | { action: 'needs_admin_notification_only'; order: Order }
+      | { action: 'needs_reconciliation_check'; order: Order }
+      | { action: 'exhausted'; order: Order }
+      | { action: 'claimed'; order: Order; attempt: number };
 
-    // Idempotent guard: if already claimed by a previous or concurrent execution, return immediately
-    if (
-      latestBeforeAdapter.fulfillmentStatus === 'processing' ||
-      latestBeforeAdapter.fulfillmentStatus === 'completed'
-    ) {
-      return latestBeforeAdapter;
-    }
-
-    const result = await this.adapter.requestFulfillment(latestBeforeAdapter);
-
-    // Atomically claim the fulfillment status transition in Firestore
-    const claimResult = await firestoreRepo.runTransaction<{
-      claimed: boolean;
-      order: Order;
-    }>(async (tx) => {
-      const current = await tx.get<Order>('orders', order.orderId);
-      const baseOrder = current || latestBeforeAdapter;
+    // =========================================================================
+    // PHASE 1: ATOMIC CLAIM BEFORE EXTERNAL ADAPTER CALL
+    // =========================================================================
+    const claim = await firestoreRepo.runTransaction<ClaimOutcome>(async (tx) => {
+      const current = (await tx.get<Order>('orders', orderInput.orderId)) || orderInput;
 
       if (
-        baseOrder.fulfillmentStatus === 'processing' ||
-        baseOrder.fulfillmentStatus === 'completed'
+        current.paymentStatus !== 'paid' &&
+        current.paymentStatus !== 'processing' &&
+        current.paymentStatus !== 'completed'
       ) {
-        return { claimed: false, order: baseOrder };
+        throw new Error(
+          `Невозможно запустить выдачу заказа #${current.orderId} без подтверждённой оплаты (текущий статус: ${current.paymentStatus}).`,
+        );
       }
 
-      const now = new Date().toISOString();
-      const updated: Order = {
-        ...baseOrder,
-        fulfillmentStatus: result.status,
-        fulfillmentNote: result.details.slice(0, 500),
-        completedAt:
-          result.status === 'completed'
-            ? baseOrder.completedAt || now
-            : baseOrder.completedAt,
-        updatedAt: now,
+      if (current.fulfillmentStatus === 'completed') {
+        return { action: 'already_completed', order: current };
+      }
+
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const startedMs = current.fulfillmentStartedAt
+        ? Date.parse(current.fulfillmentStartedAt)
+        : 0;
+      const isLeaseActive =
+        startedMs > 0 && nowMs - startedMs < this.staleProcessingLeaseMs;
+
+      if (current.fulfillmentStatus === 'processing') {
+        // If external reference is already recorded, the adapter already finished; only ensure admin notification
+        if (current.externalExecutionReference) {
+          if (!current.adminNotifiedAt) {
+            return { action: 'needs_admin_notification_only', order: current };
+          }
+          return { action: 'already_processing', order: current };
+        }
+
+        // Another worker holds an active lease right now
+        if (isLeaseActive && !options?.allowStaleTakeover) {
+          return { action: 'already_processing', order: current };
+        }
+
+        // Stale processing state: server crashed after claiming 'processing' before saving adapter result
+        if ((current.fulfillmentAttempts ?? 0) >= 1) {
+          return { action: 'needs_reconciliation_check', order: current };
+        }
+      }
+
+      const prevAttempts = current.fulfillmentAttempts ?? 0;
+      if (prevAttempts >= this.MAX_FULFILLMENT_ATTEMPTS) {
+        const exhaustedOrder: Order = {
+          ...current,
+          fulfillmentStatus: 'failed',
+          needsManualReconciliation: true,
+          fulfillmentLastError:
+            current.fulfillmentLastError ||
+            `Превышен лимит попыток автоматической выдачи (${this.MAX_FULFILLMENT_ATTEMPTS}). Требуется ручная проверка администратором.`,
+          fulfillmentNextRetryAt: undefined,
+          updatedAt: nowIso,
+        };
+        tx.set<Order>('orders', exhaustedOrder.orderId, exhaustedOrder);
+        return { action: 'exhausted', order: exhaustedOrder };
+      }
+
+      const nextAttempt = prevAttempts + 1;
+      const claimedOrder: Order = {
+        ...current,
+        fulfillmentStatus: 'processing',
+        fulfillmentStartedAt: nowIso,
+        fulfillmentAttempts: nextAttempt,
+        fulfillmentIdempotencyKey: current.fulfillmentIdempotencyKey || idempotencyKey,
+        updatedAt: nowIso,
       };
 
-      tx.set<Order>('orders', updated.orderId, updated);
-      return { claimed: true, order: updated };
+      tx.set<Order>('orders', claimedOrder.orderId, claimedOrder);
+      return { action: 'claimed', order: claimedOrder, attempt: nextAttempt };
     });
 
-    // External side effects (admin notifications) execute ONLY for the caller that won the atomic claim
-    if (claimResult.claimed) {
-      const { adminIds } = getEnvConfig();
-      for (const adminId of adminIds) {
-        await this.sendAdminNotificationWithRetry(bot, adminId, claimResult.order);
-      }
+    if (claim.action === 'already_completed') {
+      return this.ensureBuyerNotified(claim.order, bot);
     }
 
-    return claimResult.order;
+    if (claim.action === 'already_processing') {
+      return claim.order;
+    }
+
+    if (claim.action === 'needs_admin_notification_only') {
+      return this.ensureAdminNotified(claim.order, bot);
+    }
+
+    if (claim.action === 'exhausted') {
+      return this.ensureAdminNotified(claim.order, bot);
+    }
+
+    // Handle crash recovery where previous worker crashed during external execution
+    if (claim.action === 'needs_reconciliation_check') {
+      return this.reconcileStaleProcessingOrder(claim.order, bot);
+    }
+
+    // =========================================================================
+    // PHASE 2: EXECUTE EXTERNAL ADAPTER (ONLY FOR THE WORKER THAT WON THE CLAIM)
+    // =========================================================================
+    const { order: claimedOrder, attempt } = claim;
+    try {
+      const adapterResult = await this.adapter.requestFulfillment(claimedOrder, {
+        idempotencyKey: claimedOrder.fulfillmentIdempotencyKey || idempotencyKey,
+        attempt,
+      });
+
+      // =========================================================================
+      // PHASE 3: PERSIST ADAPTER RESULT ATOMICALLY
+      // =========================================================================
+      const finalizedOrder = await firestoreRepo.runTransaction<Order>(async (tx) => {
+        const latest = (await tx.get<Order>('orders', claimedOrder.orderId)) || claimedOrder;
+        if (latest.fulfillmentStatus === 'completed') {
+          return latest;
+        }
+
+        const nowIso = new Date().toISOString();
+        const isAutoCompleted =
+          adapterResult.handledAutomatically && adapterResult.status === 'completed';
+
+        const updated: Order = {
+          ...latest,
+          paymentStatus: isAutoCompleted ? 'completed' : latest.paymentStatus,
+          fulfillmentStatus: adapterResult.status,
+          fulfillmentNote: adapterResult.details.slice(0, 500),
+          externalExecutionReference:
+            adapterResult.externalReference ||
+            `${this.adapter.providerName}:${idempotencyKey}`,
+          fulfillmentLastError: undefined,
+          fulfillmentNextRetryAt: undefined,
+          completedAt: isAutoCompleted ? latest.completedAt || nowIso : latest.completedAt,
+          updatedAt: nowIso,
+        };
+
+        tx.set<Order>('orders', updated.orderId, updated);
+
+        if (isAutoCompleted) {
+          const txId = sanitizeDocId(
+            `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          );
+          tx.set<StoreTransaction>('transactions', txId, {
+            transactionId: txId,
+            orderId: updated.orderId,
+            userId: updated.userId,
+            type: 'fulfillment_completed',
+            amount: updated.totalPrice,
+            currency: 'XTR',
+            details: `Автоматическая выдача завершена: ${adapterResult.details}`.slice(
+              0,
+              500,
+            ),
+            createdAt: nowIso,
+          });
+        }
+
+        return updated;
+      });
+
+      // =========================================================================
+      // PHASE 4: SEND NOTIFICATIONS OUTSIDE TRANSACTION (FAULT-TOLERANT)
+      // =========================================================================
+      let notifiedOrder = await this.ensureAdminNotified(finalizedOrder, bot);
+      if (notifiedOrder.fulfillmentStatus === 'completed') {
+        notifiedOrder = await this.ensureBuyerNotified(notifiedOrder, bot);
+      }
+      return notifiedOrder;
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const canRetry = attempt < this.MAX_FULFILLMENT_ATTEMPTS;
+      const delayMs = this.baseRetryDelayMs * Math.pow(2, Math.max(0, attempt - 1));
+      const nextRetryIso = canRetry ? new Date(nowMs + delayMs).toISOString() : undefined;
+
+      await firestoreRepo.runTransaction<Order>(async (tx) => {
+        const latest = (await tx.get<Order>('orders', claimedOrder.orderId)) || claimedOrder;
+        const failedOrder: Order = {
+          ...latest,
+          fulfillmentStatus: 'failed',
+          fulfillmentLastError: errMsg.slice(0, 500),
+          fulfillmentNextRetryAt: nextRetryIso,
+          needsManualReconciliation: !canRetry,
+          fulfillmentNote: canRetry
+            ? `Ошибка попытки выдачи #${attempt}: ${errMsg}. Запланирован повтор.`
+            : `Выдача остановлена после ${attempt} попыток: ${errMsg}. Требуется ручная выдача админом.`,
+          updatedAt: nowIso,
+        };
+        tx.set<Order>('orders', failedOrder.orderId, failedOrder);
+
+        const txId = sanitizeDocId(
+          `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        );
+        tx.set<StoreTransaction>('transactions', txId, {
+          transactionId: txId,
+          orderId: failedOrder.orderId,
+          userId: failedOrder.userId,
+          type: 'fulfillment_failed',
+          amount: failedOrder.totalPrice,
+          currency: 'XTR',
+          details: `Ошибка выдачи (попытка ${attempt}/${this.MAX_FULFILLMENT_ATTEMPTS}): ${errMsg}`.slice(
+            0,
+            500,
+          ),
+          createdAt: nowIso,
+        });
+
+        return failedOrder;
+      });
+
+      throw error;
+    }
   }
 
   /**
-   * Recovery mechanism for orders where payment transaction committed ('paid'),
-   * but a partial failure occurred before fulfillment was initiated ('fulfillmentStatus === "paid"').
+   * Reconciles an order that was left in 'processing' without an externalExecutionReference
+   * due to a server crash mid-execution.
+   * - If the adapter supports `checkExternalStatus`, queries the provider first.
+   * - If the adapter does not support status checking and is not idempotent, marks the order
+   *   for manual reconciliation (`fulfillmentStatus: 'failed'`, `needsManualReconciliation: true`)
+   *   so the product is NEVER delivered twice!
    */
-  public static async recoverPendingFulfillments(bot: Telegraf): Promise<Order[]> {
-    const stuckOrders = await firestoreRepo.queryDocs<Order>('orders', {
-      where: [{ field: 'fulfillmentStatus', op: '==', value: 'paid' }],
-      orderBy: { field: 'createdAt', direction: 'asc' },
-      limit: 25,
-    });
+  private static async reconcileStaleProcessingOrder(
+    staleOrder: Order,
+    bot: Telegraf | null | undefined,
+  ): Promise<Order> {
+    const idempotencyKey =
+      staleOrder.fulfillmentIdempotencyKey || `fulfill_${staleOrder.orderId}`;
 
-    const recovered: Order[] = [];
-    for (const stuckOrder of stuckOrders) {
-      if (stuckOrder.paymentStatus === 'paid') {
-        try {
-          const updated = await this.initiateFulfillment(stuckOrder, bot);
-          recovered.push(updated);
-        } catch (error) {
-          console.error(
-            `[FulfillmentService] Ошибка восстановления выдачи заказа #${stuckOrder.orderId}:`,
-            error instanceof Error ? error.message : String(error),
-          );
+    if (this.adapter.checkExternalStatus) {
+      const extStatus = await this.adapter.checkExternalStatus(
+        staleOrder,
+        idempotencyKey,
+      );
+      if (extStatus.alreadyExecuted) {
+        const nowIso = new Date().toISOString();
+        const finalStatus = extStatus.status || 'completed';
+        const reconciled = await firestoreRepo.runTransaction<Order>(async (tx) => {
+          const current = (await tx.get<Order>('orders', staleOrder.orderId)) || staleOrder;
+          const updated: Order = {
+            ...current,
+            paymentStatus:
+              finalStatus === 'completed' ? 'completed' : current.paymentStatus,
+            fulfillmentStatus: finalStatus,
+            fulfillmentNote: (
+              extStatus.details ||
+              'Статус выдачи восстановлен после сверки с внешним провайдером.'
+            ).slice(0, 500),
+            externalExecutionReference:
+              extStatus.externalReference || `reconciled_${idempotencyKey}`,
+            fulfillmentLastError: undefined,
+            completedAt:
+              finalStatus === 'completed'
+                ? current.completedAt || nowIso
+                : current.completedAt,
+            updatedAt: nowIso,
+          };
+          tx.set<Order>('orders', updated.orderId, updated);
+          return updated;
+        });
+
+        let notified = await this.ensureAdminNotified(reconciled, bot);
+        if (notified.fulfillmentStatus === 'completed') {
+          notified = await this.ensureBuyerNotified(notified, bot);
         }
+        return notified;
       }
     }
-    return recovered;
+
+    // If provider does not support idempotency and we cannot verify external status,
+    // NEVER re-execute automatically to prevent double fulfillment!
+    if (!this.adapter.supportsIdempotency && !this.adapter.checkExternalStatus) {
+      const nowIso = new Date().toISOString();
+      const quarantined = await firestoreRepo.runTransaction<Order>(async (tx) => {
+        const current = (await tx.get<Order>('orders', staleOrder.orderId)) || staleOrder;
+        const updated: Order = {
+          ...current,
+          fulfillmentStatus: 'failed',
+          needsManualReconciliation: true,
+          fulfillmentLastError:
+            'Сервер перезапустился во время внешнего вызова без подтверждения статуса. Автоповтор заблокирован для защиты от двойной выдачи.',
+          fulfillmentNote:
+            'Требуется ручная сверка администратором (защита от двойной выдачи после перезапуска).',
+          updatedAt: nowIso,
+        };
+        tx.set<Order>('orders', updated.orderId, updated);
+        return updated;
+      });
+      return this.ensureAdminNotified(quarantined, bot);
+    }
+
+    // Adapter is explicitly idempotent (or checkExternalStatus confirmed it wasn't executed yet):
+    // Reset to 'paid' inside transaction and run initiateFulfillment with the same idempotencyKey
+    await firestoreRepo.runTransaction<void>(async (tx) => {
+      const current = await tx.get<Order>('orders', staleOrder.orderId);
+      if (!current || current.fulfillmentStatus !== 'processing') return;
+      tx.set<Order>('orders', current.orderId, {
+        ...current,
+        fulfillmentStatus: 'paid',
+        updatedAt: new Date().toISOString(),
+      });
+    });
+
+    const refreshed = (await OrderService.getOrderById(staleOrder.orderId)) || staleOrder;
+    return this.initiateFulfillment(refreshed, bot, { allowStaleTakeover: true });
+  }
+
+  /**
+   * Recovery worker pass:
+   * - Recovers orders in 'paid' (payment committed, fulfillment not started)
+   * - Retries eligible orders in 'failed' whose backoff delay has elapsed and attempts < MAX_FULFILLMENT_ATTEMPTS
+   * - Recovers stale 'processing' orders or retries missing admin/buyer notifications
+   * Guarded by `isRecoveryPassRunning` mutex so two recovery passes never overlap.
+   */
+  public static async recoverPendingFulfillments(
+    bot: Telegraf | null | undefined,
+  ): Promise<Order[]> {
+    if (this.isRecoveryPassRunning) {
+      return [];
+    }
+    if (!firestoreRepo.isProductionStorageHealthy()) {
+      return [];
+    }
+
+    this.isRecoveryPassRunning = true;
+    const recovered: Order[] = [];
+
+    try {
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+
+      // 1. Orders in 'paid' status
+      const paidOrders = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'fulfillmentStatus', op: '==', value: 'paid' }],
+        orderBy: { field: 'createdAt', direction: 'asc' },
+        limit: 25,
+      });
+
+      for (const ord of paidOrders) {
+        if (ord.paymentStatus === 'paid') {
+          try {
+            const updated = await this.initiateFulfillment(ord, bot);
+            recovered.push(updated);
+          } catch (error) {
+            console.error(
+              `[FulfillmentService] Ошибка восстановления paid-заказа #${ord.orderId}:`,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        }
+      }
+
+      // 2. Retryable 'failed' orders whose backoff timer has elapsed
+      const failedOrders = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'fulfillmentStatus', op: '==', value: 'failed' }],
+        orderBy: { field: 'createdAt', direction: 'asc' },
+        limit: 25,
+      });
+
+      for (const ord of failedOrders) {
+        const attempts = ord.fulfillmentAttempts ?? 0;
+        const retryDue =
+          !ord.fulfillmentNextRetryAt || ord.fulfillmentNextRetryAt <= nowIso;
+        if (
+          !ord.needsManualReconciliation &&
+          attempts < this.MAX_FULFILLMENT_ATTEMPTS &&
+          retryDue
+        ) {
+          try {
+            const updated = await this.initiateFulfillment(ord, bot);
+            recovered.push(updated);
+          } catch (error) {
+            console.error(
+              `[FulfillmentService] Повторная попытка выдачи заказа #${ord.orderId} завершилась ошибкой:`,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        } else if (!ord.adminNotifiedAt) {
+          await this.ensureAdminNotified(ord, bot);
+        }
+      }
+
+      // 3. Stale 'processing' orders or orders with undelivered admin notifications
+      const processingOrders = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
+        orderBy: { field: 'createdAt', direction: 'asc' },
+        limit: 25,
+      });
+
+      for (const ord of processingOrders) {
+        const startedMs = ord.fulfillmentStartedAt
+          ? Date.parse(ord.fulfillmentStartedAt)
+          : 0;
+        const isStale =
+          startedMs > 0 && nowMs - startedMs >= this.staleProcessingLeaseMs;
+
+        if (!ord.externalExecutionReference && isStale) {
+          try {
+            const reconciled = await this.reconcileStaleProcessingOrder(ord, bot);
+            recovered.push(reconciled);
+          } catch (error) {
+            console.error(
+              `[FulfillmentService] Ошибка сверки зависшего заказа #${ord.orderId}:`,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        } else if (!ord.adminNotifiedAt) {
+          const notified = await this.ensureAdminNotified(ord, bot);
+          if (notified.adminNotifiedAt) {
+            recovered.push(notified);
+          }
+        }
+      }
+
+      return recovered;
+    } finally {
+      this.isRecoveryPassRunning = false;
+    }
+  }
+
+  /**
+   * Starts the singleton background recovery worker after DB initialization.
+   * Calling multiple times is safe and never creates duplicate workers.
+   */
+  public static startRecoveryWorker(
+    getBot: () => Telegraf | null,
+    intervalMs = 30_000,
+  ): void {
+    if (this.recoveryIntervalHandle) {
+      return;
+    }
+
+    // Run initial recovery pass asynchronously without blocking startup
+    void this.recoverPendingFulfillments(getBot()).catch((err) => {
+      console.error(
+        '[FulfillmentService] Ошибка стартового прохода recoverPendingFulfillments:',
+        err instanceof Error ? err.message : String(err),
+      );
+    });
+
+    this.recoveryIntervalHandle = setInterval(() => {
+      void this.recoverPendingFulfillments(getBot()).catch((err) => {
+        console.error(
+          '[FulfillmentService] Ошибка фонового прохода recoverPendingFulfillments:',
+          err instanceof Error ? err.message : String(err),
+        );
+      });
+    }, intervalMs);
+
+    this.recoveryIntervalHandle.unref?.();
+  }
+
+  public static stopRecoveryWorker(): void {
+    if (this.recoveryIntervalHandle) {
+      clearInterval(this.recoveryIntervalHandle);
+      this.recoveryIntervalHandle = null;
+    }
+  }
+
+  public static isRecoveryWorkerActive(): boolean {
+    return this.recoveryIntervalHandle !== null;
   }
 
   /**
    * Completes an order (called by admin after manual delivery or by verified adapter)
-   * and notifies the buyer in Telegram chat.
+   * and notifies the buyer in Telegram chat (with optional delivery message, code, or link).
    */
   public static async completeOrder(params: {
     orderId: string;
     adminNote?: string;
-    bot: Telegraf;
+    adminTelegramId?: number;
+    bot?: Telegraf | null;
   }): Promise<Order> {
     const note =
       params.adminNote?.trim() || 'Товар успешно выдан администратором магазина.';
+    const adminInfo = params.adminTelegramId
+      ? ` (админ ID: ${params.adminTelegramId})`
+      : '';
 
     const claimResult = await firestoreRepo.runTransaction<{
       newlyCompleted: boolean;
@@ -233,42 +758,38 @@ export class FulfillmentService {
         paymentStatus: 'completed',
         fulfillmentStatus: 'completed',
         fulfillmentNote: note.slice(0, 500),
+        fulfillmentLastError: undefined,
+        fulfillmentNextRetryAt: undefined,
+        needsManualReconciliation: false,
         completedAt: existing.completedAt || now,
         updatedAt: now,
       };
 
       tx.set<Order>('orders', completedOrder.orderId, completedOrder);
+
+      const txId = sanitizeDocId(
+        `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      );
+      tx.set<StoreTransaction>('transactions', txId, {
+        transactionId: txId,
+        orderId: completedOrder.orderId,
+        userId: completedOrder.userId,
+        type: 'fulfillment_completed',
+        amount: completedOrder.totalPrice,
+        currency: 'XTR',
+        details: `Заказ выдан покупателю${adminInfo}: ${note}`.slice(0, 500),
+        createdAt: now,
+      });
+
       return { newlyCompleted: true, order: completedOrder };
     });
 
-    if (!claimResult.newlyCompleted) {
-      return claimResult.order;
-    }
+    // Ensure buyer notification is sent (or retried if previously undelivered)
+    const finalOrder = await this.ensureBuyerNotified(
+      claimResult.order,
+      params.bot,
+    );
 
-    const completedOrder = claimResult.order;
-
-    await OrderService.logTransaction({
-      orderId: completedOrder.orderId,
-      userId: completedOrder.userId,
-      type: 'fulfillment_completed',
-      amount: completedOrder.totalPrice,
-      details: `Заказ выдан покупателю: ${note}`,
-    });
-
-    // Notify the customer in Telegram
-    try {
-      await params.bot.telegram.sendMessage(
-        completedOrder.userTelegramId,
-        formatOrderCompletedUserNotice(completedOrder),
-        { parse_mode: 'HTML' },
-      );
-    } catch (error) {
-      console.warn(
-        `[FulfillmentService] Не удалось уведомить покупателя ${completedOrder.userTelegramId}:`,
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-
-    return completedOrder;
+    return finalOrder;
   }
 }

@@ -204,6 +204,25 @@ export function buildAdminOrderActionKeyboard(order: Order) {
         `adm:ord_done:${order.orderId}`,
       ),
     ]);
+    rows.push([
+      Markup.button.callback(
+        '📝 Выдать с кодом / сообщением',
+        `adm:ord_note:${order.orderId}`,
+      ),
+    ]);
+  }
+
+  if (
+    order.paymentStatus === 'paid' ||
+    order.paymentStatus === 'processing' ||
+    order.paymentStatus === 'completed'
+  ) {
+    rows.push([
+      Markup.button.callback(
+        '🔔 Повторить уведомление',
+        `adm:ord_notify:${order.orderId}`,
+      ),
+    ]);
   }
 
   if (

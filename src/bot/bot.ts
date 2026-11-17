@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { Telegraf } from 'telegraf';
 import { Request, Response } from 'express';
 import { getEnvConfig } from '../config/env.ts';
@@ -6,9 +7,46 @@ import { registerUserHandlers } from './handlers/userHandler.ts';
 import { registerPaymentHandlers } from './handlers/paymentHandler.ts';
 import { registerAdminHandlers } from './handlers/adminHandler.ts';
 
-function maskSecretInError(msg: string, token: string): string {
-  if (!token) return msg;
-  return msg.split(token).join('[REDACTED_BOT_TOKEN]');
+export function maskSecretsInText(
+  msg: string,
+  secrets: Array<string | undefined>,
+): string {
+  let result = msg;
+  for (const secret of secrets) {
+    if (secret && secret.trim().length > 0) {
+      result = result.split(secret).join('[REDACTED_SECRET]');
+    }
+  }
+  return result;
+}
+
+export function verifyWebhookSecretToken(
+  expectedSecret: string | undefined,
+  providedHeader: string | undefined,
+): boolean {
+  if (!expectedSecret || !expectedSecret.trim()) {
+    return false;
+  }
+  if (!providedHeader || typeof providedHeader !== 'string') {
+    return false;
+  }
+  const expectedBuf = Buffer.from(expectedSecret, 'utf-8');
+  const providedBuf = Buffer.from(providedHeader, 'utf-8');
+  if (expectedBuf.length !== providedBuf.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(expectedBuf, providedBuf);
+}
+
+export function isValidTelegramUpdatePayload(body: unknown): body is {
+  update_id: number;
+  [key: string]: unknown;
+} {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return false;
+  }
+  const rec = body as Record<string, unknown>;
+  return typeof rec.update_id === 'number' && Number.isInteger(rec.update_id);
 }
 
 class TelegramBotManager {
@@ -40,6 +78,34 @@ class TelegramBotManager {
     const config = getEnvConfig();
     const token = config.telegramBotToken;
 
+    // Validate mandatory webhook configuration before connecting
+    if (config.botMode === 'webhook') {
+      if (!config.webhookSecret || config.webhookSecret.trim().length === 0) {
+        const errText =
+          'КРИТИЧЕСКАЯ ОШИБКА КОНФИГУРАЦИИ: В режиме webhook переменная WEBHOOK_SECRET обязательна и не может быть пустой.';
+        this.status = {
+          connected: false,
+          mode: 'webhook',
+          pollingActive: false,
+          lastCheckedAt: new Date().toISOString(),
+          error: errText,
+        };
+        throw new Error(errText);
+      }
+      if (!config.webhookUrl || config.webhookUrl.trim().length === 0) {
+        const errText =
+          'КРИТИЧЕСКАЯ ОШИБКА КОНФИГУРАЦИИ: В режиме webhook переменная WEBHOOK_URL обязательна и не может быть пустой.';
+        this.status = {
+          connected: false,
+          mode: 'webhook',
+          pollingActive: false,
+          lastCheckedAt: new Date().toISOString(),
+          error: errText,
+        };
+        throw new Error(errText);
+      }
+    }
+
     if (!token) {
       this.status = {
         connected: false,
@@ -55,12 +121,13 @@ class TelegramBotManager {
       return this.getStatus();
     }
 
-    // Prevent starting duplicate polling instances if already connected with same token
-    const tokenFingerprint = `${token.length}:${token.slice(0, 4)}`;
+    // Prevent starting duplicate polling instances if already connected with same token and mode
+    const tokenFingerprint = `${config.botMode}:${token.length}:${token.slice(0, 4)}`;
     if (
       this.bot &&
       this.status.connected &&
-      this.activeTokenHash === tokenFingerprint
+      this.activeTokenHash === tokenFingerprint &&
+      (config.botMode === 'webhook' || this.pollingStarted)
     ) {
       return this.getStatus();
     }
@@ -80,10 +147,14 @@ class TelegramBotManager {
 
       const bot = new Telegraf(token);
 
-      // Global error handler that never leaks the token
+      // Global error handler that never leaks secrets
       bot.catch((err, ctx) => {
         const rawMsg = err instanceof Error ? err.message : String(err);
-        const safeMsg = maskSecretInError(rawMsg, token);
+        const safeMsg = maskSecretsInText(rawMsg, [
+          token,
+          config.webhookSecret,
+          config.firebasePrivateKey,
+        ]);
         console.error(
           `[TelegramBot] Ошибка при обработке обновления (${ctx.updateType}): ${safeMsg}`,
         );
@@ -117,12 +188,12 @@ class TelegramBotManager {
       this.activeTokenHash = tokenFingerprint;
 
       // 3. Configure Webhook or Polling mode
-      if (config.botMode === 'webhook' && config.webhookUrl) {
+      if (config.botMode === 'webhook') {
         const normalizedBase = config.webhookUrl.replace(/\/+$/, '');
         const fullWebhookUrl = `${normalizedBase}/webhook/telegram`;
 
         await bot.telegram.setWebhook(fullWebhookUrl, {
-          secret_token: config.webhookSecret || undefined,
+          secret_token: config.webhookSecret,
           allowed_updates: [
             'message',
             'callback_query',
@@ -142,7 +213,7 @@ class TelegramBotManager {
         };
 
         console.log(
-          `[TelegramBot] 🚀 Бот @${me.username} запущен в режиме WEBHOOK (${fullWebhookUrl})`,
+          `[TelegramBot] 🚀 Бот @${me.username} запущен в защищённом режиме WEBHOOK (${fullWebhookUrl})`,
         );
       } else {
         // Ensure webhook is removed before starting long polling to prevent conflicts
@@ -157,7 +228,10 @@ class TelegramBotManager {
           .catch((launchErr) => {
             const rawMsg =
               launchErr instanceof Error ? launchErr.message : String(launchErr);
-            const safeMsg = maskSecretInError(rawMsg, token);
+            const safeMsg = maskSecretsInText(rawMsg, [
+              token,
+              config.webhookSecret,
+            ]);
             console.error(`[TelegramBot] Ошибка фонового polling: ${safeMsg}`);
             this.pollingStarted = false;
             this.status.pollingActive = false;
@@ -183,7 +257,11 @@ class TelegramBotManager {
       return this.getStatus();
     } catch (error) {
       const rawMsg = error instanceof Error ? error.message : String(error);
-      const safeMsg = maskSecretInError(rawMsg, token);
+      const safeMsg = maskSecretsInText(rawMsg, [
+        token,
+        config.webhookSecret,
+        config.firebasePrivateKey,
+      ]);
       this.pollingStarted = false;
       this.status = {
         connected: false,
@@ -199,29 +277,58 @@ class TelegramBotManager {
     }
   }
 
+  /**
+   * Handles incoming Telegram Webhook HTTP POST requests.
+   * Enforces mandatory constant-time verification of `X-Telegram-Bot-Api-Secret-Token`
+   * and rejects any unauthenticated or malformed update payloads.
+   */
   public async handleWebhookRequest(req: Request, res: Response): Promise<void> {
     const config = getEnvConfig();
+
+    // 1. Always verify WEBHOOK_SECRET is configured and matches header BEFORE anything else
+    if (!config.webhookSecret || config.webhookSecret.trim().length === 0) {
+      res.status(503).json({
+        ok: false,
+        error: 'Webhook secret is not configured on server',
+      });
+      return;
+    }
+
+    const headerSecret = req.header('X-Telegram-Bot-Api-Secret-Token');
+    if (!verifyWebhookSecretToken(config.webhookSecret, headerSecret)) {
+      res.status(401).json({
+        ok: false,
+        error: 'Unauthorized: invalid or missing X-Telegram-Bot-Api-Secret-Token',
+      });
+      return;
+    }
+
+    // 2. Validate Telegram Update payload structure
+    if (!isValidTelegramUpdatePayload(req.body)) {
+      res.status(400).json({
+        ok: false,
+        error: 'Bad Request: invalid Telegram update payload',
+      });
+      return;
+    }
+
+    // 3. Ensure bot instance is ready
     if (!this.bot || !this.status.connected) {
       res.status(503).json({ ok: false, error: 'Telegram bot is not connected' });
       return;
     }
 
-    if (config.webhookSecret) {
-      const headerSecret = req.header('X-Telegram-Bot-Api-Secret-Token');
-      if (headerSecret !== config.webhookSecret) {
-        res.status(401).json({ ok: false, error: 'Invalid webhook secret token' });
-        return;
-      }
-    }
-
     try {
-      await this.bot.handleUpdate(req.body, res);
+      await this.bot.handleUpdate(req.body as unknown as Parameters<Telegraf['handleUpdate']>[0], res);
       if (!res.headersSent) {
         res.status(200).json({ ok: true });
       }
     } catch (error) {
       const rawMsg = error instanceof Error ? error.message : String(error);
-      const safeMsg = maskSecretInError(rawMsg, config.telegramBotToken);
+      const safeMsg = maskSecretsInText(rawMsg, [
+        config.telegramBotToken,
+        config.webhookSecret,
+      ]);
       console.error('[TelegramBot] Ошибка обработки webhook update:', safeMsg);
       if (!res.headersSent) {
         res.status(500).json({ ok: false });
