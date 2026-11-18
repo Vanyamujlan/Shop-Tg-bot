@@ -1,6 +1,7 @@
 /**
  * Firestore Security Rules Test Specification (Dirty Dozen Verification)
  * Verifies all 12 adversarial payloads defined in security_spec.md return PERMISSION_DENIED.
+ * Strictly anonymized (zero personal emails or real Telegram IDs).
  */
 
 export interface DirtyDozenTestCase {
@@ -9,7 +10,7 @@ export interface DirtyDozenTestCase {
   collection: string;
   docId: string;
   operation: 'get' | 'list' | 'create' | 'update' | 'delete';
-  auth: { uid: string; email?: string; email_verified?: boolean } | null;
+  auth: { uid: string; email?: string; email_verified?: boolean; admin?: boolean } | null;
   payload?: Record<string, unknown>;
   expectedResult: 'PERMISSION_DENIED';
 }
@@ -27,11 +28,11 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
   },
   {
     id: 2,
-    name: 'Unverified Email Admin Spoof',
+    name: 'Unverified Admin Claim Spoof',
     collection: 'products',
     docId: 'stars_100',
     operation: 'create',
-    auth: { uid: 'spoof_1', email: 'vanyamujlan@gmail.com', email_verified: false },
+    auth: { uid: 'spoof_1', email: 'spoof@example.test', email_verified: false, admin: true },
     payload: { id: 'stars_100', name: '100 Stars', category: 'stars', price: 100 },
     expectedResult: 'PERMISSION_DENIED',
   },
@@ -39,13 +40,13 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     id: 3,
     name: 'Shadow Field Injection on User Profile',
     collection: 'users',
-    docId: 'user_1',
+    docId: 'usr_syn_01',
     operation: 'create',
-    auth: { uid: 'user_1', email: 'user1@example.com', email_verified: true },
+    auth: { uid: 'usr_syn_01', email: 'user1@example.test', email_verified: true },
     payload: {
-      userId: 'user_1',
-      telegramId: 12345,
-      firstName: 'Ivan',
+      userId: 'usr_syn_01',
+      telegramId: 900001001,
+      firstName: 'SyntheticUser',
       isBlocked: false,
       totalOrders: 0,
       totalSpentStars: 0,
@@ -57,22 +58,22 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     id: 4,
     name: 'PII Blanket Read on Another User',
     collection: 'users',
-    docId: 'user_1',
+    docId: 'usr_syn_01',
     operation: 'get',
-    auth: { uid: 'user_2', email: 'user2@example.com', email_verified: true },
+    auth: { uid: 'usr_syn_02', email: 'user2@example.test', email_verified: true },
     expectedResult: 'PERMISSION_DENIED',
   },
   {
     id: 5,
     name: 'Identity Spoofing on Order Creation',
     collection: 'orders',
-    docId: 'order_1',
+    docId: 'ord_syn_01',
     operation: 'create',
-    auth: { uid: 'user_1', email: 'user1@example.com', email_verified: true },
+    auth: { uid: 'usr_syn_01', email: 'user1@example.test', email_verified: true },
     payload: {
-      orderId: 'order_1',
-      userId: 'user_2',
-      userTelegramId: 12345,
+      orderId: 'ord_syn_01',
+      userId: 'usr_syn_02',
+      userTelegramId: 900001001,
       productId: 'stars_100',
       productName: '100 Stars',
       category: 'stars',
@@ -88,13 +89,13 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     id: 6,
     name: 'Client-Side Order Status Forgery (paid)',
     collection: 'orders',
-    docId: 'order_1',
+    docId: 'ord_syn_01',
     operation: 'create',
-    auth: { uid: 'user_1', email: 'user1@example.com', email_verified: true },
+    auth: { uid: 'usr_syn_01', email: 'user1@example.test', email_verified: true },
     payload: {
-      orderId: 'order_1',
-      userId: 'user_1',
-      userTelegramId: 12345,
+      orderId: 'ord_syn_01',
+      userId: 'usr_syn_01',
+      userTelegramId: 900001001,
       productId: 'stars_100',
       productName: '100 Stars',
       category: 'stars',
@@ -110,9 +111,9 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     id: 7,
     name: 'Terminal State Mutation on Completed Order',
     collection: 'orders',
-    docId: 'order_completed',
+    docId: 'ord_syn_completed',
     operation: 'update',
-    auth: { uid: 'user_1', email: 'user1@example.com', email_verified: true },
+    auth: { uid: 'usr_syn_01', email: 'user1@example.test', email_verified: true },
     payload: { paymentStatus: 'cancelled', fulfillmentStatus: 'cancelled' },
     expectedResult: 'PERMISSION_DENIED',
   },
@@ -120,18 +121,18 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     id: 8,
     name: 'Direct Payment Record Forgery by Non-Admin',
     collection: 'payments',
-    docId: 'pay_1',
+    docId: 'pay_syn_01',
     operation: 'create',
-    auth: { uid: 'user_1', email: 'user1@example.com', email_verified: true },
+    auth: { uid: 'usr_syn_01', email: 'user1@example.test', email_verified: true },
     payload: {
-      paymentId: 'pay_1',
-      telegramPaymentChargeId: 'chg_1',
-      orderId: 'order_1',
-      userId: 'user_1',
-      userTelegramId: 12345,
+      paymentId: 'pay_syn_01',
+      telegramPaymentChargeId: 'chg_syn_01',
+      orderId: 'ord_syn_01',
+      userId: 'usr_syn_01',
+      userTelegramId: 900001001,
       totalAmount: 100,
       currency: 'XTR',
-      invoicePayload: 'order_1',
+      invoicePayload: 'ord_syn_01',
       status: 'paid',
     },
     expectedResult: 'PERMISSION_DENIED',
@@ -142,7 +143,7 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     collection: 'products',
     docId: 'stars_100',
     operation: 'create',
-    auth: { uid: 'admin_1', email: 'vanyamujlan@gmail.com', email_verified: true },
+    auth: { uid: 'adm_syn_01', email: 'admin@example.test', email_verified: true, admin: true },
     payload: {
       id: 'stars_100',
       name: '100 Stars',
@@ -159,7 +160,7 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     collection: 'products',
     docId: 'invalid$id!@#',
     operation: 'create',
-    auth: { uid: 'admin_1', email: 'vanyamujlan@gmail.com', email_verified: true },
+    auth: { uid: 'adm_syn_01', email: 'admin@example.test', email_verified: true, admin: true },
     payload: { id: 'invalid$id!@#', name: 'Bad ID', category: 'stars', price: 100 },
     expectedResult: 'PERMISSION_DENIED',
   },
@@ -167,10 +168,10 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     id: 11,
     name: 'Immutable Field Modification (createdAt)',
     collection: 'orders',
-    docId: 'order_1',
+    docId: 'ord_syn_01',
     operation: 'update',
-    auth: { uid: 'user_1', email: 'user1@example.com', email_verified: true },
-    payload: { createdAt: '2099-01-01T00:00:00Z' },
+    auth: { uid: 'usr_syn_01', email: 'user1@example.test', email_verified: true },
+    payload: { createdAt: '2099-01-01T00:00:00.000Z' },
     expectedResult: 'PERMISSION_DENIED',
   },
   {
@@ -179,7 +180,7 @@ export const DIRTY_DOZEN_TESTS: DirtyDozenTestCase[] = [
     collection: 'orders',
     docId: '*',
     operation: 'list',
-    auth: { uid: 'user_2', email: 'user2@example.com', email_verified: true },
+    auth: { uid: 'usr_syn_02', email: 'user2@example.test', email_verified: true },
     expectedResult: 'PERMISSION_DENIED',
   },
 ];

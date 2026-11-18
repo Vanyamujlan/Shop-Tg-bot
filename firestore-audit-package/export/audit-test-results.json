@@ -1,0 +1,343 @@
+{
+  "executedAt": "2026-11-18T07:27:58.378Z",
+  "emulatorHost": "127.0.0.1:8080",
+  "projectId": "demo-stars-shop-audit",
+  "totalTests": 37,
+  "passed": 37,
+  "failed": 0,
+  "results": [
+    {
+      "id": "ENV-01",
+      "suite": "Environment",
+      "name": "Блокировка при отсутствии FIRESTORE_EMULATOR_HOST",
+      "whatWasTested": "Проверка, что assertEmulatorOnlyEnvironment выбрасывает ProductionGuardError, если FIRESTORE_EMULATOR_HOST не задан",
+      "status": "PASS",
+      "durationMs": 0,
+      "details": "Запуск без FIRESTORE_EMULATOR_HOST заблокирован через ProductionGuardError."
+    },
+    {
+      "id": "ENV-02",
+      "suite": "Environment",
+      "name": "Блокировка Production projectId и внешних хостов",
+      "whatWasTested": "Проверка запрета подключения к реальному проекту tg-1-675b4 или нелокальному хосту",
+      "status": "PASS",
+      "durationMs": 0,
+      "details": "Реальный projectId (tg-1-675b4) и внешние хосты жёстко заблокированы."
+    },
+    {
+      "id": "ENV-03",
+      "suite": "Environment",
+      "name": "Блокировка при наличии реальных сервисных ключей в окружении",
+      "whatWasTested": "Проверка запрета запуска при наличии FIREBASE_PRIVATE_KEY или FIREBASE_CLIENT_EMAIL",
+      "status": "PASS",
+      "durationMs": 0,
+      "details": "Присутствие сервисных ключей в переменных окружения заблокировано."
+    },
+    {
+      "id": "ENV-04",
+      "suite": "Environment",
+      "name": "Реальное подключение к Firebase Firestore Emulator и загрузка 12 сценариев",
+      "whatWasTested": "Проверка инициализации Admin SDK поверх локального Firestore Emulator (127.0.0.1:8080) и сидинга 7 коллекций",
+      "status": "PASS",
+      "durationMs": 3762,
+      "details": "Успешно подключён к Emulator (127.0.0.1:8080, project: demo-stars-shop-audit). Записано 54 документа в 7 коллекциях."
+    },
+    {
+      "id": "INT-01",
+      "suite": "Integrity",
+      "name": "Каждый платёж связан с существующим заказом",
+      "whatWasTested": "Сверка ссылочной целостности PaymentRecord.orderId -> Order.orderId в Emulator",
+      "status": "PASS",
+      "durationMs": 142,
+      "details": "Проверено 10 документов payments: каждый связан с существующим заказом и совпадает по telegramPaymentChargeId."
+    },
+    {
+      "id": "INT-02",
+      "suite": "Integrity",
+      "name": "Сумма платежа соответствует сумме заказа и цене товара",
+      "whatWasTested": "Сверка PaymentRecord.totalAmount == Order.totalPrice == Product.price * Order.quantity",
+      "status": "PASS",
+      "durationMs": 174,
+      "details": "Все 10 платежей и заказов имеют математически точное совпадение сумм (totalAmount == totalPrice == price * quantity)."
+    },
+    {
+      "id": "INT-03",
+      "suite": "Integrity",
+      "name": "Валюта всех товаров, заказов, платежей и транзакций — строго XTR",
+      "whatWasTested": "Проверка поля currency === \"XTR\" во всех финансовых документах базы",
+      "status": "PASS",
+      "durationMs": 52,
+      "details": "Проверено 47 документов: везде установлена валюта Telegram Stars (XTR)."
+    },
+    {
+      "id": "INT-04",
+      "suite": "Integrity",
+      "name": "Каждый заказ ссылается на существующий товар и существующего пользователя",
+      "whatWasTested": "Проверка внешних ключей Order.productId -> Product.id и Order.userId -> StoreUser.userId",
+      "status": "PASS",
+      "durationMs": 202,
+      "details": "Все 12 заказов ссылаются на валидные документы в коллекциях products и users."
+    },
+    {
+      "id": "INT-05",
+      "suite": "Integrity",
+      "name": "Запрет завершения заказа или перевода в paid без подтверждённой оплаты",
+      "whatWasTested": "Проверка, что completeOrder и markOrderPaid блокируют неоплаченный заказ (ord_syn_pending_01)",
+      "status": "PASS",
+      "durationMs": 67,
+      "details": "Попытки завершить заказ без оплаты или отметить заказ оплаченным без PaymentRecord жёстко отклонены."
+    },
+    {
+      "id": "INT-06",
+      "suite": "Integrity",
+      "name": "Запрет повторной обработки одного telegram_payment_charge_id",
+      "whatWasTested": "Проверка идемпотентности PaymentService.processSuccessfulPayment на уже существующем charge_id",
+      "status": "PASS",
+      "durationMs": 58,
+      "details": "Повторный вызов с тем же telegram_payment_charge_id распознан как дубликат без изменения баланса и заказов."
+    },
+    {
+      "id": "INT-07",
+      "suite": "Integrity",
+      "name": "Запрет двойной выдачи одного заказа",
+      "whatWasTested": "Проверка идемпотентности completeOrder и initiateFulfillment для уже выданного заказа ord_syn_completed_04",
+      "status": "PASS",
+      "durationMs": 52,
+      "details": "Повторное завершение и повторный запуск выдачи для completed-заказа полностью идемпотентны."
+    },
+    {
+      "id": "INT-08",
+      "suite": "Integrity",
+      "name": "Допустимость переходов и комбинаций статусов заказов",
+      "whatWasTested": "Проверка всех заказов на соответствие матрице допустимых пар (paymentStatus, fulfillmentStatus)",
+      "status": "PASS",
+      "durationMs": 11,
+      "details": "Все 12 заказов находятся в строго валидных состояниях конечного автомата."
+    },
+    {
+      "id": "INT-09",
+      "suite": "Integrity",
+      "name": "Отсутствие пропущенных обязательных полей во всех 7 коллекциях",
+      "whatWasTested": "Проверка наличия всех required-полей согласно firebase-blueprint.json и src/types.ts",
+      "status": "PASS",
+      "durationMs": 81,
+      "details": "Проверено 54 документов во всех 7 коллекциях: все обязательные поля присутствуют."
+    },
+    {
+      "id": "INT-10",
+      "suite": "Integrity",
+      "name": "Строгое соответствие типов данных во всех документах",
+      "whatWasTested": "Проверка типов string, number, boolean, enum и формата ISO-8601 дат во всех документах",
+      "status": "PASS",
+      "durationMs": 21,
+      "details": "Все поля во всех коллекциях имеют корректные примитивные типы и валидные метки времени ISO-8601."
+    },
+    {
+      "id": "INT-11",
+      "suite": "Integrity",
+      "name": "Межколлекционная согласованность агрегатов users, orders, payments и transactions",
+      "whatWasTested": "Сверка суммы totalOrders и totalSpentStars каждого пользователя с его реально оплаченными заказами и платежами",
+      "status": "PASS",
+      "durationMs": 45,
+      "details": "Полная согласованность между users (4), orders (12), payments (10) и transactions (19) подтверждена."
+    },
+    {
+      "id": "SEC-01",
+      "suite": "SecurityRules",
+      "name": "Пользователь не может читать чужие заказы (get и list)",
+      "whatWasTested": "Проверка отказа PERMISSION_DENIED при попытке чтения чужого заказа и разрешения чтения собственного заказа",
+      "status": "PASS",
+      "durationMs": 780,
+      "details": "Чужие заказы недоступны ни через getDoc, ни через list; свои заказы читаются корректно."
+    },
+    {
+      "id": "SEC-02",
+      "suite": "SecurityRules",
+      "name": "Пользователь не может менять сумму заказа или занижать цену при создании",
+      "whatWasTested": "Проверка блокировки изменения totalPrice в существующем заказе и подмены totalPrice при создании нового заказа",
+      "status": "PASS",
+      "durationMs": 289,
+      "details": "Любая попытка изменить сумму заказа или создать заказ с заниженной ценой блокируется правилами Firestore."
+    },
+    {
+      "id": "SEC-03",
+      "suite": "SecurityRules",
+      "name": "Пользователь не может самостоятельно подтверждать оплату",
+      "whatWasTested": "Проверка запрета создания заказа в статусе paid и запрета перевода pending -> paid от лица покупателя",
+      "status": "PASS",
+      "durationMs": 151,
+      "details": "Самостоятельное подтверждение оплаты покупателем заблокировано при create и update."
+    },
+    {
+      "id": "SEC-04",
+      "suite": "SecurityRules",
+      "name": "Пользователь не может менять статус выдачи на processing или completed",
+      "whatWasTested": "Проверка запрета перевода fulfillmentStatus в processing/completed и разрешения только отмены своего pending-заказа",
+      "status": "PASS",
+      "durationMs": 176,
+      "details": "Покупатель не может менять статус выдачи оплаченных заказов; разрешена только отмена собственного неоплаченного (pending) заказа."
+    },
+    {
+      "id": "SEC-05",
+      "suite": "SecurityRules",
+      "name": "Пользователь не может изменять товары и цены, а также читать скрытые товары",
+      "whatWasTested": "Проверка защиты коллекции products от создания/изменения/удаления обычным пользователем и скрытия архивных товаров",
+      "status": "PASS",
+      "durationMs": 172,
+      "details": "Каталог товаров защищён от модификации покупателями, неактивные товары скрыты от чтения."
+    },
+    {
+      "id": "SEC-06",
+      "suite": "SecurityRules",
+      "name": "Обычный пользователь не может получить права администратора или разблокировать себя",
+      "whatWasTested": "Проверка запрета записи в коллекцию admins, чтения списка админов и модификации isBlocked / totalSpentStars",
+      "status": "PASS",
+      "durationMs": 207,
+      "details": "Повышение привилегий через /admins, снятие блокировки isBlocked и накрутка статистики заблокированы."
+    },
+    {
+      "id": "SEC-07",
+      "suite": "SecurityRules",
+      "name": "Запрет чтения и изменения чужих платежей и прямой подделки платежей",
+      "whatWasTested": "Проверка изоляции коллекции payments между пользователями и запрета клиентской записи/удаления платежей",
+      "status": "PASS",
+      "durationMs": 229,
+      "details": "Платежи доступны только владельцу и администратору на чтение; удаление платежей запрещено даже администратору (append-only аудит)."
+    },
+    {
+      "id": "SEC-08",
+      "suite": "SecurityRules",
+      "name": "Проверка матрицы доступа ко всем 7 коллекциям (settings, transactions, admins, users, products, orders, payments)",
+      "whatWasTested": "Проверка прав чтения/записи для неавторизованного гостя, покупателя и администратора из /admins",
+      "status": "PASS",
+      "durationMs": 299,
+      "details": "Матрица доступа по всем 7 коллекциям соблюдается; права администратора работают через /admins/{uid} без захардкоженных email."
+    },
+    {
+      "id": "SEC-09",
+      "suite": "SecurityRules",
+      "name": "Проверка новых полей идемпотентности/ретраев Order и новых типов транзакций из актуального types.ts",
+      "whatWasTested": "Проверка записи через правила Emulator полей fulfillmentStartedAt, fulfillmentAttempts, needsManualReconciliation, adminNotifiedAt, buyerNotifiedAt и типов транзакций fulfillment_failed, fulfillment_retry, admin_action",
+      "status": "PASS",
+      "durationMs": 167,
+      "details": "Все новые поля Order и новые типы транзакций (fulfillment_failed, fulfillment_retry, admin_action) синхронизированы и валидируются правилами Emulator."
+    },
+    {
+      "id": "SEC-10",
+      "suite": "SecurityRules",
+      "name": "Прогон 12 атакующих пейлоадов (\"Dirty Dozen\") через реальный движок правил Emulator",
+      "whatWasTested": "Проверка того, что все 12 векторов атак из firestore.rules.test.ts получают PERMISSION_DENIED",
+      "status": "PASS",
+      "durationMs": 656,
+      "details": "Все 12/12 атакующих векторов Dirty Dozen заблокированы эмулятором (PERMISSION_DENIED)."
+    },
+    {
+      "id": "IDX-01",
+      "suite": "IndexesQueries",
+      "name": "Сверка всех 10 составных индексов в firestore.indexes.json с запросами в коде",
+      "whatWasTested": "Проверка структуры, коллекций, полей и направлений сортировки всех 10 индексов",
+      "status": "PASS",
+      "durationMs": 1,
+      "details": "Все 10 составных индексов в firestore.indexes.json присутствуют и полностью покрывают все комбинации where + orderBy в коде."
+    },
+    {
+      "id": "IDX-02",
+      "suite": "IndexesQueries",
+      "name": "Выполнение всех 5 индексированных запросов к коллекции orders через Emulator",
+      "whatWasTested": "Реальный прогон запросов по userId, userTelegramId, paymentStatus, fulfillmentStatus (ASC/DESC) в Emulator",
+      "status": "PASS",
+      "durationMs": 60,
+      "details": "Все 5 составных запросов к коллекции orders отработали на Emulator с точным соблюдением фильтрации и порядка."
+    },
+    {
+      "id": "IDX-03",
+      "suite": "IndexesQueries",
+      "name": "Выполнение индексированных запросов к products, payments и transactions через Emulator",
+      "whatWasTested": "Реальный прогон запросов витрины товаров (3 индекса), платежей по статусу и транзакций по типу",
+      "status": "PASS",
+      "durationMs": 63,
+      "details": "Все 5 составных запросов к products, payments и transactions успешно выполнены через Emulator."
+    },
+    {
+      "id": "IDX-04",
+      "suite": "IndexesQueries",
+      "name": "Курсорная пагинация (startAfter) при наличии нескольких заказов с ОДИНАКОВЫМ createdAt timestamp",
+      "whatWasTested": "Постраничный обход 10 заказов пользователя tg_900001002 (включая 3 заказа с createdAt=2026-11-17T10:00:00.000Z) с размером страницы 2",
+      "status": "PASS",
+      "durationMs": 93,
+      "details": "Пройдено 5 страниц (по 2 заказа): возвращены все 10/10 заказов (включая все 3 заказа с одинаковым timestamp 2026-11-17T10:00:00.000Z) без единого пропуска или дубля."
+    },
+    {
+      "id": "IDX-05",
+      "suite": "IndexesQueries",
+      "name": "Проверка корректности сортировки (ASC/DESC) и фильтрации во всех сервисах",
+      "whatWasTested": "Проверка монотонного убывания/возрастания дат и цен в результатах запросов Emulator",
+      "status": "PASS",
+      "durationMs": 27,
+      "details": "Сортировка по дате (DESC) и цене (ASC), а также фильтрация по статусам и категориям работают без ошибок."
+    },
+    {
+      "id": "IDX-06",
+      "suite": "IndexesQueries",
+      "name": "Анализ потенциально опасных запросов для Production Firestore",
+      "whatWasTested": "Проверка отсутствия запросов с неравенством на разных полях, незакрытых составных индексов и скалярных курсоров без tie-breaker",
+      "status": "PASS",
+      "durationMs": 20,
+      "details": "Все запросы в сервисах используют равенство (==) + одиночный orderBy + DocumentSnapshot tie-breaker; запросов, способных вызвать FAILED_PRECONDITION при задеплоенных 10 индексах, не обнаружено."
+    },
+    {
+      "id": "CON-01",
+      "suite": "Concurrency",
+      "name": "Два одновременных уведомления successful_payment на один заказ в Emulator",
+      "whatWasTested": "Параллельный запуск двух транзакций processSuccessfulPayment через Promise.all для заказа ord_syn_pending_01",
+      "status": "PASS",
+      "durationMs": 3525,
+      "details": "Параллельная гонка 2 уведомлений об оплате в Emulator разрешена атомарно: 1 PaymentRecord, +1 к totalOrders, 0 дублей."
+    },
+    {
+      "id": "CON-02",
+      "suite": "Concurrency",
+      "name": "Два одновременных воркера выдачи (initiateFulfillment) на один заказ в Emulator",
+      "whatWasTested": "Параллельный запуск 2 воркеров на оплаченный заказ ord_syn_paid_02 с подсчётом числа вызовов внешнего адаптера",
+      "status": "PASS",
+      "durationMs": 3502,
+      "details": "Атомарный pre-claim в транзакции Emulator предотвратил двойную выдачу: externalAdapterCalls = 1."
+    },
+    {
+      "id": "CON-03",
+      "suite": "Concurrency",
+      "name": "Повторное выполнение уже выданного заказа под параллельной нагрузкой",
+      "whatWasTested": "Одновременный вызов completeOrder и initiateFulfillment для уже завершённого заказа",
+      "status": "PASS",
+      "durationMs": 22,
+      "details": "Повторное параллельное выполнение завершённого заказа полностью заблокировано (0 повторных выдач и сообщений)."
+    },
+    {
+      "id": "CON-04",
+      "suite": "Concurrency",
+      "name": "Перезапуск сервера во время выдачи и сверка статуса через checkExternalStatus",
+      "whatWasTested": "Имитация падения воркера после перевода заказа в processing (истёкший lease) с последующим восстановлением через checkExternalStatus",
+      "status": "PASS",
+      "durationMs": 67,
+      "details": "После перезапуска сервера заказ успешно сверен через checkExternalStatus и завершён без повторного вызова поставщика."
+    },
+    {
+      "id": "CON-05",
+      "suite": "Concurrency",
+      "name": "Потеря ответа от неидемпотентного поставщика (защитный карантин needsManualReconciliation)",
+      "whatWasTested": "Имитация обрыва связи во время вызова неидемпотентного поставщика без checkExternalStatus",
+      "status": "PASS",
+      "durationMs": 49,
+      "details": "При потере ответа от неидемпотентного поставщика заказ переведён в карантин ручной сверки (unsafeCalls = 0)."
+    },
+    {
+      "id": "CON-06",
+      "suite": "Concurrency",
+      "name": "Временная недоступность Firestore и последующее восстановление без потери заказов",
+      "whatWasTested": "Имитация отказа хранилища (StorageUnavailableError) с проверкой блокировки новых заказов и сохранности существующих данных",
+      "status": "PASS",
+      "durationMs": 13,
+      "details": "Во время сбоя БД создание заказов и оплата безопасно блокируются (StorageUnavailableError), а после восстановления все заказы сохранены."
+    }
+  ]
+}

@@ -96,6 +96,56 @@ export class StorageUnavailableError extends Error {
   }
 }
 
+export class ProductionGuardError extends Error {
+  public readonly code = 'PRODUCTION_GUARD_BLOCKED';
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProductionGuardError';
+  }
+}
+
+/**
+ * Hard safety barrier that forbids running audit/seed/test scripts against Production Firestore.
+ * Requires FIRESTORE_EMULATOR_HOST on 127.0.0.1/localhost, a demo-* projectId, and zero real credentials.
+ */
+export function assertEmulatorOnlyEnvironment(
+  targetProjectId = process.env.GCLOUD_PROJECT ||
+    process.env.FIREBASE_PROJECT_ID ||
+    'demo-stars-shop-audit',
+): { emulatorHost: string; projectId: string } {
+  const emulatorHost = (process.env.FIRESTORE_EMULATOR_HOST || '').trim();
+  if (!emulatorHost) {
+    throw new ProductionGuardError(
+      'CRITICAL SAFETY LOCK: Переменная FIRESTORE_EMULATOR_HOST не задана. Запуск аудита/тестов вне локального Firebase Emulator категорически запрещён.',
+    );
+  }
+
+  if (!/^(127\.0\.0\.1|localhost):\d+$/.test(emulatorHost)) {
+    throw new ProductionGuardError(
+      `CRITICAL SAFETY LOCK: Недопустимый хост эмулятора "${emulatorHost}". Разрешены только локальные адреса 127.0.0.1:<port> или localhost:<port>.`,
+    );
+  }
+
+  const projectId = (targetProjectId || '').trim();
+  if (!projectId.startsWith('demo-') || projectId === 'tg-1-675b4') {
+    throw new ProductionGuardError(
+      `CRITICAL SAFETY LOCK: Недопустимый projectId "${projectId}". Для независимого аудита и эмулятора разрешены только синтетические проекты с префиксом "demo-" (например, "demo-stars-shop-audit").`,
+    );
+  }
+
+  if (
+    process.env.FIREBASE_PRIVATE_KEY ||
+    process.env.FIREBASE_CLIENT_EMAIL ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS
+  ) {
+    throw new ProductionGuardError(
+      'CRITICAL SAFETY LOCK: Обнаружены переменные реальных сервисных ключей Firebase (FIREBASE_PRIVATE_KEY / FIREBASE_CLIENT_EMAIL / GOOGLE_APPLICATION_CREDENTIALS). Очистите их перед работой с Emulator.',
+    );
+  }
+
+  return { emulatorHost, projectId };
+}
+
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 export function sanitizeDocId(rawId: string): string {
@@ -166,11 +216,11 @@ function applyInMemorySortAndCursorPagination<T>(
         const cmp = String(va ?? '').localeCompare(String(vb ?? '')) * factor;
         if (cmp !== 0) return cmp;
       }
-      return getDocumentPrimaryKey(recA).localeCompare(getDocumentPrimaryKey(recB));
+      return getDocumentPrimaryKey(recA).localeCompare(getDocumentPrimaryKey(recB)) * factor;
     });
   }
 
-  // Cursor pagination (startAfter)
+  // Cursor pagination (startAfter) with deterministic tie-breaker on document primary key
   if (options?.startAfter !== undefined && options.startAfter !== null && orderField) {
     const cursorVal = options.startAfter;
     const cursorIndex = result.findIndex((item) => {
@@ -192,13 +242,28 @@ function applyInMemorySortAndCursorPagination<T>(
         typeof cursorVal === 'object' && cursorVal !== null && 'value' in cursorVal
           ? (cursorVal as { value: unknown }).value
           : cursorVal;
+      const compareId =
+        typeof cursorVal === 'object' && cursorVal !== null && 'id' in cursorVal
+          ? String((cursorVal as { id: unknown }).id)
+          : null;
       result = result.filter((item) => {
-        const fieldVal = (item as Record<string, unknown>)[orderField];
+        const rec = item as Record<string, unknown>;
+        const fieldVal = rec[orderField];
         if (typeof fieldVal === 'number' && typeof compareVal === 'number') {
-          return direction === 'desc' ? fieldVal < compareVal : fieldVal > compareVal;
+          if (fieldVal !== compareVal) {
+            return direction === 'desc' ? fieldVal < compareVal : fieldVal > compareVal;
+          }
+        } else {
+          const cmp = String(fieldVal ?? '').localeCompare(String(compareVal ?? ''));
+          if (cmp !== 0) {
+            return direction === 'desc' ? cmp < 0 : cmp > 0;
+          }
         }
-        const cmp = String(fieldVal ?? '').localeCompare(String(compareVal ?? ''));
-        return direction === 'desc' ? cmp < 0 : cmp > 0;
+        if (compareId) {
+          const pkCmp = getDocumentPrimaryKey(rec).localeCompare(compareId);
+          return direction === 'desc' ? pkCmp < 0 : pkCmp > 0;
+        }
+        return false;
       });
     }
   } else if (options?.offset && options.offset > 0) {
@@ -215,6 +280,7 @@ export class FirestoreRepository {
   private adminApp: AdminApp | null = null;
   private adminDb: AdminFirestore | null = null;
   private adminReady = false;
+  private emulatorConnected = false;
   private degradedMode = false;
   private isolatedTestMode = false;
   private simulatedFailures: SimulatedFailureConfig = {};
@@ -302,6 +368,61 @@ export class FirestoreRepository {
   public disableIsolatedTestMode(): void {
     this.isolatedTestMode = false;
     this.simulatedFailures = {};
+  }
+
+  /**
+   * Connects FirestoreRepository strictly to the local Firebase Firestore Emulator.
+   * Enforces ProductionGuard before initializing.
+   */
+  public async initWithEmulator(
+    projectId = 'demo-stars-shop-audit',
+  ): Promise<void> {
+    const verified = assertEmulatorOnlyEnvironment(projectId);
+    this.isolatedTestMode = false;
+    this.degradedMode = false;
+    this.simulatedFailures = {};
+
+    const appName = `emulator-audit-${verified.projectId}`;
+    const existing = getAdminApps().find((a) => a.name === appName);
+    this.adminApp =
+      existing ||
+      initializeAdminApp(
+        {
+          projectId: verified.projectId,
+        },
+        appName,
+      );
+
+    this.adminDb = getAdminFirestore(this.adminApp);
+    try {
+      this.adminDb.settings({ ignoreUndefinedProperties: true });
+    } catch {
+      // settings() may already have been called on this instance
+    }
+
+    const probeRef = this.adminDb.collection('_emulator_probe').doc('ping');
+    await probeRef.set({
+      emulatorHost: verified.emulatorHost,
+      projectId: verified.projectId,
+      checkedAt: new Date().toISOString(),
+    });
+    const snap = await probeRef.get();
+    if (!snap.exists) {
+      throw new Error('Не удалось подтвердить запись в локальный Firestore Emulator.');
+    }
+    await probeRef.delete();
+
+    this.adminReady = true;
+    this.emulatorConnected = true;
+    this.adminStatusMessage = `Подключён к локальному Firebase Firestore Emulator (${verified.emulatorHost}, projectId: ${verified.projectId})`;
+  }
+
+  public isEmulatorMode(): boolean {
+    return this.emulatorConnected;
+  }
+
+  public getAdminDbInstance(): AdminFirestore | null {
+    return this.adminDb;
   }
 
   public setSimulatedFailure(config: SimulatedFailureConfig): void {
@@ -733,13 +854,42 @@ export class FirestoreRepository {
           );
         }
         if (options?.startAfter !== undefined && options.startAfter !== null) {
-          const cursorVal =
+          let appliedSnapshotCursor = false;
+          if (
             typeof options.startAfter === 'object' &&
             options.startAfter !== null &&
-            'value' in options.startAfter
-              ? (options.startAfter as { value: unknown }).value
-              : options.startAfter;
-          query = query.startAfter(cursorVal);
+            'id' in options.startAfter &&
+            typeof (options.startAfter as { id: unknown }).id === 'string'
+          ) {
+            const cursorId = sanitizeDocId((options.startAfter as { id: string }).id);
+            const cursorSnap = await this.adminDb.collection(collectionName).doc(cursorId).get();
+            if (cursorSnap.exists) {
+              query = query.startAfter(cursorSnap);
+              appliedSnapshotCursor = true;
+            }
+          } else if (
+            typeof options.startAfter === 'string' &&
+            VALID_ID_REGEX.test(options.startAfter)
+          ) {
+            const cursorSnap = await this.adminDb
+              .collection(collectionName)
+              .doc(sanitizeDocId(options.startAfter))
+              .get();
+            if (cursorSnap.exists) {
+              query = query.startAfter(cursorSnap);
+              appliedSnapshotCursor = true;
+            }
+          }
+
+          if (!appliedSnapshotCursor) {
+            const cursorVal =
+              typeof options.startAfter === 'object' &&
+              options.startAfter !== null &&
+              'value' in options.startAfter
+                ? (options.startAfter as { value: unknown }).value
+                : options.startAfter;
+            query = query.startAfter(cursorVal);
+          }
         } else if (options?.offset && options.offset > 0) {
           query = query.offset(options.offset);
         }

@@ -1,0 +1,370 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1: Global Safety Net (Default-Deny Catch-All)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && (
+        request.auth.token.email_verified == true ||
+        request.auth.token.telegram_verified == true
+      );
+    }
+
+    function isOwner(userId) {
+      return isVerified() && request.auth.uid == userId;
+    }
+
+    // Strictly anonymized RBAC: no personal email hardcoded in rules.
+    // Verifies admin status only via custom claims (admin == true) or /admins/{uid} document.
+    function isAdmin() {
+      return isVerified() && (
+        request.auth.token.admin == true ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Supports both Firestore native Timestamp and ISO-8601 strings from src/types.ts
+    function isValidDateVal(val) {
+      return val is timestamp || (
+        val is string &&
+        val.size() >= 20 &&
+        val.size() <= 40 &&
+        val.matches('^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+\\-]\\d{2}:\\d{2})$')
+      );
+    }
+
+    function isFreshTimestamp(val) {
+      return (val is timestamp && val == request.time) || (
+        val is string &&
+        val.size() >= 20 &&
+        val.size() <= 40 &&
+        val.matches('^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?(Z|[+\\-]\\d{2}:\\d{2})$')
+      );
+    }
+
+    // Entity Blueprints synchronized with src/types.ts
+    function isValidUser(data, userId) {
+      return data.keys().hasAll(['userId', 'telegramId', 'firstName', 'isBlocked', 'totalOrders', 'totalSpentStars', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['userId', 'telegramId', 'username', 'firstName', 'lastName', 'languageCode', 'isBlocked', 'totalOrders', 'totalSpentStars', 'createdAt', 'updatedAt']) &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && data.userId == userId &&
+        data.telegramId is number && data.telegramId > 0 &&
+        (!('username' in data) || (data.username is string && data.username.size() <= 64)) &&
+        data.firstName is string && data.firstName.size() >= 1 && data.firstName.size() <= 128 &&
+        (!('lastName' in data) || (data.lastName is string && data.lastName.size() <= 128)) &&
+        (!('languageCode' in data) || (data.languageCode is string && data.languageCode.size() <= 16)) &&
+        data.isBlocked is bool &&
+        data.totalOrders is number && data.totalOrders >= 0 &&
+        data.totalSpentStars is number && data.totalSpentStars >= 0 &&
+        isValidDateVal(data.createdAt) &&
+        isValidDateVal(data.updatedAt);
+    }
+
+    function isValidProduct(data, productId) {
+      return data.keys().hasAll(['id', 'name', 'category', 'description', 'price', 'currency', 'imageUrl', 'isActive', 'fulfillmentType', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'name', 'category', 'description', 'price', 'currency', 'imageUrl', 'isActive', 'fulfillmentType', 'createdAt', 'updatedAt']) &&
+        data.id is string && data.id.size() >= 1 && data.id.size() <= 64 && data.id == productId &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.category is string && data.category.size() <= 32 && data.category in ['stars', 'premium', 'gifts'] &&
+        data.description is string && data.description.size() >= 1 && data.description.size() <= 1000 &&
+        data.price is number && data.price > 0 && data.price <= 100000 &&
+        data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        data.imageUrl is string && data.imageUrl.size() <= 500 &&
+        data.isActive is bool &&
+        data.fulfillmentType is string && data.fulfillmentType.size() <= 32 && data.fulfillmentType in ['manual', 'provider_adapter'] &&
+        isValidDateVal(data.createdAt) &&
+        isValidDateVal(data.updatedAt);
+    }
+
+    function isValidOrder(data, orderId) {
+      return data.keys().hasAll(['orderId', 'userId', 'userTelegramId', 'productId', 'productName', 'category', 'quantity', 'totalPrice', 'currency', 'paymentStatus', 'fulfillmentStatus', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'orderId',
+          'userId',
+          'userTelegramId',
+          'username',
+          'productId',
+          'productName',
+          'category',
+          'quantity',
+          'totalPrice',
+          'currency',
+          'paymentStatus',
+          'fulfillmentStatus',
+          'telegramPaymentChargeId',
+          'providerPaymentChargeId',
+          'fulfillmentNote',
+          'fulfillmentStartedAt',
+          'fulfillmentAttempts',
+          'fulfillmentLastError',
+          'fulfillmentNextRetryAt',
+          'fulfillmentIdempotencyKey',
+          'externalExecutionReference',
+          'needsManualReconciliation',
+          'adminNotifiedAt',
+          'buyerNotifiedAt',
+          'createdAt',
+          'paidAt',
+          'completedAt',
+          'updatedAt'
+        ]) &&
+        data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 64 && data.orderId == orderId &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && isValidId(data.userId) &&
+        data.userTelegramId is number && data.userTelegramId > 0 &&
+        (!('username' in data) || (data.username is string && data.username.size() <= 64)) &&
+        data.productId is string && data.productId.size() >= 1 && data.productId.size() <= 64 && isValidId(data.productId) &&
+        data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 120 &&
+        data.category is string && data.category.size() <= 32 && data.category in ['stars', 'premium', 'gifts'] &&
+        data.quantity is number && data.quantity >= 1 && data.quantity <= 10 &&
+        data.totalPrice is number && data.totalPrice > 0 &&
+        data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        data.paymentStatus is string && data.paymentStatus.size() <= 32 && data.paymentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        data.fulfillmentStatus is string && data.fulfillmentStatus.size() <= 32 && data.fulfillmentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        (!('telegramPaymentChargeId' in data) || (data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() <= 128)) &&
+        (!('providerPaymentChargeId' in data) || (data.providerPaymentChargeId is string && data.providerPaymentChargeId.size() <= 128)) &&
+        (!('fulfillmentNote' in data) || (data.fulfillmentNote is string && data.fulfillmentNote.size() <= 500)) &&
+        (!('fulfillmentStartedAt' in data) || isValidDateVal(data.fulfillmentStartedAt)) &&
+        (!('fulfillmentAttempts' in data) || (data.fulfillmentAttempts is number && data.fulfillmentAttempts >= 0 && data.fulfillmentAttempts <= 10)) &&
+        (!('fulfillmentLastError' in data) || (data.fulfillmentLastError is string && data.fulfillmentLastError.size() <= 500)) &&
+        (!('fulfillmentNextRetryAt' in data) || isValidDateVal(data.fulfillmentNextRetryAt)) &&
+        (!('fulfillmentIdempotencyKey' in data) || (data.fulfillmentIdempotencyKey is string && data.fulfillmentIdempotencyKey.size() >= 1 && data.fulfillmentIdempotencyKey.size() <= 128)) &&
+        (!('externalExecutionReference' in data) || (data.externalExecutionReference is string && data.externalExecutionReference.size() <= 256)) &&
+        (!('needsManualReconciliation' in data) || data.needsManualReconciliation is bool) &&
+        (!('adminNotifiedAt' in data) || isValidDateVal(data.adminNotifiedAt)) &&
+        (!('buyerNotifiedAt' in data) || isValidDateVal(data.buyerNotifiedAt)) &&
+        isValidDateVal(data.createdAt) &&
+        (!('paidAt' in data) || isValidDateVal(data.paidAt)) &&
+        (!('completedAt' in data) || isValidDateVal(data.completedAt)) &&
+        isValidDateVal(data.updatedAt);
+    }
+
+    function isValidPayment(data, paymentId) {
+      return data.keys().hasAll(['paymentId', 'telegramPaymentChargeId', 'orderId', 'userId', 'userTelegramId', 'totalAmount', 'currency', 'invoicePayload', 'status', 'createdAt']) &&
+        data.keys().hasOnly(['paymentId', 'telegramPaymentChargeId', 'providerPaymentChargeId', 'orderId', 'userId', 'userTelegramId', 'totalAmount', 'currency', 'invoicePayload', 'status', 'createdAt', 'refundedAt']) &&
+        data.paymentId is string && data.paymentId.size() >= 1 && data.paymentId.size() <= 128 && data.paymentId == paymentId &&
+        data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() >= 1 && data.telegramPaymentChargeId.size() <= 128 &&
+        (!('providerPaymentChargeId' in data) || (data.providerPaymentChargeId is string && data.providerPaymentChargeId.size() <= 128)) &&
+        data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 64 && isValidId(data.orderId) &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && isValidId(data.userId) &&
+        data.userTelegramId is number && data.userTelegramId > 0 &&
+        data.totalAmount is number && data.totalAmount > 0 &&
+        data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        data.invoicePayload is string && data.invoicePayload.size() >= 1 && data.invoicePayload.size() <= 256 &&
+        data.status is string && data.status.size() <= 32 && data.status in ['paid', 'refunded'] &&
+        isValidDateVal(data.createdAt) &&
+        (!('refundedAt' in data) || isValidDateVal(data.refundedAt));
+    }
+
+    function isValidTransaction(data, transactionId) {
+      return data.keys().hasAll(['transactionId', 'orderId', 'userId', 'type', 'amount', 'currency', 'details', 'createdAt']) &&
+        data.keys().hasOnly(['transactionId', 'orderId', 'userId', 'type', 'amount', 'currency', 'details', 'createdAt']) &&
+        data.transactionId is string && data.transactionId.size() >= 1 && data.transactionId.size() <= 64 && data.transactionId == transactionId &&
+        data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 64 && isValidId(data.orderId) &&
+        data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && isValidId(data.userId) &&
+        data.type is string && data.type.size() <= 32 && data.type in [
+          'invoice_created',
+          'pre_checkout_ok',
+          'payment_received',
+          'fulfillment_completed',
+          'fulfillment_failed',
+          'fulfillment_retry',
+          'order_cancelled',
+          'payment_refunded',
+          'admin_action',
+          'error'
+        ] &&
+        data.amount is number && data.amount >= 0 &&
+        data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        data.details is string && data.details.size() >= 1 && data.details.size() <= 500 &&
+        isValidDateVal(data.createdAt);
+    }
+
+    function isValidAdmin(data, adminId) {
+      return data.keys().hasAll(['adminId', 'telegramId', 'role', 'addedAt']) &&
+        data.keys().hasOnly(['adminId', 'telegramId', 'role', 'addedAt']) &&
+        data.adminId is string && data.adminId.size() >= 1 && data.adminId.size() <= 64 && data.adminId == adminId &&
+        data.telegramId is number && data.telegramId > 0 &&
+        data.role is string && data.role.size() <= 32 && data.role in ['admin', 'superadmin'] &&
+        isValidDateVal(data.addedAt);
+    }
+
+    function isValidSetting(data, settingKey) {
+      return data.keys().hasAll(['key', 'storeName', 'supportUsername', 'maintenanceMode', 'updatedAt']) &&
+        data.keys().hasOnly(['key', 'storeName', 'supportUsername', 'maintenanceMode', 'updatedAt']) &&
+        data.key is string && data.key.size() >= 1 && data.key.size() <= 64 && data.key == settingKey &&
+        data.storeName is string && data.storeName.size() >= 1 && data.storeName.size() <= 120 &&
+        data.supportUsername is string && data.supportUsername.size() >= 1 && data.supportUsername.size() <= 64 &&
+        data.maintenanceMode is bool &&
+        isValidDateVal(data.updatedAt);
+    }
+
+    // 1. /users/{userId}
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && isValidUser(incoming(), userId) &&
+        isFreshTimestamp(incoming().createdAt) &&
+        isFreshTimestamp(incoming().updatedAt) && (
+          isAdmin() ||
+          (isOwner(userId) && incoming().isBlocked == false && incoming().totalOrders == 0 && incoming().totalSpentStars == 0)
+        );
+      allow update: if isValidId(userId) && isValidUser(incoming(), userId) &&
+        incoming().userId == existing().userId &&
+        incoming().telegramId == existing().telegramId &&
+        incoming().createdAt == existing().createdAt &&
+        isFreshTimestamp(incoming().updatedAt) && (
+          isAdmin() ||
+          (isOwner(userId) &&
+            existing().isBlocked == false &&
+            incoming().isBlocked == false &&
+            incoming().totalOrders == existing().totalOrders &&
+            incoming().totalSpentStars == existing().totalSpentStars &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['username', 'firstName', 'lastName', 'languageCode', 'updatedAt']))
+        );
+      allow delete: if isValidId(userId) && isAdmin();
+    }
+
+    // 2. /products/{productId}
+    match /products/{productId} {
+      allow get: if isValidId(productId) && (existing().isActive == true || isAdmin());
+      allow list: if existing().isActive == true || isAdmin();
+      allow create: if isValidId(productId) && isValidProduct(incoming(), productId) &&
+        isFreshTimestamp(incoming().createdAt) &&
+        isFreshTimestamp(incoming().updatedAt) &&
+        isAdmin();
+      allow update: if isValidId(productId) && isValidProduct(incoming(), productId) &&
+        incoming().id == existing().id &&
+        incoming().createdAt == existing().createdAt &&
+        isFreshTimestamp(incoming().updatedAt) &&
+        isAdmin();
+      allow delete: if isValidId(productId) && isAdmin();
+    }
+
+    // 3. /orders/{orderId}
+    match /orders/{orderId} {
+      allow get: if isValidId(orderId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
+      allow create: if isValidId(orderId) && isValidOrder(incoming(), orderId) &&
+        isFreshTimestamp(incoming().createdAt) &&
+        isFreshTimestamp(incoming().updatedAt) && (
+          isAdmin() ||
+          (isOwner(incoming().userId) &&
+            incoming().paymentStatus == 'pending' &&
+            incoming().fulfillmentStatus == 'pending' &&
+            !('telegramPaymentChargeId' in incoming()) &&
+            !('providerPaymentChargeId' in incoming()) &&
+            !('paidAt' in incoming()) &&
+            !('completedAt' in incoming()) &&
+            !('externalExecutionReference' in incoming()) &&
+            !('adminNotifiedAt' in incoming()) &&
+            !('buyerNotifiedAt' in incoming()) &&
+            (!('needsManualReconciliation' in incoming()) || incoming().needsManualReconciliation == false) &&
+            (!('fulfillmentAttempts' in incoming()) || incoming().fulfillmentAttempts == 0) &&
+            exists(/databases/$(database)/documents/users/$(incoming().userId)) &&
+            get(/databases/$(database)/documents/users/$(incoming().userId)).data.isBlocked == false &&
+            exists(/databases/$(database)/documents/products/$(incoming().productId)) &&
+            get(/databases/$(database)/documents/products/$(incoming().productId)).data.isActive == true &&
+            get(/databases/$(database)/documents/products/$(incoming().productId)).data.price * incoming().quantity == incoming().totalPrice)
+        );
+      allow update: if isValidId(orderId) && isValidOrder(incoming(), orderId) &&
+        incoming().orderId == existing().orderId &&
+        incoming().userId == existing().userId &&
+        incoming().userTelegramId == existing().userTelegramId &&
+        incoming().productId == existing().productId &&
+        incoming().quantity == existing().quantity &&
+        incoming().totalPrice == existing().totalPrice &&
+        incoming().currency == existing().currency &&
+        incoming().createdAt == existing().createdAt &&
+        isFreshTimestamp(incoming().updatedAt) && (
+          isAdmin() ||
+          (isOwner(existing().userId) &&
+            !(existing().paymentStatus in ['paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed']) &&
+            !(existing().fulfillmentStatus in ['paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed']) &&
+            existing().paymentStatus == 'pending' &&
+            existing().fulfillmentStatus == 'pending' &&
+            incoming().paymentStatus == 'cancelled' &&
+            incoming().fulfillmentStatus == 'cancelled' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['paymentStatus', 'fulfillmentStatus', 'updatedAt']))
+        );
+      allow delete: if isValidId(orderId) && isAdmin();
+    }
+
+    // 4. /payments/{paymentId}
+    match /payments/{paymentId} {
+      allow get: if isValidId(paymentId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
+      allow create: if isValidId(paymentId) && isValidPayment(incoming(), paymentId) &&
+        isFreshTimestamp(incoming().createdAt) &&
+        isAdmin() &&
+        exists(/databases/$(database)/documents/orders/$(incoming().orderId));
+      allow update: if isValidId(paymentId) && isValidPayment(incoming(), paymentId) &&
+        incoming().paymentId == existing().paymentId &&
+        incoming().telegramPaymentChargeId == existing().telegramPaymentChargeId &&
+        incoming().orderId == existing().orderId &&
+        incoming().userId == existing().userId &&
+        incoming().totalAmount == existing().totalAmount &&
+        incoming().currency == existing().currency &&
+        incoming().createdAt == existing().createdAt &&
+        isAdmin();
+      allow delete: if false;
+    }
+
+    // 5. /transactions/{transactionId}
+    match /transactions/{transactionId} {
+      allow get: if isValidId(transactionId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(transactionId) && isValidTransaction(incoming(), transactionId) &&
+        isFreshTimestamp(incoming().createdAt) &&
+        isAdmin();
+      allow update, delete: if false;
+    }
+
+    // 6. /admins/{adminId}
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && (isOwner(adminId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(adminId) && isValidAdmin(incoming(), adminId) &&
+        isFreshTimestamp(incoming().addedAt) &&
+        isAdmin();
+      allow update: if isValidId(adminId) && isValidAdmin(incoming(), adminId) &&
+        incoming().adminId == existing().adminId &&
+        incoming().addedAt == existing().addedAt &&
+        isAdmin();
+      allow delete: if isValidId(adminId) && isAdmin();
+    }
+
+    // 7. /settings/{settingKey}
+    match /settings/{settingKey} {
+      allow get: if isValidId(settingKey) && (isSignedIn() || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(settingKey) && isValidSetting(incoming(), settingKey) &&
+        isFreshTimestamp(incoming().updatedAt) &&
+        isAdmin();
+      allow update: if isValidId(settingKey) && isValidSetting(incoming(), settingKey) &&
+        incoming().key == existing().key &&
+        isFreshTimestamp(incoming().updatedAt) &&
+        isAdmin();
+      allow delete: if isValidId(settingKey) && isAdmin();
+    }
+  }
+}
