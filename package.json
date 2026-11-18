@@ -10,7 +10,8 @@
     "preview": "tsx server.ts",
     "clean": "rm -rf dist",
     "lint": "eslint . && tsc --noEmit",
-    "test": "NODE_ENV=test tsx src/tests/stage1.test.ts"
+    "test": "NODE_ENV=test tsx src/tests/stage1.test.ts",
+    "audit:emulator": "tsx firestore-audit-package/scripts/runAuditEmulatorCli.ts"
   },
   "dependencies": {
     "@dimforge/rapier3d-simd-compat": "^0.19.3",
