@@ -37,6 +37,49 @@ export type OrderStatus =
   | 'refunded'
   | 'failed';
 
+export type RefundExecutionState =
+  | 'refund_in_progress'
+  | 'telegram_refund_succeeded_pending_commit'
+  | 'refund_failed_needs_reconciliation'
+  | 'refunded';
+
+export type BalanceTopUpProvider = 'cryptobot' | 'lolzteam' | 'xrocket';
+
+export type BalanceTopUpStatus =
+  | 'pending'
+  | 'paid'
+  | 'expired'
+  | 'cancelled'
+  | 'failed';
+
+export type OrderPaymentMethod =
+  | 'stars'
+  | 'balance'
+  | 'telegram_stars'
+  | 'internal_balance';
+
+export interface BalanceTopUpRecord {
+  paymentId: string;
+  userId: string;
+  userTelegramId: number;
+  username?: string;
+  provider: BalanceTopUpProvider;
+  amountPaid: number;
+  feePercent: number;
+  feeAmount: number;
+  amountCredited: number;
+  currency: string;
+  paymentStatus: BalanceTopUpStatus;
+  externalInvoiceId: string;
+  payUrl?: string;
+  recipientMerchantId?: string;
+  failureReason?: string;
+  expiresAt?: string;
+  createdAt: string;
+  paidAt?: string;
+  updatedAt: string;
+}
+
 export interface StoreUser {
   userId: string;
   telegramId: number;
@@ -47,6 +90,7 @@ export interface StoreUser {
   isBlocked: boolean;
   totalOrders: number;
   totalSpentStars: number;
+  balance?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -76,6 +120,9 @@ export interface Order {
   quantity: number;
   totalPrice: number;
   currency: 'XTR';
+  paymentMethod?: OrderPaymentMethod;
+  balancePaymentId?: string;
+  balanceRefunded?: boolean;
   paymentStatus: OrderStatus;
   fulfillmentStatus: OrderStatus;
   telegramPaymentChargeId?: string;
@@ -88,6 +135,11 @@ export interface Order {
   fulfillmentIdempotencyKey?: string;
   externalExecutionReference?: string;
   needsManualReconciliation?: boolean;
+  refundState?: RefundExecutionState;
+  refundLockToken?: string;
+  refundStartedAt?: string;
+  refundLastError?: string;
+  refundStatsAdjusted?: boolean;
   adminNotifiedAt?: string;
   buyerNotifiedAt?: string;
   createdAt: string;
@@ -120,6 +172,12 @@ export type TransactionType =
   | 'fulfillment_retry'
   | 'order_cancelled'
   | 'payment_refunded'
+  | 'balance_topup_created'
+  | 'balance_topup_paid'
+  | 'balance_topup_failed'
+  | 'balance_topup_expired'
+  | 'balance_deducted'
+  | 'balance_refunded'
   | 'admin_action'
   | 'error';
 
@@ -129,7 +187,7 @@ export interface StoreTransaction {
   userId: string;
   type: TransactionType;
   amount: number;
-  currency: 'XTR';
+  currency: string;
   details: string;
   createdAt: string;
 }

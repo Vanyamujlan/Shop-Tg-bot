@@ -1,6 +1,7 @@
 import { Context, Markup, Telegraf } from 'telegraf';
 import {
   AdminInteractiveSession,
+  BalanceTopUpStatus,
   BotConnectionStatus,
   OrderStatus,
   ProductCategory,
@@ -11,16 +12,24 @@ import { ProductService } from '../../services/ProductService.ts';
 import { OrderService } from '../../services/OrderService.ts';
 import { PaymentService } from '../../services/PaymentService.ts';
 import { FulfillmentService } from '../../services/FulfillmentService.ts';
+import { balanceService } from '../../services/BalanceService.ts';
+import {
+  PAYMENT_PROVIDER_CATALOG,
+  paymentProviderGateway,
+} from '../../services/PaymentProviders.ts';
 import { firestoreRepo } from '../../db/firestore.ts';
 import { getEnvConfig } from '../../config/env.ts';
 import {
   buildAdminCategoryPickKeyboard,
   buildAdminMainKeyboard,
   buildAdminOrderActionKeyboard,
+  buildAdminOrderBalanceRefundConfirmKeyboard,
   buildAdminOrderRefundConfirmKeyboard,
   buildAdminOrdersKeyboard,
   buildAdminProductManageKeyboard,
   buildAdminProductsKeyboard,
+  buildAdminTopUpDetailKeyboard,
+  buildAdminTopUpsKeyboard,
   buildAdminUserManageKeyboard,
   buildAdminUsersKeyboard,
 } from '../keyboards.ts';
@@ -28,6 +37,7 @@ import {
   escapeHtml,
   formatAdminOrderCard,
   formatAdminStatsMessage,
+  formatAdminTopUpCard,
   formatDateRu,
   formatProductCardMessage,
   formatUserProfileMessage,
@@ -159,18 +169,26 @@ export function registerAdminHandlers(
     if (!(await ensureAdmin(ctx))) return;
     if (isDuplicateCallbackClick(ctx.from!.id, 'adm:stats')) return;
 
-    const [users, orders, products, payments, recentTransactions] =
+    const [users, orders, products, payments, recentTransactions, topUps] =
       await Promise.all([
         UserService.getAllUsers(200),
         OrderService.getAllOrders(undefined, 200),
         ProductService.getAllProducts(true, 200),
         PaymentService.getAllPayments(200),
         OrderService.getRecentTransactions(6),
+        balanceService.getAllTopUps(undefined, 200),
       ]);
 
     const paidRevenue = payments
       .filter((p) => p.status === 'paid')
       .reduce((acc, p) => acc + p.totalAmount, 0);
+
+    const paidTopUps = topUps.filter((t) => t.paymentStatus === 'paid');
+    const totalTopUpCredited = paidTopUps.reduce(
+      (acc, t) => acc + t.amountCredited,
+      0,
+    );
+    const totalTopUpFees = paidTopUps.reduce((acc, t) => acc + t.feeAmount, 0);
 
     const text = formatAdminStatsMessage({
       totalUsers: users.length,
@@ -190,9 +208,111 @@ export function registerAdminHandlers(
       totalProducts: products.length,
       activeProducts: products.filter((p) => p.isActive).length,
       recentTransactions,
+      totalTopUpsCount: topUps.length,
+      paidTopUpsCount: paidTopUps.length,
+      totalTopUpCredited,
+      totalTopUpFees,
     });
 
     await safeRespondOrEdit(ctx, text, buildAdminMainKeyboard());
+  });
+
+  // 1b. Просмотр и фильтрация пополнений баланса в админ-панели
+  bot.action(/^adm:topups:(all|paid|pending|failed)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const filterRaw = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:topups:${filterRaw}`)) return;
+
+    const allTopUps = await balanceService.getAllTopUps(undefined, 60);
+    const filtered =
+      filterRaw === 'all'
+        ? allTopUps
+        : filterRaw === 'failed'
+          ? allTopUps.filter(
+              (t) =>
+                t.paymentStatus === 'failed' ||
+                t.paymentStatus === 'expired' ||
+                t.paymentStatus === 'cancelled',
+            )
+          : allTopUps.filter(
+              (t) => t.paymentStatus === (filterRaw as BalanceTopUpStatus),
+            );
+
+    const paidList = allTopUps.filter((t) => t.paymentStatus === 'paid');
+    const totalPaidIn = paidList.reduce((acc, t) => acc + t.amountPaid, 0);
+    const totalCredited = paidList.reduce((acc, t) => acc + t.amountCredited, 0);
+    const totalFee = paidList.reduce((acc, t) => acc + t.feeAmount, 0);
+
+    const summaryLines = [
+      `💳 <b>Пополнения внутреннего баланса (фильтр: ${filterRaw}, найдено: ${filtered.length})</b>`,
+      `• Успешных пополнений: <b>${paidList.length}</b>`,
+      `• Внесено покупателями: <code>${Number(totalPaidIn.toFixed(2))}</code>`,
+      `• Удержано комиссии магазином: <code>${Number(totalFee.toFixed(2))}</code>`,
+      `• Фактически зачислено на балансы: <code>${Number(totalCredited.toFixed(2))}</code>`,
+      '',
+      filtered.length === 0
+        ? 'Записей о пополнениях по выбранному фильтру пока нет.'
+        : 'Нажмите на пополнение ниже для просмотра провайдера, суммы комиссии и статуса:',
+    ].join('\n');
+
+    await safeRespondOrEdit(
+      ctx,
+      summaryLines,
+      buildAdminTopUpsKeyboard(filtered),
+    );
+  });
+
+  // Детали конкретного пополнения баланса для админа
+  bot.action(/^adm:topup:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const paymentId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:topup:${paymentId}`)) return;
+
+    const topUp = await balanceService.getTopUpById(paymentId);
+    if (!topUp) {
+      await safeAnswerCbQuery(ctx, 'Запись о пополнении не найдена.', true);
+      return;
+    }
+
+    await safeRespondOrEdit(
+      ctx,
+      formatAdminTopUpCard(topUp),
+      buildAdminTopUpDetailKeyboard(topUp),
+    );
+  });
+
+  // Принудительная проверка статуса пополнения через API провайдера из админки
+  bot.action(/^adm:topup_check:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const paymentId = ctx.match[1];
+    if (
+      isDuplicateCallbackClick(ctx.from!.id, `adm:topup_check:${paymentId}`, 1500)
+    ) {
+      return;
+    }
+
+    try {
+      const res = await balanceService.verifyAndProcessTopUp(paymentId);
+      await logAdminAudit(
+        ctx.from!.id,
+        paymentId,
+        res.topUp.amountPaid,
+        `Проверил статус пополнения через API (${res.topUp.provider}): status=${res.status}`,
+      );
+      await safeAnswerCbQuery(
+        ctx,
+        `Статус у провайдера: ${res.status}${res.reason ? ` (${res.reason})` : ''}`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminTopUpCard(res.topUp),
+        buildAdminTopUpDetailKeyboard(res.topUp),
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
   });
 
   // 2. Список заказов (с фильтрацией)
@@ -497,7 +617,7 @@ export function registerAdminHandlers(
       return;
     }
 
-    if (PaymentService.isRefundInProgress(orderId)) {
+    if (order.refundState === 'refund_in_progress') {
       await safeAnswerCbQuery(
         ctx,
         'Возврат по этому заказу уже выполняется другим запросом.',
@@ -623,6 +743,131 @@ export function registerAdminHandlers(
         `Ошибка возврата: ${msg.slice(0, 150)}`,
         true,
       );
+    }
+  });
+
+  // Возврат заказа, оплаченного с внутреннего баланса, обратно на внутренний баланс (Шаг 1 из 2)
+  bot.action(/^adm:ord_bal_refund:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const orderId = ctx.match[1];
+    if (
+      isDuplicateCallbackClick(ctx.from!.id, `adm:ord_bal_refund:${orderId}`, 1500)
+    ) {
+      return;
+    }
+
+    const order = await OrderService.getOrderById(orderId);
+    if (!order || order.paymentMethod !== 'balance') {
+      await safeAnswerCbQuery(
+        ctx,
+        'Заказ не найден или не был оплачен с внутреннего баланса.',
+        true,
+      );
+      return;
+    }
+
+    if (order.paymentStatus === 'refunded' || order.balanceRefunded) {
+      await safeAnswerCbQuery(
+        ctx,
+        'По этому заказу уже выполнен возврат на внутренний баланс.',
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(order),
+        buildAdminOrderActionKeyboard(order),
+      );
+      return;
+    }
+
+    const confirmText = [
+      '⚠️ <b>Подтверждение возврата средств на внутренний баланс (Шаг 2 из 2)</b>',
+      '',
+      `Заказ: <code>#${escapeHtml(order.orderId)}</code>`,
+      `Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
+      `Покупатель: <code>${order.userTelegramId}</code>${order.username ? ` (@${escapeHtml(order.username)})` : ''}`,
+      `Сумма к возврату на внутренний баланс: <b>+${order.totalPrice}</b>`,
+      order.fulfillmentStatus === 'completed'
+        ? '\n🚨 <b>ВНИМАНИЕ: Заказ уже ВЫПОЛНЕН!</b> При подтверждении средства вернутся на баланс покупателя.'
+        : '',
+      '',
+      'Подтвердите возврат средств на внутренний баланс покупателя:',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    await safeRespondOrEdit(
+      ctx,
+      confirmText,
+      buildAdminOrderBalanceRefundConfirmKeyboard(order),
+    );
+  });
+
+  // Возврат заказа на внутренний баланс (Шаг 2 из 2 — атомарное выполнение)
+  bot.action(/^adm:ord_bal_refund_confirm:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const orderId = ctx.match[1];
+    if (
+      isDuplicateCallbackClick(
+        ctx.from!.id,
+        `adm:ord_bal_refund_confirm:${orderId}`,
+        2000,
+      )
+    ) {
+      return;
+    }
+
+    try {
+      const res = await balanceService.refundOrderToInternalBalance({
+        orderId,
+        reason: `Возврат на внутренний баланс выполнен администратором (ID: ${ctx.from!.id}).`,
+        adminTelegramId: ctx.from!.id,
+      });
+
+      if (res.alreadyRefunded) {
+        await safeAnswerCbQuery(
+          ctx,
+          'По этому заказу возврат на баланс уже был выполнен.',
+          true,
+        );
+        await safeRespondOrEdit(
+          ctx,
+          formatAdminOrderCard(res.order),
+          buildAdminOrderActionKeyboard(res.order),
+        );
+        return;
+      }
+
+      await logAdminAudit(
+        ctx.from!.id,
+        orderId,
+        res.order.totalPrice,
+        `Выполнил возврат +${res.order.totalPrice} на внутренний баланс покупателя ${res.order.userTelegramId} (новый баланс: ${res.newBalance})`,
+      );
+
+      try {
+        await bot.telegram.sendMessage(
+          res.order.userTelegramId,
+          `↩️ <b>Возврат средств по заказу #${escapeHtml(res.order.orderId)}</b>\n\nНа ваш внутренний баланс магазина возвращено <b>+${res.order.totalPrice}</b>. Текущий баланс: <code>${res.newBalance}</code>.`,
+          { parse_mode: 'HTML' },
+        );
+      } catch {
+        // Ignore if user blocked the bot
+      }
+
+      await safeAnswerCbQuery(
+        ctx,
+        'Средства успешно возвращены на внутренний баланс покупателя!',
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(res.order),
+        buildAdminOrderActionKeyboard(res.order),
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, `Ошибка возврата: ${msg.slice(0, 150)}`, true);
     }
   });
 
@@ -1049,6 +1294,17 @@ export function registerAdminHandlers(
         FulfillmentService.isRecoveryWorkerActive() ? 'активен' : 'остановлен'
       })`,
       `👑 <b>Администраторов в ADMIN_IDS:</b> ${envConfig.adminIds.length}`,
+      '',
+      '💳 <b>Платёжные провайдеры пополнения баланса:</b>',
+      ...(['cryptobot', 'lolzteam', 'xrocket'] as const).map((p) => {
+        const meta = PAYMENT_PROVIDER_CATALOG[p];
+        const st = paymentProviderGateway.getProviderStatusSummary()[p];
+        return `• <b>${escapeHtml(meta.shortTitle)} (${meta.feePercent}%):</b> ${
+          st.configured
+            ? `✅ Настроен (ключ: <code>${escapeHtml(st.maskedKey)}</code>)`
+            : '⚠️ Не настроен (токен не задан в .env)'
+        }`;
+      }),
       '',
       '⚠️ <b>Последние системные ошибки:</b>',
       ...errorLines,

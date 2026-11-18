@@ -23,6 +23,7 @@ import {
   AdminRecord,
   StoreSettings,
   OperationType,
+  BalanceTopUpRecord,
 } from '../types.ts';
 import { handleFirestoreError, testConnection } from './firestoreErrorHandler.ts';
 
@@ -34,6 +35,8 @@ export type CollectionName =
   | 'transactions'
   | 'admins'
   | 'settings';
+
+export type StoreCollectionName = CollectionName | 'balance_topups';
 
 export interface QueryWhereFilter {
   field: string;
@@ -63,9 +66,9 @@ export interface PaginatedResult<T> {
 }
 
 export interface RepoTransaction {
-  get<T>(collectionName: CollectionName, docId: string): Promise<T | null>;
+  get<T>(collectionName: StoreCollectionName, docId: string): Promise<T | null>;
   set<T extends object>(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     docId: string,
     data: T,
   ): void;
@@ -76,6 +79,7 @@ interface LocalDatabaseState {
   products: Record<string, Product>;
   orders: Record<string, Order>;
   payments: Record<string, PaymentRecord>;
+  balance_topups: Record<string, BalanceTopUpRecord>;
   transactions: Record<string, StoreTransaction>;
   admins: Record<string, AdminRecord>;
   settings: Record<string, StoreSettings>;
@@ -322,6 +326,7 @@ export class FirestoreRepository {
       products: {},
       orders: {},
       payments: {},
+      balance_topups: {},
       transactions: {},
       admins: {},
       settings: {},
@@ -532,6 +537,7 @@ export class FirestoreRepository {
           products: parsed.products || {},
           orders: parsed.orders || {},
           payments: parsed.payments || {},
+          balance_topups: parsed.balance_topups || {},
           transactions: parsed.transactions || {},
           admins: parsed.admins || {},
           settings: parsed.settings || {},
@@ -743,7 +749,7 @@ export class FirestoreRepository {
   }
 
   public async getDoc<T>(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     docId: string,
   ): Promise<T | null> {
     const safeId = sanitizeDocId(docId);
@@ -766,7 +772,7 @@ export class FirestoreRepository {
   }
 
   public async setDoc<T extends object>(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     docId: string,
     data: T,
   ): Promise<void> {
@@ -789,7 +795,7 @@ export class FirestoreRepository {
   }
 
   public async updateDoc<T extends object>(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     docId: string,
     partial: Partial<T>,
   ): Promise<T | null> {
@@ -812,7 +818,7 @@ export class FirestoreRepository {
   }
 
   public async deleteDoc(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     docId: string,
   ): Promise<boolean> {
     const safeId = sanitizeDocId(docId);
@@ -839,7 +845,7 @@ export class FirestoreRepository {
    * Server-side indexed Firestore queries with where, orderBy, startAfter cursor, and limit.
    */
   public async queryDocs<T>(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     options?: QueryOptions,
   ): Promise<T[]> {
     this.assertStorageAvailable(OperationType.LIST, collectionName);
@@ -954,7 +960,7 @@ export class FirestoreRepository {
    * Cursor-based pagination (`startAfter`) with backward-compatible `nextOffset`.
    */
   public async queryDocsPaginated<T>(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     options?: QueryOptions,
   ): Promise<PaginatedResult<T>> {
     const limit = Math.max(1, options?.limit ?? 20);
@@ -986,7 +992,7 @@ export class FirestoreRepository {
   }
 
   public async listDocs<T>(
-    collectionName: CollectionName,
+    collectionName: StoreCollectionName,
     limit = 200,
   ): Promise<T[]> {
     return this.queryDocs<T>(collectionName, { limit });
@@ -1011,7 +1017,7 @@ export class FirestoreRepository {
           let hasWritten = false;
           const repoTx: RepoTransaction = {
             get: async <T>(
-              collectionName: CollectionName,
+              collectionName: StoreCollectionName,
               docId: string,
             ): Promise<T | null> => {
               if (hasWritten) {
@@ -1030,7 +1036,7 @@ export class FirestoreRepository {
               return snap.data() as T;
             },
             set: <T extends object>(
-              collectionName: CollectionName,
+              collectionName: StoreCollectionName,
               docId: string,
               data: T,
             ): void => {
@@ -1069,12 +1075,12 @@ export class FirestoreRepository {
       let hasWritten = false;
       const stagedWrites = new Map<
         string,
-        { collectionName: CollectionName; docId: string; data: unknown }
+        { collectionName: StoreCollectionName; docId: string; data: unknown }
       >();
 
       const repoTx: RepoTransaction = {
         get: async <T>(
-          collectionName: CollectionName,
+          collectionName: StoreCollectionName,
           docId: string,
         ): Promise<T | null> => {
           if (hasWritten) {
@@ -1092,7 +1098,7 @@ export class FirestoreRepository {
           return val ? (JSON.parse(JSON.stringify(val)) as T) : null;
         },
         set: <T extends object>(
-          collectionName: CollectionName,
+          collectionName: StoreCollectionName,
           docId: string,
           data: T,
         ): void => {

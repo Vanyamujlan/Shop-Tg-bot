@@ -66,7 +66,7 @@ service cloud.firestore {
     // Entity Blueprints synchronized with src/types.ts
     function isValidUser(data, userId) {
       return data.keys().hasAll(['userId', 'telegramId', 'firstName', 'isBlocked', 'totalOrders', 'totalSpentStars', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['userId', 'telegramId', 'username', 'firstName', 'lastName', 'languageCode', 'isBlocked', 'totalOrders', 'totalSpentStars', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['userId', 'telegramId', 'username', 'firstName', 'lastName', 'languageCode', 'isBlocked', 'totalOrders', 'totalSpentStars', 'balance', 'createdAt', 'updatedAt']) &&
         data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && data.userId == userId &&
         data.telegramId is number && data.telegramId > 0 &&
         (!('username' in data) || (data.username is string && data.username.size() <= 64)) &&
@@ -76,6 +76,7 @@ service cloud.firestore {
         data.isBlocked is bool &&
         data.totalOrders is number && data.totalOrders >= 0 &&
         data.totalSpentStars is number && data.totalSpentStars >= 0 &&
+        (!('balance' in data) || (data.balance is number && data.balance >= 0)) &&
         isValidDateVal(data.createdAt) &&
         isValidDateVal(data.updatedAt);
     }
@@ -109,6 +110,9 @@ service cloud.firestore {
           'quantity',
           'totalPrice',
           'currency',
+          'paymentMethod',
+          'balancePaymentId',
+          'balanceRefunded',
           'paymentStatus',
           'fulfillmentStatus',
           'telegramPaymentChargeId',
@@ -121,6 +125,11 @@ service cloud.firestore {
           'fulfillmentIdempotencyKey',
           'externalExecutionReference',
           'needsManualReconciliation',
+          'refundState',
+          'refundLockToken',
+          'refundStartedAt',
+          'refundLastError',
+          'refundStatsAdjusted',
           'adminNotifiedAt',
           'buyerNotifiedAt',
           'createdAt',
@@ -138,6 +147,9 @@ service cloud.firestore {
         data.quantity is number && data.quantity >= 1 && data.quantity <= 10 &&
         data.totalPrice is number && data.totalPrice > 0 &&
         data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        (!('paymentMethod' in data) || (data.paymentMethod is string && data.paymentMethod in ['stars', 'balance'])) &&
+        (!('balancePaymentId' in data) || (data.balancePaymentId is string && data.balancePaymentId.size() <= 128)) &&
+        (!('balanceRefunded' in data) || data.balanceRefunded is bool) &&
         data.paymentStatus is string && data.paymentStatus.size() <= 32 && data.paymentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
         data.fulfillmentStatus is string && data.fulfillmentStatus.size() <= 32 && data.fulfillmentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
         (!('telegramPaymentChargeId' in data) || (data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() <= 128)) &&
@@ -150,6 +162,11 @@ service cloud.firestore {
         (!('fulfillmentIdempotencyKey' in data) || (data.fulfillmentIdempotencyKey is string && data.fulfillmentIdempotencyKey.size() >= 1 && data.fulfillmentIdempotencyKey.size() <= 128)) &&
         (!('externalExecutionReference' in data) || (data.externalExecutionReference is string && data.externalExecutionReference.size() <= 256)) &&
         (!('needsManualReconciliation' in data) || data.needsManualReconciliation is bool) &&
+        (!('refundState' in data) || (data.refundState is string && data.refundState in ['none', 'in_progress', 'telegram_refunded_pending_commit', 'refunded'])) &&
+        (!('refundLockToken' in data) || (data.refundLockToken is string && data.refundLockToken.size() <= 128)) &&
+        (!('refundStartedAt' in data) || isValidDateVal(data.refundStartedAt)) &&
+        (!('refundLastError' in data) || (data.refundLastError is string && data.refundLastError.size() <= 500)) &&
+        (!('refundStatsAdjusted' in data) || data.refundStatsAdjusted is bool) &&
         (!('adminNotifiedAt' in data) || isValidDateVal(data.adminNotifiedAt)) &&
         (!('buyerNotifiedAt' in data) || isValidDateVal(data.buyerNotifiedAt)) &&
         isValidDateVal(data.createdAt) &&
@@ -190,11 +207,17 @@ service cloud.firestore {
           'fulfillment_retry',
           'order_cancelled',
           'payment_refunded',
+          'balance_topup_created',
+          'balance_topup_paid',
+          'balance_topup_failed',
+          'balance_topup_expired',
+          'balance_deducted',
+          'balance_refunded',
           'admin_action',
           'error'
         ] &&
         data.amount is number && data.amount >= 0 &&
-        data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
         data.details is string && data.details.size() >= 1 && data.details.size() <= 500 &&
         isValidDateVal(data.createdAt);
     }
@@ -226,7 +249,11 @@ service cloud.firestore {
         isFreshTimestamp(incoming().createdAt) &&
         isFreshTimestamp(incoming().updatedAt) && (
           isAdmin() ||
-          (isOwner(userId) && incoming().isBlocked == false && incoming().totalOrders == 0 && incoming().totalSpentStars == 0)
+          (isOwner(userId) &&
+            incoming().isBlocked == false &&
+            incoming().totalOrders == 0 &&
+            incoming().totalSpentStars == 0 &&
+            (!('balance' in incoming()) || incoming().balance == 0))
         );
       allow update: if isValidId(userId) && isValidUser(incoming(), userId) &&
         incoming().userId == existing().userId &&
@@ -326,6 +353,14 @@ service cloud.firestore {
         incoming().currency == existing().currency &&
         incoming().createdAt == existing().createdAt &&
         isAdmin();
+      allow delete: if false;
+    }
+
+    // 4b. /balance_topups/{paymentId}
+    match /balance_topups/{paymentId} {
+      allow get: if isValidId(paymentId) && (isOwner(existing().userId) || isAdmin());
+      allow list: if (isVerified() && existing().userId == request.auth.uid) || isAdmin();
+      allow create, update: if isValidId(paymentId) && isAdmin();
       allow delete: if false;
     }
 

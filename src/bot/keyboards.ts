@@ -1,6 +1,15 @@
 import { Markup } from 'telegraf';
-import { Order, Product, ProductCategory, StoreUser } from '../types.ts';
+import {
+  BalanceTopUpProvider,
+  BalanceTopUpRecord,
+  Order,
+  Product,
+  ProductCategory,
+  StoreUser,
+} from '../types.ts';
 import { CATEGORY_LABELS, ORDER_STATUS_LABELS } from '../constants.ts';
+import { PAYMENT_PROVIDER_CATALOG } from '../services/PaymentProviders.ts';
+import { calculateTopUpCommission } from '../services/BalanceService.ts';
 
 export function buildMainMenuKeyboard(isAdmin = false) {
   const rows = [
@@ -11,13 +20,130 @@ export function buildMainMenuKeyboard(isAdmin = false) {
       Markup.button.callback('📦 Мои заказы', 'menu:orders'),
       Markup.button.callback('👤 Мой профиль', 'menu:profile'),
     ],
-    [Markup.button.callback('💬 Поддержка', 'menu:support')],
+    [
+      Markup.button.callback('💳 Пополнить баланс', 'menu:topup'),
+      Markup.button.callback('💬 Поддержка', 'menu:support'),
+    ],
   ];
 
   if (isAdmin) {
     rows.push([Markup.button.callback('🛠 Админ-панель магазина', 'adm:home')]);
   }
 
+  return Markup.inlineKeyboard(rows);
+}
+
+export function buildUserProfileKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('💳 Пополнить баланс', 'menu:topup')],
+    [Markup.button.callback('📜 История пополнений', 'topup:history')],
+    [Markup.button.callback('🏠 Вернуться в главное меню', 'menu:home')],
+  ]);
+}
+
+export function buildTopUpMenuKeyboard(
+  selectedProvider: BalanceTopUpProvider = 'cryptobot',
+  selectedCurrency?: string,
+  selectedAmount = 500,
+) {
+  const meta = PAYMENT_PROVIDER_CATALOG[selectedProvider];
+  const currency =
+    selectedCurrency && meta.supportedCurrencies.includes(selectedCurrency)
+      ? selectedCurrency
+      : meta.defaultCurrency;
+  const calc = calculateTopUpCommission(selectedAmount, selectedProvider);
+
+  const providerRow = (['cryptobot', 'lolzteam', 'xrocket'] as const).map(
+    (provId) => {
+      const p = PAYMENT_PROVIDER_CATALOG[provId];
+      const activePrefix = provId === selectedProvider ? '✅ ' : '';
+      return Markup.button.callback(
+        `${activePrefix}${p.shortTitle} (${p.feePercent}%)`,
+        `topup:prov:${provId}`,
+      );
+    },
+  );
+
+  // Currency rows (up to 4 buttons per row)
+  const currencyRows = [];
+  const currencies = meta.supportedCurrencies;
+  for (let i = 0; i < currencies.length; i += 4) {
+    const slice = currencies.slice(i, i + 4);
+    currencyRows.push(
+      slice.map((curr) =>
+        Markup.button.callback(
+          `${curr === currency ? '🔹 ' : ''}${curr}`,
+          `topup:curr:${selectedProvider}:${curr}`,
+        ),
+      ),
+    );
+  }
+
+  // Preset amount rows (3 buttons per row)
+  const amountRows = [];
+  const amounts = meta.presetAmounts;
+  for (let i = 0; i < amounts.length; i += 3) {
+    const slice = amounts.slice(i, i + 3);
+    amountRows.push(
+      slice.map((amt) =>
+        Markup.button.callback(
+          `${amt === selectedAmount ? '🔘 ' : ''}${amt} ${currency}`,
+          `topup:amt:${selectedProvider}:${currency}:${amt}`,
+        ),
+      ),
+    );
+  }
+
+  return Markup.inlineKeyboard([
+    providerRow,
+    ...currencyRows,
+    ...amountRows,
+    [
+      Markup.button.callback(
+        '✏️ Ввести свою сумму',
+        `topup:custom:${selectedProvider}:${currency}`,
+      ),
+    ],
+    [
+      Markup.button.callback(
+        `💳 Оплатить ${calc.amountPaid} ${currency} (к зачислению ${calc.amountCredited})`,
+        `topup:create:${selectedProvider}:${currency}:${calc.amountPaid}`,
+      ),
+    ],
+    [
+      Markup.button.callback('🪙 Доступные валюты и сети', 'topup:crypto_info'),
+      Markup.button.callback('📜 История пополнений', 'topup:history'),
+    ],
+    [
+      Markup.button.callback('👤 В профиль', 'menu:profile'),
+      Markup.button.callback('🏠 Главное меню', 'menu:home'),
+    ],
+  ]);
+}
+
+export function buildTopUpInvoiceKeyboard(topUp: BalanceTopUpRecord) {
+  const rows = [];
+  if (topUp.payUrl && topUp.paymentStatus === 'pending') {
+    rows.push([Markup.button.url('🔗 Перейти к оплате счёта', topUp.payUrl)]);
+  }
+  if (topUp.paymentStatus === 'pending') {
+    rows.push([
+      Markup.button.callback(
+        '🔄 Проверить статус оплаты',
+        `topup:check:${topUp.paymentId}`,
+      ),
+    ]);
+    rows.push([
+      Markup.button.callback(
+        '❌ Отменить счёт',
+        `topup:cancel:${topUp.paymentId}`,
+      ),
+    ]);
+  }
+  rows.push([
+    Markup.button.callback('⬅️ К выбору пополнения', 'menu:topup'),
+    Markup.button.callback('👤 В профиль', 'menu:profile'),
+  ]);
   return Markup.inlineKeyboard(rows);
 }
 
@@ -59,6 +185,15 @@ export function buildProductDetailKeyboard(product: Product) {
     ],
     [
       Markup.button.callback(
+        `💰 Оплатить с внутреннего баланса (${product.price})`,
+        `buy_bal:${product.id}`,
+      ),
+    ],
+    [
+      Markup.button.callback('💳 Пополнить баланс', 'menu:topup'),
+    ],
+    [
+      Markup.button.callback(
         `⬅️ Назад в ${CATEGORY_LABELS[product.category]}`,
         `cat:${product.category}`,
       ),
@@ -70,7 +205,7 @@ export function buildProductDetailKeyboard(product: Product) {
 export function buildUserOrdersKeyboard(orders: Order[]) {
   const rows = orders.slice(0, 8).map((order) => [
     Markup.button.callback(
-      `#${order.orderId.slice(-6)} • ${order.productName.slice(0, 22)} (${order.totalPrice} ⭐)`,
+      `#${order.orderId.slice(-6)} • ${order.productName.slice(0, 22)} (${order.totalPrice} ${order.paymentMethod === 'balance' ? 'BAL' : '⭐'})`,
       `uord:${order.orderId}`,
     ),
   ]);
@@ -110,18 +245,61 @@ export function buildAdminMainKeyboard() {
       Markup.button.callback('📦 Управление заказами', 'adm:orders:all'),
     ],
     [
+      Markup.button.callback('💳 Пополнения баланса', 'adm:topups:all'),
       Markup.button.callback('🛍 Управление товарами', 'adm:products'),
+    ],
+    [
       Markup.button.callback('➕ Добавить товар', 'adm:prod_add_start'),
-    ],
-    [
       Markup.button.callback('👥 Пользователи и блокировки', 'adm:users'),
-      Markup.button.callback('✉️ Написать пользователю', 'adm:msg_user_start'),
     ],
     [
+      Markup.button.callback('✉️ Написать пользователю', 'adm:msg_user_start'),
       Markup.button.callback('🔌 Статус интеграций и логи', 'adm:integrations'),
     ],
     [Markup.button.callback('🏠 Выйти в меню покупателя', 'menu:home')],
   ]);
+}
+
+export function buildAdminTopUpsKeyboard(topUps: BalanceTopUpRecord[]) {
+  const filterRow = [
+    Markup.button.callback('Все', 'adm:topups:all'),
+    Markup.button.callback('Оплачены', 'adm:topups:paid'),
+    Markup.button.callback('Ожидают', 'adm:topups:pending'),
+    Markup.button.callback('Ошибки/Истекли', 'adm:topups:failed'),
+  ];
+
+  const rows = topUps.slice(0, 10).map((t) => {
+    const prov = PAYMENT_PROVIDER_CATALOG[t.provider]?.shortTitle || t.provider;
+    return [
+      Markup.button.callback(
+        `#${t.paymentId.slice(-6)} | ${prov} | +${t.amountCredited}/${t.amountPaid} ${t.currency} | ${t.paymentStatus}`,
+        `adm:topup:${t.paymentId}`,
+      ),
+    ];
+  });
+
+  return Markup.inlineKeyboard([
+    filterRow,
+    ...rows,
+    [Markup.button.callback('⬅️ В админ-панель', 'adm:home')],
+  ]);
+}
+
+export function buildAdminTopUpDetailKeyboard(topUp: BalanceTopUpRecord) {
+  const rows = [];
+  if (topUp.paymentStatus === 'pending') {
+    rows.push([
+      Markup.button.callback(
+        '🔄 Проверить статус через API провайдера',
+        `adm:topup_check:${topUp.paymentId}`,
+      ),
+    ]);
+  }
+  rows.push([
+    Markup.button.callback('⬅️ К списку пополнений', 'adm:topups:all'),
+    Markup.button.callback('🏠 В админ-панель', 'adm:home'),
+  ]);
+  return Markup.inlineKeyboard(rows);
 }
 
 export function buildAdminProductsKeyboard(products: Product[]) {
@@ -178,7 +356,7 @@ export function buildAdminOrdersKeyboard(orders: Order[]) {
 
   const orderRows = orders.slice(0, 10).map((o) => [
     Markup.button.callback(
-      `#${o.orderId.slice(-6)} | ${o.productName.slice(0, 18)} | ${o.totalPrice}⭐ | ${ORDER_STATUS_LABELS[o.fulfillmentStatus].split(' ')[0]}`,
+      `#${o.orderId.slice(-6)} | ${o.productName.slice(0, 18)} | ${o.totalPrice}${o.paymentMethod === 'balance' ? ' BAL' : '⭐'} | ${ORDER_STATUS_LABELS[o.fulfillmentStatus].split(' ')[0]}`,
       `adm:ord:${o.orderId}`,
     ),
   ]);
@@ -240,8 +418,9 @@ export function buildAdminOrderActionKeyboard(order: Order) {
     ]);
   }
 
-  // AUD-004: Возврат доступен только для реально оплаченных заказов с charge_id
+  // AUD-004: Возврат Telegram Stars доступен только для реально оплаченных заказов с charge_id
   if (
+    order.paymentMethod !== 'balance' &&
     order.telegramPaymentChargeId &&
     (order.paymentStatus === 'paid' ||
       order.paymentStatus === 'processing' ||
@@ -251,6 +430,23 @@ export function buildAdminOrderActionKeyboard(order: Order) {
       Markup.button.callback(
         '↩️ Возврат Stars (refundStarPayment)',
         `adm:ord_refund:${order.orderId}`,
+      ),
+    ]);
+  }
+
+  // Возврат на внутренний баланс для заказов, оплаченных с внутреннего баланса
+  if (
+    order.paymentMethod === 'balance' &&
+    !order.balanceRefunded &&
+    (order.paymentStatus === 'paid' ||
+      order.paymentStatus === 'processing' ||
+      order.paymentStatus === 'completed' ||
+      order.paymentStatus === 'failed')
+  ) {
+    rows.push([
+      Markup.button.callback(
+        '↩️ Возврат средств на внутренний баланс',
+        `adm:ord_bal_refund:${order.orderId}`,
       ),
     ]);
   }
@@ -292,6 +488,23 @@ export function buildAdminOrderRefundConfirmKeyboard(order: Order) {
   ]);
 }
 
+export function buildAdminOrderBalanceRefundConfirmKeyboard(order: Order) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        `✅ Да, вернуть ${order.totalPrice} на внутренний баланс`,
+        `adm:ord_bal_refund_confirm:${order.orderId}`,
+      ),
+    ],
+    [
+      Markup.button.callback(
+        '❌ Отмена (вернуться к заказу)',
+        `adm:ord:${order.orderId}`,
+      ),
+    ],
+  ]);
+}
+
 export function buildAdminUsersKeyboard(users: StoreUser[]) {
   const rows = users.slice(0, 10).map((u) => [
     Markup.button.callback(
@@ -321,3 +534,4 @@ export function buildAdminUserManageKeyboard(user: StoreUser) {
     [Markup.button.callback('⬅️ К списку пользователей', 'adm:users')],
   ]);
 }
+

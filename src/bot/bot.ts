@@ -154,6 +154,10 @@ class TelegramBotManager {
           token,
           config.webhookSecret,
           config.firebasePrivateKey,
+          config.cryptobotApiToken,
+          config.lolzteamApiToken,
+          config.lolzteamWebhookSecret,
+          config.xrocketApiKey,
         ]);
         console.error(
           `[TelegramBot] Ошибка при обработке обновления (${ctx.updateType}): ${safeMsg}`,
@@ -177,6 +181,7 @@ class TelegramBotManager {
       await bot.telegram.setMyCommands([
         { command: 'start', description: 'Главное меню магазина' },
         { command: 'catalog', description: 'Каталог товаров (Stars, Premium, Gifts)' },
+        { command: 'topup', description: 'Пополнить внутренний баланс' },
         { command: 'orders', description: 'Мои заказы' },
         { command: 'profile', description: 'Мой профиль' },
         { command: 'help', description: 'Помощь и FAQ' },
@@ -231,6 +236,10 @@ class TelegramBotManager {
             const safeMsg = maskSecretsInText(rawMsg, [
               token,
               config.webhookSecret,
+              config.cryptobotApiToken,
+              config.lolzteamApiToken,
+              config.lolzteamWebhookSecret,
+              config.xrocketApiKey,
             ]);
             console.error(`[TelegramBot] Ошибка фонового polling: ${safeMsg}`);
             this.pollingStarted = false;
@@ -261,6 +270,10 @@ class TelegramBotManager {
         token,
         config.webhookSecret,
         config.firebasePrivateKey,
+        config.cryptobotApiToken,
+        config.lolzteamApiToken,
+        config.lolzteamWebhookSecret,
+        config.xrocketApiKey,
       ]);
       this.pollingStarted = false;
       this.status = {

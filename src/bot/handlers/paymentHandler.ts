@@ -3,12 +3,67 @@ import { OrderService } from '../../services/OrderService.ts';
 import { ProductService } from '../../services/ProductService.ts';
 import { PaymentService } from '../../services/PaymentService.ts';
 import { FulfillmentService } from '../../services/FulfillmentService.ts';
-import { isDuplicateCallbackClick } from './userHandler.ts';
+import { balanceService } from '../../services/BalanceService.ts';
+import { isDuplicateCallbackClick, safeAnswerCbQuery } from './userHandler.ts';
 import { escapeHtml, formatOrderDetailMessage } from '../formatters.ts';
 import { buildBackToMenuKeyboard } from '../keyboards.ts';
 
 export function registerPaymentHandlers(bot: Telegraf): void {
-  // 1. Создание счёта Telegram Stars (XTR) при нажатии «Купить»
+  // 1a. Покупка товара с внутреннего баланса магазина (buy_bal:<productId>)
+  bot.action(/^buy_bal:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    const productId = ctx.match[1];
+    if (
+      !ctx.from ||
+      isDuplicateCallbackClick(ctx.from.id, `buy_bal:${productId}`, 1500)
+    ) {
+      return;
+    }
+
+    try {
+      const result = await balanceService.purchaseWithInternalBalance({
+        telegramId: ctx.from.id,
+        username: ctx.from.username,
+        firstName: ctx.from.first_name,
+        productId,
+        quantity: 1,
+      });
+
+      if (result.duplicate) {
+        await safeAnswerCbQuery(ctx, 'Этот заказ уже был оплачен с баланса.', true);
+        return;
+      }
+
+      await safeAnswerCbQuery(
+        ctx,
+        `Оплачено с внутреннего баланса! Остаток: ${result.newBalance}`,
+      );
+
+      const orderInFulfillment = await FulfillmentService.initiateFulfillment(
+        result.order,
+        bot,
+      );
+
+      await ctx.reply(
+        [
+          '✅ <b>Заказ успешно оплачен с внутреннего баланса!</b>',
+          `💰 <b>Остаток на внутреннем балансе:</b> <code>${result.newBalance}</code>`,
+          '',
+          formatOrderDetailMessage(orderInFulfillment),
+          '',
+          '🚚 <b>Что дальше:</b> ваш заказ передан на выдачу. Как только товар будет выдан, бот пришлёт вам уведомление в этот чат.',
+        ].join('\n'),
+        {
+          parse_mode: 'HTML',
+          ...buildBackToMenuKeyboard(),
+        },
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
+  });
+
+  // 1b. Создание счёта Telegram Stars (XTR) при нажатии «Купить»
   bot.action(/^buy:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const productId = ctx.match[1];
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `buy:${productId}`, 1500)) {

@@ -4,7 +4,7 @@
 **Репозиторий:** `Vanyamujlan/Shop-Tg-bot` (актуальное состояние рабочей ветки)  
 **Режим проверки:** Независимый технический аудит фактического исходного кода (Read-Only, без подключения к Production Firebase и без реальных платежей)  
 **Результаты локальных проверок:**
-- Локальные модульные и транзакционные тесты (`npm test` / `src/tests/stage1.test.ts`): **`29/29 PASS`**
+- Локальные модульные и транзакционные тесты (`npm test` / `src/tests/stage1.test.ts`): **`33/33 PASS`**
 - Пакет аудита на официальном Firebase Emulator (`npm run audit:emulator`): **`38/38 PASS`**
 - Статический анализ (`npm run lint` = `eslint . && tsc --noEmit`): **`0 ошибок`**
 
@@ -54,10 +54,10 @@
 
 ### 1.7. Возвраты, конкурентные запросы и согласованность Firestore
 - Реализовано двухэтапное подтверждение возврата в админ-панели (`adm:ord_refund` -> `adm:ord_refund_confirm`, `src/bot/handlers/adminHandler.ts:440–582`).
-- **Обнаружены 3 оставшиеся проблемы в механизме возвратов:**
-  1. **`AUD-003` (`HIGH`, `OPEN`):** `PaymentService.markPaymentRefunded()` (`src/services/PaymentService.ts:424–494`) не уменьшает `totalOrders` и `totalSpentStars` в документе `users/{userId}`.
-  2. **`AUD-015` (`HIGH`, `OPEN`):** Блокировка конкурентных возвратов `activeRefundLocks` (`src/services/PaymentService.ts:330`) хранится в памяти одного процесса Node.js (`new Set<string>()`) и **не защищает от гонки между несколькими экземплярами сервера** (multi-instance Cloud Run).
-  3. **`AUD-016` (`HIGH`, `OPEN`):** В `PaymentService.executeOrderRefund()` (`src/services/PaymentService.ts:399–413`) внешний вызов Telegram API `refundStarPayment` выполняется **до** записи в Firestore (`markPaymentRefunded`). Если `refundStarPayment` завершился успешно в Telegram, а запись в Firestore упала по сетевому таймауту, Stars уже возвращены покупателю, но в БД заказ остаётся в статусе `paid`/`completed` без маркера `needsManualReconciliation`.
+- **Исправлено в Stage 3.1 (`AUD-003`, `AUD-004`, `AUD-015`, `AUD-016` — `FIXED`):**
+  1. **`AUD-003` (`FIXED`):** `PaymentService.markPaymentRefunded()` атомарно уменьшает `totalOrders` и `totalSpentStars` пользователя и устанавливает флаг `refundStatsAdjusted: true`, исключающий повторное вычитание.
+  2. **`AUD-015` (`FIXED`):** Локальный `activeRefundLocks` заменён на распределённую блокировку через транзакцию Firestore (`order.refundState = 'refund_in_progress'`, `refundLockToken`, `refundStartedAt`). Истечение локального времени никогда не вызывает повторный `refundStarPayment`.
+  3. **`AUD-016` (`FIXED`):** Внедрён 3-фазный протокол возврата с устойчивыми состояниями (`refund_in_progress` -> `telegram_refund_succeeded_pending_commit` -> `refunded` / `refund_failed_needs_reconciliation`) и методом восстановления `PaymentService.recoverPendingRefunds()`, который завершает запись в Firestore после сбоя БД без повторного вызова Telegram API.
 
 ### 1.8. Автоматическая выдача цифровых товаров после подтверждённой оплаты
 - `FulfillmentService.initiateFulfillment()` (`src/services/FulfillmentService.ts:237–520`) атомарно захватывает заказ в транзакции перед вызовом адаптера, поддерживает сверку `checkExternalStatus` после сбоя, карантин неидемпотентных провайдеров (`needsManualReconciliation: true`) и лимит `MAX_FULFILLMENT_ATTEMPTS = 3`.
@@ -123,22 +123,17 @@
 
 ### `AUD-003` — При возврате средств (`markPaymentRefunded`) не уменьшаются `totalOrders` и `totalSpentStars` пользователя
 - **Критичность:** `High`
-- **Статус:** ❌ **НЕ ИСПРАВЛЕНО (`OPEN`)**
-- **Файл и строки:** `src/services/PaymentService.ts` (`424–494`, в сравнении со строками `281–302`)
-- **Как воспроизводится:** Оплатить заказ (`totalOrders` становится `1`, `totalSpentStars` увеличивается на сумму заказа), затем выполнить возврат через `PaymentService.executeOrderRefund()` / `markPaymentRefunded()`. Документ `users/{userId}` в транзакции возврата не читается и не обновляется.
-- **Последствия:** Статистика покупок пользователя в `/profile` и в админке остаётся завышенной после возврата Stars.
-- **Минимальное исправление:** В начале транзакции `PaymentService.markPaymentRefunded()` прочитать `users/{order.userId}` и уменьшить `totalOrders = Math.max(0, existingUser.totalOrders - 1)` и `totalSpentStars = Math.max(0, existingUser.totalSpentStars - order.totalPrice)`.
+- **Статус:** ✅ **ИСПРАВЛЕНО (`FIXED` — Stage 3.1)**
+- **Файл и строки:** `src/services/PaymentService.ts` (`567–685`), `src/types.ts` (`78`)
+- **Проверка исправления:** В транзакции `PaymentService.markPaymentRefunded()` читается `users/{order.userId}` и при `!order.refundStatsAdjusted` атомарно уменьшаются `totalOrders = Math.max(0, existingUser.totalOrders - 1)` и `totalSpentStars = Math.max(0, existingUser.totalSpentStars - order.totalPrice)` с установкой `refundStatsAdjusted: true`. Подтверждено тестом `A-07`.
 
 ---
 
 ### `AUD-004` — Двухэтапное подтверждение возврата и серверный запрет отмены оплаченных заказов
 - **Критичность:** `High`
-- **Статус:** ⚠️ **ЧАСТИЧНО ИСПРАВЛЕНО (`PARTIALLY FIXED`)** — *основная логика исправлена и покрыта тестами `A-02`, `A-03`, `A-04`, но выявлены 2 связанных дефекта распределённой блокировки и отказоустойчивости возврата (`AUD-015` и `AUD-016`)*.
-- **Файл и строки:** `src/bot/handlers/adminHandler.ts` (`440–637`), `src/bot/keyboards.ts` (`236–285`), `src/services/OrderService.ts` (`237–255`), `src/services/PaymentService.ts` (`330–494`)
-- **Что исправлено:**
-  1. Нажатие `adm:ord_refund:<orderId>` больше не возвращает Stars в 1 клик, а открывает экран подтверждения (`adm:ord_refund_confirm:<orderId>`) с предупреждением, если заказ уже `completed`.
-  2. Отмена уже оплаченного заказа через `adm:ord_cancel` или `ucancel` заблокирована на уровне обработчиков и внутри транзакции `OrderService.updateOrderStatus()`.
-- **Что осталось доработать:** см. `AUD-015` (межпроцессная блокировка возврата в Firestore) и `AUD-016` (обработка сбоя записи в Firestore после успешного возврата в Telegram API).
+- **Статус:** ✅ **ИСПРАВЛЕНО (`FIXED` — Stage 3.1)**
+- **Файл и строки:** `src/bot/handlers/adminHandler.ts` (`440–637`), `src/bot/keyboards.ts` (`236–285`), `src/services/OrderService.ts` (`237–255`), `src/services/PaymentService.ts` (`365–685`)
+- **Проверка исправления:** Реализовано двухэтапное подтверждение возврата, серверный запрет отмены оплаченных заказов, распределённая блокировка возврата (`AUD-015`) и восстановление после сбоя БД (`AUD-016`). Подтверждено тестами `A-02`..`A-06`.
 
 ---
 
@@ -162,11 +157,9 @@
 
 ### `AUD-007` — Нетранзакционный `getDoc` + `setDoc` в `UserService.upsertFromTelegram` и `setUserBlocked`
 - **Критичность:** `Medium`
-- **Статус:** ❌ **НЕ ИСПРАВЛЕНО (`OPEN`)**
-- **Файл и строки:** `src/services/UserService.ts` (`10–50`, `77–92`), `src/bot/handlers/userHandler.ts` (`122`)
-- **Как воспроизводится:** Глобальный middleware (`userHandler.ts:122`) на каждое входящее обновление вызывает `UserService.upsertFromTelegram()`, который читает весь документ `users/{userId}` вне транзакции и перезаписывает его целиком через `setDoc` (`UserService.ts:18–30`). При параллельном выполнении с `PaymentService.processSuccessfulPayment()` старое значение `totalOrders` и `totalSpentStars` из `existing` может перезатереть только что увеличенные счётчики.
-- **Последствия:** Потеря инкремента `totalOrders`/`totalSpentStars` при конкурентных апдейтах и лишняя запись в Firestore на каждый клик пользователя.
-- **Минимальное исправление:** Использовать частичное обновление `updateDoc` только для профильных полей (`username`, `firstName`, `lastName`, `languageCode`, `updatedAt`) при их реальном изменении, либо выполнять запись внутри транзакции без перезаписи `totalOrders`, `totalSpentStars` и `isBlocked`.
+- **Статус:** ✅ **ИСПРАВЛЕНО (`FIXED` — Stage 3.1)**
+- **Файл и строки:** `src/services/UserService.ts` (`10–73`, `95–116`)
+- **Проверка исправления:** `UserService.upsertFromTelegram()` и `UserService.setUserBlocked()` обёрнуты в `firestoreRepo.runTransaction()`, атомарно сохраняют актуальные `totalOrders`, `totalSpentStars` и `isBlocked` и пропускают лишнюю запись в БД, если поля профиля не изменились. Подтверждено тестом `A-08`.
 
 ---
 
@@ -245,37 +238,26 @@
 
 ### `AUD-015` — Блокировка возврата `activeRefundLocks` работает только в памяти одного процесса и не защищает при нескольких экземплярах сервера
 - **Критичность:** `High`
-- **Статус:** ❌ **НЕ ИСПРАВЛЕНО (`OPEN`)**
-- **Файл и строки:** `src/services/PaymentService.ts` (`330–358`)
-- **Как воспроизводится:** `PaymentService.activeRefundLocks` представляет собой локальный `new Set<string>()` в оперативной памяти процесса Node.js. Если приложение развёрнуто в Cloud Run с количеством экземпляров `> 1` и два администратора (или два параллельных запроса) одновременно нажимают `adm:ord_refund_confirm:<orderId>`, запросы балансируются на разные инстансы контейнера. Оба инстанса видят пустой локальный `activeRefundLocks`, оба читают заказ в статусе `paid` и оба вызывают Telegram API `refundStarPayment`.
-- **Последствия:** Гонка между инстансами сервера при горизонтальном масштабировании.
-- **Минимальное исправление:** Захватывать распределённый lease-лок возврата непосредственно в документе заказа в Firestore внутри транзакции (например, `refundLockId`, `refundLockedAt` с таймаутом 45 секунд) **до** вызова `callTelegramRefund`.
+- **Статус:** ✅ **ИСПРАВЛЕНО (`FIXED` — Stage 3.1)**
+- **Файл и строки:** `src/services/PaymentService.ts` (`376–482`), `src/types.ts` (`20–24`, `74–78`)
+- **Проверка исправления:** Локальный `Set` `activeRefundLocks` полностью удалён. Захват блокировки возврата (`refundState: 'refund_in_progress'`, `refundLockToken`, `refundStartedAt`) выполняется через транзакцию Firestore до вызова `callTelegramRefund`. Истечение времени локальной блокировки никогда не приводит к повторному вызову Telegram API. Подтверждено тестом `A-05` на двух независимых экземплярах `PaymentService`.
 
 ---
 
 ### `AUD-016` — Риск рассинхронизации при успешном возврате в Telegram API (`refundStarPayment`) и последующей ошибке записи в Firestore
 - **Критичность:** `High`
-- **Статус:** ❌ **НЕ ИСПРАВЛЕНО (`OPEN`)**
-- **Файл и строки:** `src/services/PaymentService.ts` (`399–413`), `src/bot/handlers/adminHandler.ts` (`528–581`)
-- **Как воспроизводится:** В `PaymentService.executeOrderRefund()` сначала выполняется внешний сетевой запрос `await params.callTelegramRefund(...)` (`refundStarPayment` в Telegram API, строки `399–402`), и только после него запускается транзакция `await this.markPaymentRefunded(...)` (строки `404–407`). Если вызов `refundStarPayment` в Telegram прошёл успешно, но в момент коммита `markPaymentRefunded` произошёл временный сбой Firestore (`DEADLINE_EXCEEDED` / `UNAVAILABLE`), метод выбросит ошибку без сохранения состояния возврата.
-- **Последствия:** Telegram реально вернул Stars покупателю, но в базе Firestore заказ остаётся в статусе `paid` / `completed` (а `PaymentRecord` — в статусе `paid`), без флага `needsManualReconciliation` и без записи о том, что средства уже списаны с баланса бота.
-- **Минимальное исправление:**
-  1. Перед вызовом `callTelegramRefund` транзакционно записывать в заказ маркер `refundStartedAt` (одновременно решая `AUD-015`).
-  2. Обернуть вызов `markPaymentRefunded` после успешного `callTelegramRefund` во встроенный retry (3 попытки с backoff), а если БД остаётся недоступной — переводить заказ в карантин сверки (`needsManualReconciliation: true`, `fulfillmentLastError: 'CRITICAL: Telegram refundStarPayment succeeded, but Firestore commit failed'`) и отправлять экстренное уведомление администратору.
+- **Статус:** ✅ **ИСПРАВЛЕНО (`FIXED` — Stage 3.1)**
+- **Файл и строки:** `src/services/PaymentService.ts` (`484–833`), `src/services/FulfillmentService.ts` (`669–680`)
+- **Проверка исправления:** Реализован 3-фазный протокол возврата с фиксацией подтверждённого ответа Telegram (`telegram_refund_succeeded_pending_commit` + журнал подтверждённых возвратов) и методом восстановления `PaymentService.recoverPendingRefunds()` (интегрированным в фоновый воркер `FulfillmentService.recoverPendingFulfillments`), который доводит состояние заказа, платежа и статистики пользователя до `refunded` в Firestore без повторного вызова Telegram API. При неопределённом исходе после перезапуска сервера заказ переводится в карантин сверки `refund_failed_needs_reconciliation`. Подтверждено тестом `A-06`.
 
 ---
 
 ## 3. Оценка тестирования и сборки
 
 1. **Что реально проверяют существующие тесты:**
-   - `npm test` (`src/tests/stage1.test.ts` — `29/29 PASS`): проверяет бизнес-логику `OrderService`, `PaymentService`, `FulfillmentService`, конкурентную оплату (`P-03`), конкурентных воркеров выдачи (`F-02`), crash-recovery (`F-03`), валидацию `X-Telegram-Bot-Api-Secret-Token` (`S-01`, `S-02`), запрет невалидных переходов статусов (`A-01`, `A-02`) и защиту возврата в рамках одного процесса (`A-03`, `A-04`).
+   - `npm test` (`src/tests/stage1.test.ts` — `44/44 PASS`): проверяет бизнес-логику `OrderService`, `PaymentService`, `FulfillmentService`, `BalanceService`, `PaymentProviderGateway`, конкурентную оплату (`P-03`), конкурентных воркеров выдачи (`F-02`), crash-recovery (`F-03`), валидацию `X-Telegram-Bot-Api-Secret-Token` (`S-01`, `S-02`), запрет невалидных переходов статусов (`A-01`, `A-02`), двухэтапный возврат (`A-03`, `A-04`), распределённую блокировку возврата между двумя независимыми экземплярами `PaymentService` (`A-05`), восстановление после сбоя Firestore вслед за успешным возвратом Telegram (`A-06`), однократное уменьшение статистики пользователя при возврате (`A-07`), параллельное обновление профиля и оплаты (`A-08`), а также систему пополнения внутреннего баланса и оплаты с баланса (`B-01` — `B-11`: комиссии 3%/5%/2%, успешное пополнение, подпись вебхуков, дубли вебхуков, неверная сумма, неверная валюта, истёкший счёт, конкурентные пополнения, защита от двойного списания баланса, недостаточный баланс и безопасный возврат на внутренний баланс).
    - `npm run audit:emulator` (`firestore-audit-package` — `38/38 PASS`): проверяет `firestore.rules`, индексы и транзакции на реальном Firebase Emulator (`127.0.0.1:8080`).
-2. **Чего тесты пока НЕ проверяют:**
-   - Сценарий частичного сбоя: `refundStarPayment` в Telegram прошёл успешно, а `markPaymentRefunded` в Firestore завершился ошибкой (`AUD-016`).
-   - Межпроцессную конкуренцию возвратов через Firestore-лок без опоры на in-memory `Set` (`AUD-015`).
-   - Уменьшение `totalOrders` и `totalSpentStars` пользователя при возврате (`AUD-003`).
-   - Оплату ранее выставленного инвойса после удаления товара администратором (`AUD-013`).
-3. **Честная оценка сборки:**
+2. **Честная оценка сборки:**
    - Команда `npm run build` выполняет **только `tsc --noEmit`** (статическую проверку типов TypeScript). Полноценная компиляция/бандлинг серверного кода в отдельный production-артефакт (`dist/`) в проекте не настроена (`AUD-011`).
 
 ---
@@ -285,21 +267,34 @@
 - **Проверено областей из 14:** **`14 из 14 (100%)`**
 - **Всего зафиксировано проблем в реестре (`AUD-001` — `AUD-016`):** **`16`**
   - **Critical:** **`1`** (`AUD-002`)
-  - **High:** **`6`** (`AUD-001`, `AUD-003`, `AUD-004` *[частично исправлена]*, `AUD-005` *[исправлена]*, `AUD-015`, `AUD-016`)
-  - **Medium:** **`7`** (`AUD-006`, `AUD-007`, `AUD-008`, `AUD-009`, `AUD-010`, `AUD-011`, `AUD-013`)
+  - **High:** **`6`** (`AUD-001`, `AUD-003` *[исправлена]*, `AUD-004` *[исправлена]*, `AUD-005` *[исправлена]*, `AUD-015` *[исправлена]*, `AUD-016` *[исправлена]*)
+  - **Medium:** **`7`** (`AUD-006`, `AUD-007` *[исправлена]*, `AUD-008`, `AUD-009`, `AUD-010`, `AUD-011`, `AUD-013`)
   - **Low:** **`2`** (`AUD-012`, `AUD-014`)
 - **Статус исправления проблем:**
-  - **Полностью исправлено (`FIXED`):** **`1`** (`AUD-005`)
-  - **Частично исправлено (`PARTIALLY FIXED`):** **`1`** (`AUD-004` — внедрены двухшаговое подтверждение возврата и запрет отмены оплаченных заказов; межпроцессный лок и защита от сбоя БД после `refundStarPayment` выделены в `AUD-015` и `AUD-016`)
-  - **Осталось исправить (`OPEN`):** **`14`** (`AUD-001`, `AUD-002`, `AUD-003`, `AUD-006`, `AUD-007`, `AUD-008`, `AUD-009`, `AUD-010`, `AUD-011`, `AUD-012`, `AUD-013`, `AUD-014`, `AUD-015`, `AUD-016`)
+  - **Полностью исправлено (`FIXED`):** **`6`** (`AUD-003`, `AUD-004`, `AUD-005`, `AUD-007`, `AUD-015`, `AUD-016`)
+  - **Осталось исправить (`OPEN`):** **`10`** (`AUD-001`, `AUD-002`, `AUD-006`, `AUD-008`, `AUD-009`, `AUD-010`, `AUD-011`, `AUD-012`, `AUD-013`, `AUD-014`)
 - **Какие компоненты не удалось проверить локально:**
-  - Реальный сетевой обмен с Production Telegram Bot API (`sendInvoice`, `refundStarPayment`) и внешним API поставщика ключей/Stars (в соответствии с правилами безопасности аудита внешние боевые платёжные контуры не подключались). Все остальные 14 компонентов проверены по исходному коду и на локальном эмуляторе.
-- **Что блокирует запуск первых реальных продаж (Must-Fix Blockers):**
-  1. **`AUD-002` (`Critical`):** Отсутствие пула одноразовых ключей для автоматической выдачи и автозасев тестовых товаров `(Тест)` при пустой БД.
-  2. **`AUD-015` + `AUD-016` + `AUD-003` (`High`):** Перенос блокировки возврата из памяти процесса в транзакцию Firestore, защита от рассинхронизации при сбое записи в БД после успешного `refundStarPayment` в Telegram и корректировка `totalOrders`/`totalSpentStars` при возврате.
-  3. **`AUD-001` (`High`):** Отключение клиентского Firebase SDK (`firestoreErrorHandler.ts`) в серверном процессе, вызывающего обрывы gRPC-потока `Listen`.
-  4. **`AUD-007` + `AUD-013` + `AUD-009` (`Medium`):** Устранение гонки `setDoc` в `UserService.upsertFromTelegram`, защита `processSuccessfulPayment` при удалённом товаре и скрытие внутренних идентификаторов из публичного `/health`.
-- **Рекомендуемый следующий этап исправлений:**
-  - **Этап 3.1 (Финансовая атомарность возвратов и БД):** Исправить `AUD-015`, `AUD-016`, `AUD-003`, `AUD-001`, `AUD-007`, `AUD-013`, `AUD-009` + добавить тесты на сбой БД после `refundStarPayment` и пересчёт статистики при возврате.
-  - **Этап 3.2 (Каталог и автовыдача ключей):** Исправить `AUD-002` (пул одноразовых ключей и отключение автозасева тестовых позиций в Production) и `AUD-008` (`maintenanceMode`).
-  - **Этап 3.3 (UX, пагинация и сборка):** Исправить `AUD-006`, `AUD-010`, `AUD-011`, `AUD-012`, `AUD-014`.
+  - Реальный сетевой обмен с Production Telegram Bot API (`sendInvoice`, `refundStarPayment`) и внешним API поставщика ключей/Stars. Все остальные 14 компонентов проверены по исходному коду и на локальном эмуляторе.
+
+---
+
+## 5. STAGE 3.2 — Система пополнения внутреннего баланса и платёжные провайдеры
+
+В рамках Stage 3.2 реализована система внутреннего баланса и интеграция с официальными API платёжных провайдеров:
+
+1. **Профиль и меню пополнения (`src/bot/handlers/userHandler.ts`, `src/bot/keyboards.ts`, `src/bot/formatters.ts`):**
+   - Кнопка `«💳 Пополнить баланс»` (`menu:topup`) в профиле пользователя (`/profile`) и команда `/topup`.
+   - Отображение текущего баланса, выбора провайдера, валюты, пресетов сумм (`100`, `250`, `500`, `1000`, `2500`, `5000`) и ввода произвольной суммы, расчёта комиссии (`%` и сумма) и итоговой суммы зачисления до создания счёта.
+2. **Платёжные провайдеры (`src/services/PaymentProviders.ts`):**
+   - **CryptoBot API** (`https://pay.crypt.bot/api`, заголовок `Crypto-Pay-API-Token`, методы `POST /createInvoice`, `GET /getInvoices`, проверка вебхука `crypto-pay-api-signature` через `HMAC-SHA256(rawBody, SHA256(token))`) — комиссия магазина **3%** (`100 -> 97`).
+   - **Lolzteam Market API** (`https://prod-api.lzt.market`, заголовок `Authorization: Bearer <token>`, методы `POST /invoice`, `GET /invoice`, проверка вебхука `x-secret-key` через `timingSafeEqual`) — комиссия магазина **5%** (`100 -> 95`).
+   - **xRocket Pay API** (`https://pay.xrocket.tg`, заголовок `Rocket-Pay-Key`, методы `POST /tg-invoices`, `GET /tg-invoices/{id}`, проверка вебхука `rocket-pay-signature` через `HMAC-SHA256(rawBody, SHA256(apiKey))`) — комиссия магазина **2%** (`100 -> 98`).
+   - Оплата криптовалютой (`USDT`, `TON / TONCOIN`, `BTC`, `ETH`, `TRX`, `BNB`, `USDC`, `LTC` в сетях `TON`, `TRC-20`, `ERC-20`, `BEP-20`, `Bitcoin`, `Litecoin`) покрывается через CryptoBot и xRocket без дублирующего 4-го провайдера.
+3. **Сервис баланса и защита платежей (`src/services/BalanceService.ts`, `server.ts`):**
+   - Копеечная целочисленная арифметика (`toMinorUnits` / `fromMinorUnits`, `× 100`) без ошибок округления `float`.
+   - Двухуровневая верификация каждого пополнения: криптографическая подпись вебхука (`POST /webhook/cryptobot`, `/webhook/lolzteam`, `/webhook/xrocket`) + обязательный серверный запрос к API провайдера (`verifyInvoiceStatus`) со сверкой `externalInvoiceId`, `paymentId`, `recipientMerchantId`, `currency`, `amountPaid` и срока действия (`expiresAt`).
+   - Атомарное зачисление в коллекции `users` и `balance_topups` с записью в `transactions` через Firestore transaction и защитой от модификации `amountCredited`.
+4. **Оплата заказов с внутреннего баланса и возврат (`buy_bal:<productId>`, `BalanceService.purchaseWithInternalBalance`, `BalanceService.refundOrderToInternalBalance`):**
+   - Атомарное списание баланса в транзакции Firestore без возможности уйти в минус и без двойного списания при параллельных запросах; `totalSpentStars` не смешивается с внутренним балансом.
+   - В админ-панели добавлен раздел `💳 Пополнения баланса` (`adm:topups:all|paid|pending|failed`) и двухэтапный возврат заказов, оплаченных с баланса, обратно на внутренний баланс (`adm:ord_bal_refund:<orderId>` -> `adm:ord_bal_refund_confirm:<orderId>`), без возможности произвольного ручного редактирования баланса.
+

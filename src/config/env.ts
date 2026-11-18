@@ -70,6 +70,14 @@ export interface AppConfig {
   firebaseClientEmail: string;
   firebasePrivateKey: string;
   appletFirebaseConfig: AppletFirebaseConfig;
+  cryptobotApiToken: string;
+  cryptobotApiUrl: string;
+  lolzteamApiToken: string;
+  lolzteamMerchantId: string;
+  lolzteamWebhookSecret: string;
+  lolzteamApiUrl: string;
+  xrocketApiKey: string;
+  xrocketApiUrl: string;
 }
 
 function parseAdminIds(raw: string | undefined): number[] {
@@ -172,6 +180,35 @@ export function getEnvConfig(): AppConfig {
     firebaseClientEmail,
     firebasePrivateKey: normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY),
     appletFirebaseConfig: appletConfig,
+    cryptobotApiToken: cleanEnvValue(
+      'CRYPTOBOT_API_TOKEN',
+      process.env.CRYPTOBOT_API_TOKEN,
+    ),
+    cryptobotApiUrl:
+      cleanEnvValue('CRYPTOBOT_API_URL', process.env.CRYPTOBOT_API_URL) ||
+      'https://pay.crypt.bot/api',
+    lolzteamApiToken: cleanEnvValue(
+      'LOLZTEAM_API_TOKEN',
+      process.env.LOLZTEAM_API_TOKEN,
+    ),
+    lolzteamMerchantId: cleanEnvValue(
+      'LOLZTEAM_MERCHANT_ID',
+      process.env.LOLZTEAM_MERCHANT_ID,
+    ),
+    lolzteamWebhookSecret: cleanEnvValue(
+      'LOLZTEAM_WEBHOOK_SECRET',
+      process.env.LOLZTEAM_WEBHOOK_SECRET,
+    ),
+    lolzteamApiUrl:
+      cleanEnvValue('LOLZTEAM_API_URL', process.env.LOLZTEAM_API_URL) ||
+      'https://prod-api.lzt.market',
+    xrocketApiKey: cleanEnvValue(
+      'XROCKET_API_KEY',
+      process.env.XROCKET_API_KEY,
+    ),
+    xrocketApiUrl:
+      cleanEnvValue('XROCKET_API_URL', process.env.XROCKET_API_URL) ||
+      'https://pay.xrocket.tg',
   };
 }
 

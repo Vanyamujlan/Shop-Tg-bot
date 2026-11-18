@@ -3,6 +3,7 @@ import { getEnvConfig } from '../config/env.ts';
 import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import { Order, StoreTransaction } from '../types.ts';
 import { OrderService } from './OrderService.ts';
+import { PaymentService } from './PaymentService.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
 import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
 
@@ -663,6 +664,19 @@ export class FulfillmentService {
             recovered.push(notified);
           }
         }
+      }
+
+      // 4. AUD-016: Recover pending/interrupted refunds where Telegram succeeded before Firestore commit
+      try {
+        const recoveredRefunds = await PaymentService.recoverPendingRefunds();
+        for (const r of recoveredRefunds) {
+          recovered.push(r);
+        }
+      } catch (error) {
+        console.error(
+          '[FulfillmentService] Ошибка фонового восстановления возвратов:',
+          error instanceof Error ? error.message : String(error),
+        );
       }
 
       return recovered;
