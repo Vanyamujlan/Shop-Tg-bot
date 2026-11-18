@@ -17,6 +17,7 @@ import {
   buildAdminCategoryPickKeyboard,
   buildAdminMainKeyboard,
   buildAdminOrderActionKeyboard,
+  buildAdminOrderRefundConfirmKeyboard,
   buildAdminOrdersKeyboard,
   buildAdminProductManageKeyboard,
   buildAdminProductsKeyboard,
@@ -231,7 +232,7 @@ export function registerAdminHandlers(
     );
   });
 
-  // Перевести заказ в статус processing («В обработке»)
+  // Перевести заказ в статус processing («В обработке») — AUD-005: только для оплаченных заказов
   bot.action(/^adm:ord_proc:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
@@ -239,28 +240,74 @@ export function registerAdminHandlers(
       return;
     }
 
-    const updated = await OrderService.updateOrderStatus({
-      orderId,
-      fulfillmentStatus: 'processing',
-      fulfillmentNote: 'Администратор взял заказ в обработку.',
-    });
-    if (!updated) {
+    const existing = await OrderService.getOrderById(orderId);
+    if (!existing) {
       await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
       return;
     }
 
-    await logAdminAudit(
-      ctx.from!.id,
-      orderId,
-      updated.totalPrice,
-      'Взял заказ в обработку (processing)',
-    );
-    await safeAnswerCbQuery(ctx, 'Статус изменён на «В обработке»');
-    await safeRespondOrEdit(
-      ctx,
-      formatAdminOrderCard(updated),
-      buildAdminOrderActionKeyboard(updated),
-    );
+    if (
+      existing.paymentStatus !== 'paid' &&
+      existing.paymentStatus !== 'processing'
+    ) {
+      await safeAnswerCbQuery(
+        ctx,
+        `Невозможно взять заказ в обработку: статус оплаты «${existing.paymentStatus}» (требуется оплата).`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(existing),
+        buildAdminOrderActionKeyboard(existing),
+      );
+      return;
+    }
+
+    if (
+      existing.fulfillmentStatus === 'completed' ||
+      existing.fulfillmentStatus === 'refunded' ||
+      existing.fulfillmentStatus === 'cancelled'
+    ) {
+      await safeAnswerCbQuery(
+        ctx,
+        `Заказ уже находится в финальном статусе «${existing.fulfillmentStatus}».`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(existing),
+        buildAdminOrderActionKeyboard(existing),
+      );
+      return;
+    }
+
+    try {
+      const updated = await OrderService.updateOrderStatus({
+        orderId,
+        fulfillmentStatus: 'processing',
+        fulfillmentNote: 'Администратор взял заказ в обработку.',
+      });
+      if (!updated) {
+        await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
+        return;
+      }
+
+      await logAdminAudit(
+        ctx.from!.id,
+        orderId,
+        updated.totalPrice,
+        'Взял заказ в обработку (processing)',
+      );
+      await safeAnswerCbQuery(ctx, 'Статус изменён на «В обработке»');
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(updated),
+        buildAdminOrderActionKeyboard(updated),
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
   });
 
   // Быстрое подтверждение выдачи заказа (completed) + уведомление покупателя
@@ -294,7 +341,7 @@ export function registerAdminHandlers(
     }
   });
 
-  // Выдача заказа с персональным сообщением, ссылкой или кодом активации
+  // Выдача заказа с персональным сообщением, ссылкой или кодом активации (AUD-005: только для оплаченных)
   bot.action(/^adm:ord_note:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
@@ -305,6 +352,41 @@ export function registerAdminHandlers(
     const order = await OrderService.getOrderById(orderId);
     if (!order) {
       await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
+      return;
+    }
+
+    if (
+      order.paymentStatus !== 'paid' &&
+      order.paymentStatus !== 'processing'
+    ) {
+      await safeAnswerCbQuery(
+        ctx,
+        `Невозможно выдать заказ без оплаты (текущий статус: «${order.paymentStatus}»).`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(order),
+        buildAdminOrderActionKeyboard(order),
+      );
+      return;
+    }
+
+    if (
+      order.fulfillmentStatus === 'completed' ||
+      order.fulfillmentStatus === 'refunded' ||
+      order.fulfillmentStatus === 'cancelled'
+    ) {
+      await safeAnswerCbQuery(
+        ctx,
+        `Заказ уже имеет финальный статус «${order.fulfillmentStatus}».`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(order),
+        buildAdminOrderActionKeyboard(order),
+      );
       return;
     }
 
@@ -361,11 +443,11 @@ export function registerAdminHandlers(
     }
   });
 
-  // Официальный возврат Telegram Stars через refundStarPayment
+  // AUD-004 (Шаг 1 из 2): Запрос подтверждения официального возврата Telegram Stars
   bot.action(/^adm:ord_refund:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
-    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_refund:${orderId}`, 2500)) {
+    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_refund:${orderId}`, 1500)) {
       return;
     }
 
@@ -380,35 +462,142 @@ export function registerAdminHandlers(
       return;
     }
 
-    if (order.paymentStatus === 'refunded') {
+    if (
+      order.paymentStatus === 'refunded' ||
+      order.fulfillmentStatus === 'refunded'
+    ) {
       await safeAnswerCbQuery(
         ctx,
         'По этому заказу уже выполнен возврат.',
         true,
       );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(order),
+        buildAdminOrderActionKeyboard(order),
+      );
+      return;
+    }
+
+    if (
+      order.paymentStatus !== 'paid' &&
+      order.paymentStatus !== 'processing' &&
+      order.paymentStatus !== 'completed'
+    ) {
+      await safeAnswerCbQuery(
+        ctx,
+        `Возврат невозможен для заказа со статусом оплаты «${order.paymentStatus}».`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(order),
+        buildAdminOrderActionKeyboard(order),
+      );
+      return;
+    }
+
+    if (PaymentService.isRefundInProgress(orderId)) {
+      await safeAnswerCbQuery(
+        ctx,
+        'Возврат по этому заказу уже выполняется другим запросом.',
+        true,
+      );
+      return;
+    }
+
+    const completedWarning =
+      order.fulfillmentStatus === 'completed'
+        ? [
+            '',
+            '🚨 <b>ВНИМАНИЕ: Заказ уже ВЫПОЛНЕН (товар был выдан покупателю)!</b>',
+            'Если вы подтвердите возврат, покупатель получит Stars обратно, сохранив выданный товар.',
+          ].join('\n')
+        : '';
+
+    const confirmText = [
+      `⚠️ <b>Подтверждение возврата Telegram Stars (Шаг 2 из 2)</b>`,
+      '',
+      `Заказ: <code>#${escapeHtml(order.orderId)}</code>`,
+      `Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
+      `Покупатель: <code>${order.userTelegramId}</code>${order.username ? ` (@${escapeHtml(order.username)})` : ''}`,
+      `Сумма к возврату: <b>${order.totalPrice} ⭐ (XTR)</b>`,
+      `Charge ID: <code>${escapeHtml(order.telegramPaymentChargeId)}</code>`,
+      completedWarning,
+      '',
+      'Вы действительно хотите выполнить официальный возврат средств через <code>refundStarPayment</code>? Это действие необратимо.',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    await safeRespondOrEdit(
+      ctx,
+      confirmText,
+      buildAdminOrderRefundConfirmKeyboard(order),
+    );
+  });
+
+  // AUD-004 (Шаг 2 из 2): Выполнение подтверждённого возврата Telegram Stars через refundStarPayment
+  bot.action(/^adm:ord_refund_confirm:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const orderId = ctx.match[1];
+    if (
+      isDuplicateCallbackClick(
+        ctx.from!.id,
+        `adm:ord_refund_confirm:${orderId}`,
+        2500,
+      )
+    ) {
       return;
     }
 
     try {
-      await (
-        ctx.telegram as unknown as {
-          callApi: (method: string, payload: Record<string, unknown>) => Promise<boolean>;
-        }
-      ).callApi('refundStarPayment', {
-        user_id: order.userTelegramId,
-        telegram_payment_charge_id: order.telegramPaymentChargeId,
+      const result = await PaymentService.executeOrderRefund({
+        orderId,
+        adminTelegramId: ctx.from!.id,
+        callTelegramRefund: async (userTelegramId, telegramPaymentChargeId) => {
+          await (
+            ctx.telegram as unknown as {
+              callApi: (
+                method: string,
+                payload: Record<string, unknown>,
+              ) => Promise<boolean>;
+            }
+          ).callApi('refundStarPayment', {
+            user_id: userTelegramId,
+            telegram_payment_charge_id: telegramPaymentChargeId,
+          });
+        },
       });
 
-      const refundedOrder = await PaymentService.markPaymentRefunded(
-        order.orderId,
+      if (result.alreadyRefunded) {
+        await safeAnswerCbQuery(
+          ctx,
+          'По этому заказу уже выполнен возврат.',
+          true,
+        );
+        await safeRespondOrEdit(
+          ctx,
+          formatAdminOrderCard(result.order),
+          buildAdminOrderActionKeyboard(result.order),
+        );
+        return;
+      }
+
+      const refundedOrder = result.order;
+
+      await logAdminAudit(
         ctx.from!.id,
+        refundedOrder.orderId,
+        refundedOrder.totalPrice,
+        `Выполнил возврат ${refundedOrder.totalPrice} XTR (charge_id: ${refundedOrder.telegramPaymentChargeId})`,
       );
 
       // Уведомляем покупателя о возврате
       try {
         await bot.telegram.sendMessage(
-          order.userTelegramId,
-          `↩️ <b>Возврат средств по заказу #${escapeHtml(order.orderId)}</b>\n\nНа ваш баланс возвращено <b>${order.totalPrice} ⭐ (Telegram Stars)</b>.`,
+          refundedOrder.userTelegramId,
+          `↩️ <b>Возврат средств по заказу #${escapeHtml(refundedOrder.orderId)}</b>\n\nНа ваш баланс возвращено <b>${refundedOrder.totalPrice} ⭐ (Telegram Stars)</b>.`,
           { parse_mode: 'HTML' },
         );
       } catch {
@@ -421,25 +610,23 @@ export function registerAdminHandlers(
         true,
       );
 
-      if (refundedOrder) {
-        await safeRespondOrEdit(
-          ctx,
-          formatAdminOrderCard(refundedOrder),
-          buildAdminOrderActionKeyboard(refundedOrder),
-        );
-      }
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(refundedOrder),
+        buildAdminOrderActionKeyboard(refundedOrder),
+      );
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       console.error('[AdminHandler] Ошибка refundStarPayment:', msg);
       await safeAnswerCbQuery(
         ctx,
-        `Ошибка API возврата: ${msg.slice(0, 150)}`,
+        `Ошибка возврата: ${msg.slice(0, 150)}`,
         true,
       );
     }
   });
 
-  // Отмена неоплаченного заказа админом
+  // Отмена неоплаченного заказа админом (AUD-004: запрет отмены уже оплаченных заказов)
   bot.action(/^adm:ord_cancel:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     const orderId = ctx.match[1];
@@ -447,26 +634,55 @@ export function registerAdminHandlers(
       return;
     }
 
-    const updated = await OrderService.updateOrderStatus({
-      orderId,
-      paymentStatus: 'cancelled',
-      fulfillmentStatus: 'cancelled',
-      fulfillmentNote: `Отменён администратором (ID: ${ctx.from!.id}).`,
-    });
-    if (!updated) return;
+    const existing = await OrderService.getOrderById(orderId);
+    if (!existing) {
+      await safeAnswerCbQuery(ctx, 'Заказ не найден.', true);
+      return;
+    }
 
-    await logAdminAudit(
-      ctx.from!.id,
-      orderId,
-      updated.totalPrice,
-      'Отменил заказ',
-    );
+    if (
+      existing.paymentStatus !== 'pending' ||
+      existing.fulfillmentStatus !== 'pending'
+    ) {
+      await safeAnswerCbQuery(
+        ctx,
+        `Невозможно отменить заказ: статус оплаты уже «${existing.paymentStatus}» (выдача: «${existing.fulfillmentStatus}»).`,
+        true,
+      );
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(existing),
+        buildAdminOrderActionKeyboard(existing),
+      );
+      return;
+    }
 
-    await safeRespondOrEdit(
-      ctx,
-      formatAdminOrderCard(updated),
-      buildAdminOrderActionKeyboard(updated),
-    );
+    try {
+      const updated = await OrderService.updateOrderStatus({
+        orderId,
+        paymentStatus: 'cancelled',
+        fulfillmentStatus: 'cancelled',
+        fulfillmentNote: `Отменён администратором (ID: ${ctx.from!.id}).`,
+      });
+      if (!updated) return;
+
+      await logAdminAudit(
+        ctx.from!.id,
+        orderId,
+        updated.totalPrice,
+        'Отменил неоплаченный заказ',
+      );
+
+      await safeAnswerCbQuery(ctx, 'Неоплаченный заказ отменён.');
+      await safeRespondOrEdit(
+        ctx,
+        formatAdminOrderCard(updated),
+        buildAdminOrderActionKeyboard(updated),
+      );
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
   });
 
   // 3. Управление товарами

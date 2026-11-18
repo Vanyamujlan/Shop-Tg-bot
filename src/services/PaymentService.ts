@@ -327,8 +327,99 @@ export class PaymentService {
     });
   }
 
+  private static activeRefundLocks = new Set<string>();
+
+  public static isRefundInProgress(orderId: string): boolean {
+    return this.activeRefundLocks.has(orderId);
+  }
+
+  /**
+   * Executes Telegram Stars refund with in-flight concurrency lock, duplicate refund protection,
+   * and strict paymentStatus verification before calling Telegram API and committing to Firestore.
+   */
+  public static async executeOrderRefund(params: {
+    orderId: string;
+    adminTelegramId: number;
+    callTelegramRefund: (
+      userTelegramId: number,
+      telegramPaymentChargeId: string,
+    ) => Promise<void>;
+  }): Promise<{ alreadyRefunded: boolean; order: Order }> {
+    firestoreRepo.assertReadyForOrdersAndPayments();
+
+    if (this.activeRefundLocks.has(params.orderId)) {
+      throw new Error(
+        `Возврат по заказу #${params.orderId} уже выполняется параллельным запросом.`,
+      );
+    }
+
+    this.activeRefundLocks.add(params.orderId);
+    try {
+      const order = await OrderService.getOrderById(params.orderId);
+      if (!order || !order.telegramPaymentChargeId) {
+        throw new Error(
+          'У заказа отсутствует telegram_payment_charge_id для возврата.',
+        );
+      }
+
+      if (
+        order.paymentStatus === 'refunded' ||
+        order.fulfillmentStatus === 'refunded'
+      ) {
+        return { alreadyRefunded: true, order };
+      }
+
+      const isRefundableStatus =
+        order.paymentStatus === 'paid' ||
+        order.paymentStatus === 'processing' ||
+        order.paymentStatus === 'completed';
+
+      if (!isRefundableStatus) {
+        throw new Error(
+          `Невозможно выполнить возврат для заказа #${order.orderId} со статусом оплаты "${order.paymentStatus}".`,
+        );
+      }
+
+      const paymentId = this.getPaymentDocId(order.telegramPaymentChargeId);
+      const existingPayment = await firestoreRepo.getDoc<PaymentRecord>(
+        'payments',
+        paymentId,
+      );
+      if (existingPayment?.status === 'refunded') {
+        const syncedOrder = await this.markPaymentRefunded(
+          order.orderId,
+          params.adminTelegramId,
+        );
+        return {
+          alreadyRefunded: true,
+          order: syncedOrder || order,
+        };
+      }
+
+      await params.callTelegramRefund(
+        order.userTelegramId,
+        order.telegramPaymentChargeId,
+      );
+
+      const refundedOrder = await this.markPaymentRefunded(
+        order.orderId,
+        params.adminTelegramId,
+      );
+      if (!refundedOrder) {
+        throw new Error(
+          `Не удалось зафиксировать возврат заказа #${order.orderId} в базе данных.`,
+        );
+      }
+
+      return { alreadyRefunded: false, order: refundedOrder };
+    } finally {
+      this.activeRefundLocks.delete(params.orderId);
+    }
+  }
+
   /**
    * Atomically updates payment, order, and transaction records on refund.
+   * Rejects unpaid/cancelled orders and ensures idempotency on repeated calls.
    */
   public static async markPaymentRefunded(
     orderId: string,
@@ -341,8 +432,22 @@ export class PaymentService {
       const order = await tx.get<Order>('orders', orderId);
       if (!order || !order.telegramPaymentChargeId) return null;
 
-      if (order.paymentStatus === 'refunded') {
+      if (
+        order.paymentStatus === 'refunded' ||
+        order.fulfillmentStatus === 'refunded'
+      ) {
         return order;
+      }
+
+      const isRefundableStatus =
+        order.paymentStatus === 'paid' ||
+        order.paymentStatus === 'processing' ||
+        order.paymentStatus === 'completed';
+
+      if (!isRefundableStatus) {
+        throw new Error(
+          `Невозможно отметить возврат для заказа #${order.orderId} со статусом оплаты "${order.paymentStatus}".`,
+        );
       }
 
       const paymentId = this.getPaymentDocId(order.telegramPaymentChargeId);
@@ -354,7 +459,7 @@ export class PaymentService {
         tx.set<PaymentRecord>('payments', paymentId, {
           ...existingPayment,
           status: 'refunded',
-          refundedAt: now,
+          refundedAt: existingPayment.refundedAt || now,
         });
       } else {
         tx.set<PaymentRecord>('payments', paymentId, {

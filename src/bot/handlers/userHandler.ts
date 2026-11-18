@@ -359,35 +359,48 @@ export function registerUserHandlers(bot: Telegraf): void {
       return;
     }
 
-    if (order.paymentStatus !== 'pending') {
+    if (
+      order.paymentStatus !== 'pending' ||
+      order.fulfillmentStatus !== 'pending'
+    ) {
       await safeAnswerCbQuery(
         ctx,
         'Оплаченный заказ нельзя отменить самостоятельно.',
         true,
       );
+      await safeRespondOrEdit(
+        ctx,
+        formatOrderDetailMessage(order),
+        buildUserOrderDetailKeyboard(order),
+      );
       return;
     }
 
-    const updated = await OrderService.updateOrderStatus({
-      orderId: order.orderId,
-      paymentStatus: 'cancelled',
-      fulfillmentStatus: 'cancelled',
-      fulfillmentNote: 'Отменён покупателем до оплаты.',
-    });
-
-    if (updated) {
-      await OrderService.logTransaction({
-        orderId: updated.orderId,
-        userId: updated.userId,
-        type: 'order_cancelled',
-        amount: updated.totalPrice,
-        details: 'Заказ отменён пользователем до оплаты.',
+    try {
+      const updated = await OrderService.updateOrderStatus({
+        orderId: order.orderId,
+        paymentStatus: 'cancelled',
+        fulfillmentStatus: 'cancelled',
+        fulfillmentNote: 'Отменён покупателем до оплаты.',
       });
-      await safeRespondOrEdit(
-        ctx,
-        formatOrderDetailMessage(updated),
-        buildUserOrderDetailKeyboard(updated),
-      );
+
+      if (updated) {
+        await OrderService.logTransaction({
+          orderId: updated.orderId,
+          userId: updated.userId,
+          type: 'order_cancelled',
+          amount: updated.totalPrice,
+          details: 'Заказ отменён пользователем до оплаты.',
+        });
+        await safeRespondOrEdit(
+          ctx,
+          formatOrderDetailMessage(updated),
+          buildUserOrderDetailKeyboard(updated),
+        );
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
     }
   });
 }

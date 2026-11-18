@@ -193,17 +193,32 @@ export function buildAdminOrdersKeyboard(orders: Order[]) {
 export function buildAdminOrderActionKeyboard(order: Order) {
   const rows = [];
 
-  if (order.fulfillmentStatus !== 'completed' && order.paymentStatus !== 'refunded') {
-    rows.push([
-      Markup.button.callback(
-        '🔄 Взять в обработку',
-        `adm:ord_proc:${order.orderId}`,
-      ),
+  // AUD-005: Кнопки обработки и выдачи доступны ТОЛЬКО для оплаченных заказов
+  const isPaidForFulfillment =
+    order.paymentStatus === 'paid' || order.paymentStatus === 'processing';
+
+  if (
+    isPaidForFulfillment &&
+    order.fulfillmentStatus !== 'completed' &&
+    order.fulfillmentStatus !== 'refunded' &&
+    order.fulfillmentStatus !== 'cancelled'
+  ) {
+    const actionRow = [];
+    if (order.fulfillmentStatus !== 'processing') {
+      actionRow.push(
+        Markup.button.callback(
+          '🔄 Взять в обработку',
+          `adm:ord_proc:${order.orderId}`,
+        ),
+      );
+    }
+    actionRow.push(
       Markup.button.callback(
         '✅ Подтвердить выдачу',
         `adm:ord_done:${order.orderId}`,
       ),
-    ]);
+    );
+    rows.push(actionRow);
     rows.push([
       Markup.button.callback(
         '📝 Выдать с кодом / сообщением',
@@ -225,9 +240,12 @@ export function buildAdminOrderActionKeyboard(order: Order) {
     ]);
   }
 
+  // AUD-004: Возврат доступен только для реально оплаченных заказов с charge_id
   if (
     order.telegramPaymentChargeId &&
-    order.paymentStatus !== 'refunded'
+    (order.paymentStatus === 'paid' ||
+      order.paymentStatus === 'processing' ||
+      order.paymentStatus === 'completed')
   ) {
     rows.push([
       Markup.button.callback(
@@ -237,7 +255,10 @@ export function buildAdminOrderActionKeyboard(order: Order) {
     ]);
   }
 
-  if (order.paymentStatus === 'pending') {
+  if (
+    order.paymentStatus === 'pending' &&
+    order.fulfillmentStatus === 'pending'
+  ) {
     rows.push([
       Markup.button.callback('❌ Отменить заказ', `adm:ord_cancel:${order.orderId}`),
     ]);
@@ -252,6 +273,23 @@ export function buildAdminOrderActionKeyboard(order: Order) {
   rows.push([Markup.button.callback('⬅️ К списку заказов', 'adm:orders:all')]);
 
   return Markup.inlineKeyboard(rows);
+}
+
+export function buildAdminOrderRefundConfirmKeyboard(order: Order) {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback(
+        `✅ Да, вернуть ${order.totalPrice} ⭐ покупателю`,
+        `adm:ord_refund_confirm:${order.orderId}`,
+      ),
+    ],
+    [
+      Markup.button.callback(
+        '❌ Отмена (вернуться к заказу)',
+        `adm:ord:${order.orderId}`,
+      ),
+    ],
+  ]);
 }
 
 export function buildAdminUsersKeyboard(users: StoreUser[]) {

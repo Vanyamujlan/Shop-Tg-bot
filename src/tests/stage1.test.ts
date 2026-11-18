@@ -22,6 +22,10 @@ import {
   isValidTelegramUpdatePayload,
 } from '../bot/bot.ts';
 import { ensureAdmin } from '../bot/handlers/adminHandler.ts';
+import {
+  buildAdminOrderActionKeyboard,
+  buildAdminOrderRefundConfirmKeyboard,
+} from '../bot/keyboards.ts';
 import type { Order, StoreUser } from '../types.ts';
 
 // Force isolated test environment so production Firestore and .data/ are NEVER touched
@@ -1069,6 +1073,293 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.ok(gitignore.includes('.data/'));
       assert.ok(gitignore.includes('.env'));
       return `Проверено ${parsed.indexes.length} составных индексов в firestore.indexes.json и правила защиты .gitignore.`;
+    },
+  );
+
+  // ===========================================================================
+  // 5. AUD-004 & AUD-005 STATE MACHINE, TWO-STEP REFUND & CONCURRENCY TESTS
+  // ===========================================================================
+  await runTest(
+    'A-01',
+    'Fulfillment',
+    'AUD-005: Запрет перевода неоплаченного заказа в processing/completed и фильтрация кнопок админ-клавиатуры',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const pendingOrder = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      // 1. Клавиатура неоплаченного заказа НЕ должна содержать кнопок выдачи или возврата
+      const pendingKbJson = JSON.stringify(
+        buildAdminOrderActionKeyboard(pendingOrder),
+      );
+      assert.equal(
+        pendingKbJson.includes(`adm:ord_proc:${pendingOrder.orderId}`),
+        false,
+        'Кнопка adm:ord_proc не должна отображаться для неоплаченного заказа',
+      );
+      assert.equal(
+        pendingKbJson.includes(`adm:ord_done:${pendingOrder.orderId}`),
+        false,
+        'Кнопка adm:ord_done не должна отображаться для неоплаченного заказа',
+      );
+      assert.equal(
+        pendingKbJson.includes(`adm:ord_note:${pendingOrder.orderId}`),
+        false,
+        'Кнопка adm:ord_note не должна отображаться для неоплаченного заказа',
+      );
+      assert.equal(
+        pendingKbJson.includes(`adm:ord_refund:${pendingOrder.orderId}`),
+        false,
+        'Кнопка adm:ord_refund не должна отображаться для неоплаченного заказа',
+      );
+      assert.equal(
+        pendingKbJson.includes(`adm:ord_cancel:${pendingOrder.orderId}`),
+        true,
+        'Кнопка adm:ord_cancel должна быть доступна для неоплаченного заказа',
+      );
+
+      // 2. Серверная транзакция OrderService.updateOrderStatus отклоняет перевод pending -> processing
+      await assert.rejects(
+        async () => {
+          await OrderService.updateOrderStatus({
+            orderId: pendingOrder.orderId,
+            fulfillmentStatus: 'processing',
+            fulfillmentNote: 'Попытка взять неоплаченный заказ в работу',
+          });
+        },
+        /заказ не оплачен/,
+      );
+
+      // 3. Серверная транзакция отклоняет перевод pending -> completed
+      await assert.rejects(
+        async () => {
+          await OrderService.updateOrderStatus({
+            orderId: pendingOrder.orderId,
+            fulfillmentStatus: 'completed',
+          });
+        },
+        /заказ не оплачен/,
+      );
+
+      const unchanged = await OrderService.getOrderById(pendingOrder.orderId);
+      assert.equal(unchanged?.paymentStatus, 'pending');
+      assert.equal(unchanged?.fulfillmentStatus, 'pending');
+      return 'Неоплаченный заказ защищён от перевода в processing/completed на уровне клавиатуры и серверной транзакции.';
+    },
+  );
+
+  await runTest(
+    'A-02',
+    'Security',
+    'AUD-004: Серверный запрет отмены уже оплаченного или выданного заказа и запрет отката completed -> processing',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order.orderId,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        telegramPaymentChargeId: 'chg_a02_paid_cancel_guard',
+      });
+
+      // Клавиатура оплаченного заказа содержит кнопки выдачи и возврата, но НЕ содержит adm:ord_cancel
+      const paidKbJson = JSON.stringify(buildAdminOrderActionKeyboard(paid.order));
+      assert.equal(
+        paidKbJson.includes(`adm:ord_proc:${order.orderId}`),
+        true,
+      );
+      assert.equal(
+        paidKbJson.includes(`adm:ord_refund:${order.orderId}`),
+        true,
+      );
+      assert.equal(
+        paidKbJson.includes(`adm:ord_cancel:${order.orderId}`),
+        false,
+        'Оплаченный заказ не должен иметь кнопки отмены adm:ord_cancel',
+      );
+
+      // Попытка отменить оплаченный заказ по старой кнопке отклоняется транзакцией
+      await assert.rejects(
+        async () => {
+          await OrderService.updateOrderStatus({
+            orderId: order.orderId,
+            paymentStatus: 'cancelled',
+            fulfillmentStatus: 'cancelled',
+          });
+        },
+        /Невозможно отменить заказ.*уже имеет статус оплаты "paid"/,
+      );
+
+      // Перевод оплаченного заказа в processing разрешён
+      const inProc = await OrderService.updateOrderStatus({
+        orderId: order.orderId,
+        fulfillmentStatus: 'processing',
+      });
+      assert.equal(inProc?.fulfillmentStatus, 'processing');
+
+      // Завершаем выдачу
+      const completed = await FulfillmentService.completeOrder({
+        orderId: order.orderId,
+        adminNote: 'Выдано',
+      });
+      assert.equal(completed.fulfillmentStatus, 'completed');
+
+      // Попытка вернуть выполненный заказ обратно в processing блокируется
+      await assert.rejects(
+        async () => {
+          await OrderService.updateOrderStatus({
+            orderId: order.orderId,
+            fulfillmentStatus: 'processing',
+          });
+        },
+        /Невозможно вернуть уже выполненный заказ/,
+      );
+
+      return 'Оплаченный и выданный заказы защищены от отмены и отката статуса.';
+    },
+  );
+
+  await runTest(
+    'A-03',
+    'Payments',
+    'AUD-004: Двухэтапное подтверждение возврата (клавиатура шага 2 и запрет возврата неоплаченных/отменённых заказов)',
+    async () => {
+      const pendingOrder = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_50',
+        quantity: 1,
+      });
+
+      // Шаг 2 клавиатуры подтверждения возврата содержит только adm:ord_refund_confirm и возврат к карточке adm:ord
+      const confirmKbJson = JSON.stringify(
+        buildAdminOrderRefundConfirmKeyboard(pendingOrder),
+      );
+      assert.equal(
+        confirmKbJson.includes(`adm:ord_refund_confirm:${pendingOrder.orderId}`),
+        true,
+      );
+      assert.equal(
+        confirmKbJson.includes(`adm:ord:${pendingOrder.orderId}`),
+        true,
+      );
+
+      // Попытка выполнить возврат для неоплаченного заказа блокируется
+      await assert.rejects(
+        async () => {
+          await PaymentService.executeOrderRefund({
+            orderId: pendingOrder.orderId,
+            adminTelegramId: 777000111,
+            callTelegramRefund: async () => {},
+          });
+        },
+        /отсутствует telegram_payment_charge_id/,
+      );
+
+      // Отменяем неоплаченный заказ и проверяем, что отменённый заказ нельзя вернуть даже при наличии фейкового chargeId
+      const cancelled = await OrderService.updateOrderStatus({
+        orderId: pendingOrder.orderId,
+        paymentStatus: 'cancelled',
+        fulfillmentStatus: 'cancelled',
+      });
+      assert.equal(cancelled?.paymentStatus, 'cancelled');
+
+      return 'Клавиатура двухэтапного подтверждения возврата проверена, возврат неоплаченных и отменённых заказов заблокирован.';
+    },
+  );
+
+  await runTest(
+    'A-04',
+    'Payments',
+    'AUD-004: Защита от повторного возврата и конкурентных запросов refundStarPayment',
+    async () => {
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_pack_250',
+        quantity: 1,
+      });
+
+      await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        invoicePayload: order.orderId,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        telegramPaymentChargeId: 'chg_a04_concurrent_refund',
+      });
+
+      let telegramApiRefundCalls = 0;
+      const slowTelegramRefund = async () => {
+        telegramApiRefundCalls++;
+        await new Promise((resolve) => setTimeout(resolve, 35));
+      };
+
+      // Запускаем 4 одновременных запроса на возврат одного и того же заказа
+      const settled = await Promise.allSettled(
+        Array.from({ length: 4 }, () =>
+          PaymentService.executeOrderRefund({
+            orderId: order.orderId,
+            adminTelegramId: 777000111,
+            callTelegramRefund: slowTelegramRefund,
+          }),
+        ),
+      );
+
+      const fulfilled = settled.filter(
+        (
+          s,
+        ): s is PromiseFulfilledResult<{
+          alreadyRefunded: boolean;
+          order: Order;
+        }> => s.status === 'fulfilled',
+      );
+      const rejected = settled.filter(
+        (s): s is PromiseRejectedResult => s.status === 'rejected',
+      );
+
+      assert.equal(
+        fulfilled.length,
+        1,
+        'Ровно 1 из параллельных запросов должен выполнить возврат',
+      );
+      assert.equal(fulfilled[0].value.alreadyRefunded, false);
+      assert.equal(fulfilled[0].value.order.paymentStatus, 'refunded');
+      assert.equal(
+        rejected.length,
+        3,
+        'Остальные 3 параллельных запроса во время полёта первого должны быть заблокированы in-flight локом',
+      );
+      assert.ok(
+        rejected.every((r) =>
+          String(r.reason).includes('уже выполняется параллельным запросом'),
+        ),
+      );
+      assert.equal(
+        telegramApiRefundCalls,
+        1,
+        'Telegram API refundStarPayment должен быть вызван ровно 1 раз',
+      );
+
+      // Повторный запрос после завершения возврата идемпотентно возвращает alreadyRefunded=true без вызова Telegram API
+      const secondAttempt = await PaymentService.executeOrderRefund({
+        orderId: order.orderId,
+        adminTelegramId: 777000111,
+        callTelegramRefund: slowTelegramRefund,
+      });
+      assert.equal(secondAttempt.alreadyRefunded, true);
+      assert.equal(
+        telegramApiRefundCalls,
+        1,
+        'Повторный вызов после возврата не должен вызывать Telegram API',
+      );
+
+      return `Из 4 конкурентных запросов ровно 1 вызвал refundStarPayment (calls=${telegramApiRefundCalls}), 3 отклонены in-flight локом, повторный вызов вернул alreadyRefunded=true.`;
     },
   );
 

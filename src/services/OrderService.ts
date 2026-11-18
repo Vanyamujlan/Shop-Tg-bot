@@ -218,6 +218,15 @@ export class OrderService {
       );
     }
 
+    if (
+      params.paymentStatus === 'refunded' ||
+      params.fulfillmentStatus === 'refunded'
+    ) {
+      throw new Error(
+        'Перевод заказа в статус refunded разрешён только через PaymentService.markPaymentRefunded.',
+      );
+    }
+
     return firestoreRepo.runTransaction(async (tx) => {
       const existing = await tx.get<Order>('orders', params.orderId);
       if (!existing) return null;
@@ -225,6 +234,49 @@ export class OrderService {
       const now = new Date().toISOString();
       const nextFulfillment = params.fulfillmentStatus ?? existing.fulfillmentStatus;
       const nextPayment = params.paymentStatus ?? existing.paymentStatus;
+
+      // AUD-004: Запрет отмены уже оплаченного, выданного или возвращённого заказа
+      if (nextPayment === 'cancelled' || nextFulfillment === 'cancelled') {
+        if (
+          existing.paymentStatus !== 'pending' &&
+          existing.paymentStatus !== 'cancelled'
+        ) {
+          throw new Error(
+            `Невозможно отменить заказ #${existing.orderId}: заказ уже имеет статус оплаты "${existing.paymentStatus}".`,
+          );
+        }
+        if (
+          existing.fulfillmentStatus !== 'pending' &&
+          existing.fulfillmentStatus !== 'cancelled'
+        ) {
+          throw new Error(
+            `Невозможно отменить заказ #${existing.orderId}: статус выдачи уже "${existing.fulfillmentStatus}".`,
+          );
+        }
+      }
+
+      // AUD-005: Запрет перевода неоплаченного, отменённого или возвращённого заказа в обработку или выдачу
+      if (nextFulfillment === 'processing' || nextFulfillment === 'completed') {
+        const hasConfirmedPayment =
+          existing.paymentStatus === 'paid' ||
+          existing.paymentStatus === 'processing' ||
+          existing.paymentStatus === 'completed';
+
+        if (!hasConfirmedPayment) {
+          throw new Error(
+            `Невозможно перевести заказ #${existing.orderId} в статус "${nextFulfillment}": заказ не оплачен (статус оплаты: "${existing.paymentStatus}").`,
+          );
+        }
+
+        if (
+          existing.fulfillmentStatus === 'completed' &&
+          nextFulfillment === 'processing'
+        ) {
+          throw new Error(
+            `Невозможно вернуть уже выполненный заказ #${existing.orderId} обратно в обработку ("processing").`,
+          );
+        }
+      }
 
       const updated: Order = {
         ...existing,
