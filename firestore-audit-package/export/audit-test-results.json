@@ -1,5 +1,5 @@
 {
-  "executedAt": "2026-11-18T12:46:20.113Z",
+  "executedAt": "2026-11-18T13:00:11.007Z",
   "emulatorHost": "127.0.0.1:8080",
   "projectId": "demo-stars-shop-audit",
   "totalTests": 38,
@@ -12,7 +12,7 @@
       "name": "Блокировка при отсутствии FIRESTORE_EMULATOR_HOST",
       "whatWasTested": "Проверка, что assertEmulatorOnlyEnvironment выбрасывает ProductionGuardError, если FIRESTORE_EMULATOR_HOST не задан",
       "status": "PASS",
-      "durationMs": 2,
+      "durationMs": 0,
       "details": "Запуск без FIRESTORE_EMULATOR_HOST заблокирован через ProductionGuardError."
     },
     {
@@ -21,7 +21,7 @@
       "name": "Блокировка Production projectId и внешних/нестандартных хостов",
       "whatWasTested": "Проверка запрета подключения к реальному проекту tg-1-675b4, другим проектам или хостам вне 127.0.0.1:8080 / localhost:8080",
       "status": "PASS",
-      "durationMs": 1,
+      "durationMs": 0,
       "details": "Реальный projectId (tg-1-675b4) и внешние хосты жёстко заблокированы; разрешены только 127.0.0.1:8080 и localhost:8080 для demo-stars-shop-audit."
     },
     {
@@ -30,7 +30,7 @@
       "name": "Блокировка при наличии реальных сервисных ключей и защита родительского process.env",
       "whatWasTested": "Проверка запрета запуска при наличии FIREBASE_PRIVATE_KEY / FIREBASE_CLIENT_EMAIL и неизменности родительского окружения в buildIsolatedEmulatorChildEnv",
       "status": "PASS",
-      "durationMs": 1,
+      "durationMs": 0,
       "details": "Присутствие сервисных ключей блокируется, а buildIsolatedEmulatorChildEnv создаёт очищенное окружение дочернего процесса без модификации секретов родительского процесса."
     },
     {
@@ -39,7 +39,7 @@
       "name": "Проверка verifyJavaRuntime (Java 17, 21, 22, 8, отсутствие Java, битый вывод, status=1, status=null, status=0)",
       "whatWasTested": "Прямое тестирование функции verifyJavaRuntime (а также parseJavaMajorVersion и assertSupportedJavaVersion) на всех позитивных и негативных сценариях завершения процесса",
       "status": "PASS",
-      "durationMs": 101,
+      "durationMs": 92,
       "details": "Проверено поведение verifyJavaRuntime на всех 9 сценариях: Java 17/8 отклонены, отсутствующая Java и битый вывод отклонены, status=1 и status=null/SIGTERM при валидном выводе Java 21 жёстко отклонены, status=0 с Java 21/22 принят. Системная Java: 21.0.13.0.3 (major=21)."
     },
     {
@@ -48,7 +48,7 @@
       "name": "Реальное подключение к Firebase Firestore Emulator и загрузка 12 сценариев",
       "whatWasTested": "Проверка инициализации Admin SDK поверх локального Firestore Emulator (127.0.0.1:8080) и сидинга 7 коллекций",
       "status": "PASS",
-      "durationMs": 3906,
+      "durationMs": 3443,
       "details": "Успешно подключён к Emulator (127.0.0.1:8080, project: demo-stars-shop-audit). Записано 54 документа в 7 коллекциях."
     },
     {
@@ -57,7 +57,7 @@
       "name": "Каждый платёж связан с существующим заказом",
       "whatWasTested": "Сверка ссылочной целостности PaymentRecord.orderId -> Order.orderId в Emulator",
       "status": "PASS",
-      "durationMs": 117,
+      "durationMs": 122,
       "details": "Проверено 10 документов payments: каждый связан с существующим заказом и совпадает по telegramPaymentChargeId."
     },
     {
@@ -66,7 +66,7 @@
       "name": "Сумма платежа соответствует сумме заказа и цене товара",
       "whatWasTested": "Сверка PaymentRecord.totalAmount == Order.totalPrice == Product.price * Order.quantity",
       "status": "PASS",
-      "durationMs": 192,
+      "durationMs": 193,
       "details": "Все 10 платежей и заказов имеют математически точное совпадение сумм (totalAmount == totalPrice == price * quantity)."
     },
     {
@@ -75,7 +75,7 @@
       "name": "Валюта всех товаров, заказов, платежей и транзакций — строго XTR",
       "whatWasTested": "Проверка поля currency === \"XTR\" во всех финансовых документах базы",
       "status": "PASS",
-      "durationMs": 56,
+      "durationMs": 49,
       "details": "Проверено 47 документов: везде установлена валюта Telegram Stars (XTR)."
     },
     {
@@ -84,7 +84,7 @@
       "name": "Каждый заказ ссылается на существующий товар и существующего пользователя",
       "whatWasTested": "Проверка внешних ключей Order.productId -> Product.id и Order.userId -> StoreUser.userId",
       "status": "PASS",
-      "durationMs": 181,
+      "durationMs": 177,
       "details": "Все 12 заказов ссылаются на валидные документы в коллекциях products и users."
     },
     {
@@ -93,7 +93,7 @@
       "name": "Запрет завершения заказа или перевода в paid без подтверждённой оплаты",
       "whatWasTested": "Проверка, что completeOrder и markOrderPaid блокируют неоплаченный заказ (ord_syn_pending_01)",
       "status": "PASS",
-      "durationMs": 55,
+      "durationMs": 59,
       "details": "Попытки завершить заказ без оплаты или отметить заказ оплаченным без PaymentRecord жёстко отклонены."
     },
     {
@@ -102,7 +102,7 @@
       "name": "Запрет повторной обработки одного telegram_payment_charge_id",
       "whatWasTested": "Проверка идемпотентности PaymentService.processSuccessfulPayment на уже существующем charge_id",
       "status": "PASS",
-      "durationMs": 36,
+      "durationMs": 35,
       "details": "Повторный вызов с тем же telegram_payment_charge_id распознан как дубликат без изменения баланса и заказов."
     },
     {
@@ -111,7 +111,7 @@
       "name": "Запрет двойной выдачи одного заказа",
       "whatWasTested": "Проверка идемпотентности completeOrder и initiateFulfillment для уже выданного заказа ord_syn_completed_04",
       "status": "PASS",
-      "durationMs": 58,
+      "durationMs": 53,
       "details": "Повторное завершение и повторный запуск выдачи для completed-заказа полностью идемпотентны."
     },
     {
@@ -120,7 +120,7 @@
       "name": "Допустимость переходов и комбинаций статусов заказов",
       "whatWasTested": "Проверка всех заказов на соответствие матрице допустимых пар (paymentStatus, fulfillmentStatus)",
       "status": "PASS",
-      "durationMs": 12,
+      "durationMs": 14,
       "details": "Все 12 заказов находятся в строго валидных состояниях конечного автомата."
     },
     {
@@ -129,7 +129,7 @@
       "name": "Отсутствие пропущенных обязательных полей во всех 7 коллекциях",
       "whatWasTested": "Проверка наличия всех required-полей согласно firebase-blueprint.json и src/types.ts",
       "status": "PASS",
-      "durationMs": 94,
+      "durationMs": 77,
       "details": "Проверено 54 документов во всех 7 коллекциях: все обязательные поля присутствуют."
     },
     {
@@ -138,7 +138,7 @@
       "name": "Строгое соответствие типов данных во всех документах",
       "whatWasTested": "Проверка типов string, number, boolean, enum и формата ISO-8601 дат во всех документах",
       "status": "PASS",
-      "durationMs": 19,
+      "durationMs": 46,
       "details": "Все поля во всех коллекциях имеют корректные примитивные типы и валидные метки времени ISO-8601."
     },
     {
@@ -147,7 +147,7 @@
       "name": "Межколлекционная согласованность агрегатов users, orders, payments и transactions",
       "whatWasTested": "Сверка суммы totalOrders и totalSpentStars каждого пользователя с его реально оплаченными заказами и платежами",
       "status": "PASS",
-      "durationMs": 37,
+      "durationMs": 38,
       "details": "Полная согласованность между users (4), orders (12), payments (10) и transactions (19) подтверждена."
     },
     {
@@ -156,7 +156,7 @@
       "name": "Пользователь не может читать чужие заказы (get и list)",
       "whatWasTested": "Проверка отказа PERMISSION_DENIED при попытке чтения чужого заказа и разрешения чтения собственного заказа",
       "status": "PASS",
-      "durationMs": 858,
+      "durationMs": 859,
       "details": "Чужие заказы недоступны ни через getDoc, ни через list; свои заказы читаются корректно."
     },
     {
@@ -165,7 +165,7 @@
       "name": "Пользователь не может менять сумму заказа или занижать цену при создании",
       "whatWasTested": "Проверка блокировки изменения totalPrice в существующем заказе и подмены totalPrice при создании нового заказа",
       "status": "PASS",
-      "durationMs": 339,
+      "durationMs": 316,
       "details": "Любая попытка изменить сумму заказа или создать заказ с заниженной ценой блокируется правилами Firestore."
     },
     {
@@ -174,7 +174,7 @@
       "name": "Пользователь не может самостоятельно подтверждать оплату",
       "whatWasTested": "Проверка запрета создания заказа в статусе paid и запрета перевода pending -> paid от лица покупателя",
       "status": "PASS",
-      "durationMs": 153,
+      "durationMs": 164,
       "details": "Самостоятельное подтверждение оплаты покупателем заблокировано при create и update."
     },
     {
@@ -183,7 +183,7 @@
       "name": "Пользователь не может менять статус выдачи на processing или completed",
       "whatWasTested": "Проверка запрета перевода fulfillmentStatus в processing/completed и разрешения только отмены своего pending-заказа",
       "status": "PASS",
-      "durationMs": 199,
+      "durationMs": 154,
       "details": "Покупатель не может менять статус выдачи оплаченных заказов; разрешена только отмена собственного неоплаченного (pending) заказа."
     },
     {
@@ -192,7 +192,7 @@
       "name": "Пользователь не может изменять товары и цены, а также читать скрытые товары",
       "whatWasTested": "Проверка защиты коллекции products от создания/изменения/удаления обычным пользователем и скрытия архивных товаров",
       "status": "PASS",
-      "durationMs": 175,
+      "durationMs": 156,
       "details": "Каталог товаров защищён от модификации покупателями, неактивные товары скрыты от чтения."
     },
     {
@@ -201,7 +201,7 @@
       "name": "Обычный пользователь не может получить права администратора или разблокировать себя",
       "whatWasTested": "Проверка запрета записи в коллекцию admins, чтения списка админов и модификации isBlocked / totalSpentStars",
       "status": "PASS",
-      "durationMs": 202,
+      "durationMs": 187,
       "details": "Повышение привилегий через /admins, снятие блокировки isBlocked и накрутка статистики заблокированы."
     },
     {
@@ -210,7 +210,7 @@
       "name": "Запрет чтения и изменения чужих платежей и прямой подделки платежей",
       "whatWasTested": "Проверка изоляции коллекции payments между пользователями и запрета клиентской записи/удаления платежей",
       "status": "PASS",
-      "durationMs": 275,
+      "durationMs": 285,
       "details": "Платежи доступны только владельцу и администратору на чтение; удаление платежей запрещено даже администратору (append-only аудит)."
     },
     {
@@ -219,7 +219,7 @@
       "name": "Проверка матрицы доступа ко всем 7 коллекциям (settings, transactions, admins, users, products, orders, payments)",
       "whatWasTested": "Проверка прав чтения/записи для неавторизованного гостя, покупателя и администратора из /admins",
       "status": "PASS",
-      "durationMs": 252,
+      "durationMs": 344,
       "details": "Матрица доступа по всем 7 коллекциям соблюдается; права администратора работают через /admins/{uid} без захардкоженных email."
     },
     {
@@ -228,7 +228,7 @@
       "name": "Проверка новых полей идемпотентности/ретраев Order и новых типов транзакций из актуального types.ts",
       "whatWasTested": "Проверка записи через правила Emulator полей fulfillmentStartedAt, fulfillmentAttempts, needsManualReconciliation, adminNotifiedAt, buyerNotifiedAt и типов транзакций fulfillment_failed, fulfillment_retry, admin_action",
       "status": "PASS",
-      "durationMs": 181,
+      "durationMs": 220,
       "details": "Все новые поля Order и новые типы транзакций (fulfillment_failed, fulfillment_retry, admin_action) синхронизированы и валидируются правилами Emulator."
     },
     {
@@ -237,7 +237,7 @@
       "name": "Прогон 12 атакующих пейлоадов (\"Dirty Dozen\") через реальный движок правил Emulator",
       "whatWasTested": "Проверка того, что все 12 векторов атак из firestore.rules.test.ts получают PERMISSION_DENIED",
       "status": "PASS",
-      "durationMs": 637,
+      "durationMs": 1212,
       "details": "Все 12/12 атакующих векторов Dirty Dozen заблокированы эмулятором (PERMISSION_DENIED)."
     },
     {
@@ -255,7 +255,7 @@
       "name": "Выполнение всех 5 индексированных запросов к коллекции orders через Emulator",
       "whatWasTested": "Реальный прогон запросов по userId, userTelegramId, paymentStatus, fulfillmentStatus (ASC/DESC) в Emulator",
       "status": "PASS",
-      "durationMs": 80,
+      "durationMs": 85,
       "details": "Все 5 составных запросов к коллекции orders отработали на Emulator с точным соблюдением фильтрации и порядка."
     },
     {
@@ -264,7 +264,7 @@
       "name": "Выполнение индексированных запросов к products, payments и transactions через Emulator",
       "whatWasTested": "Реальный прогон запросов витрины товаров (3 индекса), платежей по статусу и транзакций по типу",
       "status": "PASS",
-      "durationMs": 76,
+      "durationMs": 82,
       "details": "Все 5 составных запросов к products, payments и transactions успешно выполнены через Emulator."
     },
     {
@@ -273,7 +273,7 @@
       "name": "Курсорная пагинация (startAfter) при наличии нескольких заказов с ОДИНАКОВЫМ createdAt timestamp",
       "whatWasTested": "Постраничный обход 10 заказов пользователя tg_900001002 (включая 3 заказа с createdAt=2026-11-17T10:00:00.000Z) с размером страницы 2",
       "status": "PASS",
-      "durationMs": 74,
+      "durationMs": 98,
       "details": "Пройдено 5 страниц (по 2 заказа): возвращены все 10/10 заказов (включая все 3 заказа с одинаковым timestamp 2026-11-17T10:00:00.000Z) без единого пропуска или дубля."
     },
     {
@@ -282,7 +282,7 @@
       "name": "Проверка корректности сортировки (ASC/DESC) и фильтрации во всех сервисах",
       "whatWasTested": "Проверка монотонного убывания/возрастания дат и цен в результатах запросов Emulator",
       "status": "PASS",
-      "durationMs": 26,
+      "durationMs": 40,
       "details": "Сортировка по дате (DESC) и цене (ASC), а также фильтрация по статусам и категориям работают без ошибок."
     },
     {
@@ -291,7 +291,7 @@
       "name": "Анализ потенциально опасных запросов для Production Firestore",
       "whatWasTested": "Проверка отсутствия запросов с неравенством на разных полях, незакрытых составных индексов и скалярных курсоров без tie-breaker",
       "status": "PASS",
-      "durationMs": 24,
+      "durationMs": 29,
       "details": "Все запросы в сервисах используют равенство (==) + одиночный orderBy + DocumentSnapshot tie-breaker; запросов, способных вызвать FAILED_PRECONDITION при задеплоенных 10 индексах, не обнаружено."
     },
     {
@@ -300,7 +300,7 @@
       "name": "Два одновременных уведомления successful_payment на один заказ в Emulator",
       "whatWasTested": "Параллельный запуск двух транзакций processSuccessfulPayment через Promise.all для заказа ord_syn_pending_01",
       "status": "PASS",
-      "durationMs": 3205,
+      "durationMs": 2796,
       "details": "Параллельная гонка 2 уведомлений об оплате в Emulator разрешена атомарно: 1 PaymentRecord, +1 к totalOrders, 0 дублей."
     },
     {
@@ -309,7 +309,7 @@
       "name": "Два одновременных воркера выдачи (initiateFulfillment) на один заказ в Emulator",
       "whatWasTested": "Параллельный запуск 2 воркеров на оплаченный заказ ord_syn_paid_02 с подсчётом числа вызовов внешнего адаптера",
       "status": "PASS",
-      "durationMs": 3361,
+      "durationMs": 3396,
       "details": "Атомарный pre-claim в транзакции Emulator предотвратил двойную выдачу: externalAdapterCalls = 1."
     },
     {
@@ -318,7 +318,7 @@
       "name": "Повторное выполнение уже выданного заказа под параллельной нагрузкой",
       "whatWasTested": "Одновременный вызов completeOrder и initiateFulfillment для уже завершённого заказа",
       "status": "PASS",
-      "durationMs": 20,
+      "durationMs": 17,
       "details": "Повторное параллельное выполнение завершённого заказа полностью заблокировано (0 повторных выдач и сообщений)."
     },
     {
@@ -327,7 +327,7 @@
       "name": "Перезапуск сервера во время выдачи и сверка статуса через checkExternalStatus",
       "whatWasTested": "Имитация падения воркера после перевода заказа в processing (истёкший lease) с последующим восстановлением через checkExternalStatus",
       "status": "PASS",
-      "durationMs": 53,
+      "durationMs": 52,
       "details": "После перезапуска сервера заказ успешно сверен через checkExternalStatus и завершён без повторного вызова поставщика."
     },
     {
@@ -336,7 +336,7 @@
       "name": "Потеря ответа от неидемпотентного поставщика (защитный карантин needsManualReconciliation)",
       "whatWasTested": "Имитация обрыва связи во время вызова неидемпотентного поставщика без checkExternalStatus",
       "status": "PASS",
-      "durationMs": 53,
+      "durationMs": 39,
       "details": "При потере ответа от неидемпотентного поставщика заказ переведён в карантин ручной сверки (unsafeCalls = 0)."
     },
     {
@@ -345,7 +345,7 @@
       "name": "Временная недоступность Firestore и последующее восстановление без потери заказов",
       "whatWasTested": "Имитация отказа хранилища (StorageUnavailableError) с проверкой блокировки новых заказов и сохранности существующих данных",
       "status": "PASS",
-      "durationMs": 12,
+      "durationMs": 13,
       "details": "Во время сбоя БД создание заказов и оплата безопасно блокируются (StorageUnavailableError), а после восстановления все заказы сохранены."
     }
   ]
