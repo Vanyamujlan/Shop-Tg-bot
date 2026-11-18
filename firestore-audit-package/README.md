@@ -20,24 +20,33 @@
 
 ---
 
-## 2. Структура пакета `/firestore-audit-package`
+## 2. Структура пакета `/firestore-audit-package` и архива `firestore-audit-package.zip`
+
+В архиве `firestore-audit-package.zip` содержатся **22 записи ZIP** (`unzip -l`): **14 файлов** и **8 записей директорий** (корневая папка `firestore-audit-package/` + **21 вложенный элемент**: 14 файлов и 7 поддиректорий):
 
 ```text
-firestore-audit-package/
-├── firebase.json                         # Конфигурация локального Firestore Emulator (127.0.0.1:8080)
-├── firestore.rules                       # Синхронизированные с src/types.ts правила безопасности
-├── firestore.indexes.json                # 10 составных индексов (Composite Indexes)
-├── scripts/
-│   ├── runAuditEmulatorCli.ts            # Скрипт запуска полного аудита (npm run audit:emulator)
-│   └── seedSyntheticData.ts              # Генератор 54 синтетических документов (12 сценариев) + JSON-дамп
-├── tests/
-│   └── runEmulatorAuditSuite.ts          # 38 автоматических проверок на реальном Emulator + @firebase/rules-unit-testing
-├── export/
-│   ├── firestore-collections-dump.json   # Полный JSON-дамп всех 7 коллекций (54 документа)
-│   ├── audit-test-results.json           # Машиночитаемый отчёт о прохождении всех 38 проверок
-│   └── native-emulator-export/           # Нативный снимок Firebase Emulator (firebase emulators:export)
-├── AUDIT_REPORT.md                       # Подробный технический отчёт о результатах всех проверок
-└── README.md                             # Документация по схеме, 54 документам, 12 сценариям и запуску
+firestore-audit-package/                      # [Dir 1] Корневая директория пакета
+├── firebase.json                             # [File 1] Конфигурация локального Firestore Emulator (127.0.0.1:8080)
+├── firestore.rules                           # [File 2] Синхронизированные с src/types.ts правила безопасности
+├── firestore.indexes.json                    # [File 3] 10 составных индексов (Composite Indexes)
+├── scripts/                                  # [Dir 2] Скрипты запуска и наполнения эмулятора
+│   ├── runAuditEmulatorCli.ts                # [File 4] Скрипт запуска полного аудита (npm run audit:emulator)
+│   └── seedSyntheticData.ts                  # [File 5] Генератор 54 синтетических документов (12 сценариев) + JSON-дамп
+├── tests/                                    # [Dir 3] Автоматические тесты
+│   └── runEmulatorAuditSuite.ts              # [File 6] 38 автоматических проверок на реальном Emulator + @firebase/rules-unit-testing
+├── export/                                   # [Dir 4] Экспортированные дампы и отчёты прогона
+│   ├── firestore-collections-dump.json       # [File 7] Полный JSON-дамп всех 7 коллекций (54 документа)
+│   ├── audit-test-results.json               # [File 8] Машиночитаемый отчёт о прохождении всех 38 проверок
+│   └── native-emulator-export/               # [Dir 5] Нативный снимок Firebase Emulator (firebase emulators:export)
+│       ├── firebase-export-metadata.json     # [File 9] Метаданные экспорта Firebase Emulator
+│       └── firestore_export/                 # [Dir 6] Директория снимка Firestore
+│           ├── firestore_export.overall_export_metadata # [File 10] Общие метаданные снимка Firestore
+│           └── all_namespaces/               # [Dir 7] Пространства имён
+│               └── all_kinds/                # [Dir 8] Коллекции снимка
+│                   ├── all_namespaces_all_kinds.export_metadata # [File 11] Метаданные сегментов
+│                   └── output-0              # [File 12] Бинарный снимок 54 документов LevelDB/Protobuf
+├── AUDIT_REPORT.md                           # [File 13] Подробный технический отчёт о результатах всех проверок
+└── README.md                                 # [File 14] Документация по схеме, 54 документам, 12 сценариям и запуску
 ```
 
 ---
@@ -46,7 +55,7 @@ firestore-audit-package/
 
 ### Требования к среде
 - **Node.js**: `>= 20.x`
-- **Java Runtime (JRE/JDK)**: `>= 21` (требуется для `firebase-tools >= 15.x` и `cloud-firestore-emulator.jar`; проверяется автоматически через `verifyJavaRuntime` по `stderr`/`stdout`)
+- **Java Runtime (JRE/JDK)**: `>= 21` (требуется для `firebase-tools >= 15.x` и `cloud-firestore-emulator.jar`; проверяется автоматически через `verifyJavaRuntime`: сначала проверяется отсутствие `error`, `signal` и строго `status === 0`, и только после этого парсится версия из `stderr`/`stdout`)
 - **Firebase CLI**: `firebase-tools` (`firebase --version`)
 
 ### Основной способ: запуск одной командой (`npm run audit:emulator`)
@@ -59,9 +68,9 @@ npm run audit:emulator
 
 Команда выполняет `firestore-audit-package/scripts/runAuditEmulatorCli.ts`, который последовательно:
 1. Создаёт изолированное окружение дочернего процесса (`buildIsolatedEmulatorChildEnv`) **без модификации `process.env` родительского процесса** и выполняет `assertEmulatorOnlyEnvironment('demo-stars-shop-audit', childEnv)` **до** инициализации Firebase.
-2. Проверяет `firebase.json` (хост строго `127.0.0.1:8080` или `localhost:8080`), установленные пакеты (`@firebase/rules-unit-testing`, `firebase-admin`, `firebase`, `tsx`), `firebase --version` и версию Java (`verifyJavaRuntime('java', 21)` — извлекает major-версию из `stderr`/`stdout` и блокирует запуск при Java `< 21`).
+2. Проверяет `firebase.json` (хост строго `127.0.0.1:8080` или `localhost:8080`), установленные пакеты (`@firebase/rules-unit-testing`, `firebase-admin`, `firebase`, `tsx`), `firebase --version` и версию Java (`verifyJavaRuntime('java', 21)` — проверяет `!res.error && !res.signal && res.status === 0`, извлекает major-версию из `stderr`/`stdout` и блокирует запуск при Java `< 21` или ненулевом коде возврата).
 3. Запускает `firebase emulators:exec --only firestore --project demo-stars-shop-audit` строго на `127.0.0.1:8080`.
-4. Очищает эмулятор и загружает 54 синтетических документа (12 сценариев) во все 7 коллекций.
+4. Очищает эмулятор и загружает 54 синтетических документов (12 сценариев) во все 7 коллекций.
 5. Выполняет все 38 проверок (`Environment`, `Integrity`, `SecurityRules` через `@firebase/rules-unit-testing`, `IndexesQueries`, `Concurrency`).
 6. Восстанавливает эталонный набор из 54 документов после мутирующих тестов, сохраняет `export/firestore-collections-dump.json`, `export/audit-test-results.json` и нативный снимок `export/native-emulator-export/`.
 7. Завершается с ненулевым кодом возврата (`exit 1`), если хотя бы один тест завершился со статусом `FAIL` или если эмулятор не смог запуститься.
