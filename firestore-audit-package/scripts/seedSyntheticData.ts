@@ -25,20 +25,6 @@ export interface SyntheticDatasetSummary {
   scenarios: string[];
 }
 
-/**
- * Strips any real credentials from process.env before connecting to the Emulator.
- */
-export function sanitizeProcessEnvForEmulator(): void {
-  delete process.env.FIREBASE_PRIVATE_KEY;
-  delete process.env.FIREBASE_CLIENT_EMAIL;
-  delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
-  delete process.env.TELEGRAM_BOT_TOKEN;
-  process.env.GCLOUD_PROJECT = AUDIT_PROJECT_ID;
-  process.env.FIREBASE_PROJECT_ID = AUDIT_PROJECT_ID;
-  process.env.FIRESTORE_EMULATOR_HOST =
-    process.env.FIRESTORE_EMULATOR_HOST || '127.0.0.1:8080';
-}
-
 export async function clearEmulatorCollections(): Promise<void> {
   assertEmulatorOnlyEnvironment(AUDIT_PROJECT_ID);
   const db = firestoreRepo.getAdminDbInstance();
@@ -68,9 +54,9 @@ export async function clearEmulatorCollections(): Promise<void> {
 
 /**
  * Seeds all 7 collections with 12 realistic, 100% synthetic scenarios in the local Firestore Emulator.
+ * Runs ProductionGuard (assertEmulatorOnlyEnvironment) strictly before any Firebase initialization.
  */
 export async function seedSyntheticAuditDataset(): Promise<SyntheticDatasetSummary> {
-  sanitizeProcessEnvForEmulator();
   const { emulatorHost, projectId } = assertEmulatorOnlyEnvironment(AUDIT_PROJECT_ID);
   await firestoreRepo.initWithEmulator(projectId);
   await clearEmulatorCollections();

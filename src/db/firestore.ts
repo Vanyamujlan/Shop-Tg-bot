@@ -106,40 +106,45 @@ export class ProductionGuardError extends Error {
 
 /**
  * Hard safety barrier that forbids running audit/seed/test scripts against Production Firestore.
- * Requires FIRESTORE_EMULATOR_HOST on 127.0.0.1/localhost, a demo-* projectId, and zero real credentials.
+ * Requires FIRESTORE_EMULATOR_HOST on 127.0.0.1:8080 or localhost:8080, projectId === "demo-stars-shop-audit",
+ * and zero real credentials in the inspected environment.
  */
 export function assertEmulatorOnlyEnvironment(
-  targetProjectId = process.env.GCLOUD_PROJECT ||
-    process.env.FIREBASE_PROJECT_ID ||
-    'demo-stars-shop-audit',
+  targetProjectId?: string,
+  envObj: NodeJS.ProcessEnv = process.env,
 ): { emulatorHost: string; projectId: string } {
-  const emulatorHost = (process.env.FIRESTORE_EMULATOR_HOST || '').trim();
+  const resolvedProjectId =
+    targetProjectId !== undefined
+      ? targetProjectId
+      : envObj.GCLOUD_PROJECT || envObj.FIREBASE_PROJECT_ID || 'demo-stars-shop-audit';
+
+  const emulatorHost = (envObj.FIRESTORE_EMULATOR_HOST || '').trim();
   if (!emulatorHost) {
     throw new ProductionGuardError(
       'CRITICAL SAFETY LOCK: Переменная FIRESTORE_EMULATOR_HOST не задана. Запуск аудита/тестов вне локального Firebase Emulator категорически запрещён.',
     );
   }
 
-  if (!/^(127\.0\.0\.1|localhost):\d+$/.test(emulatorHost)) {
+  if (!/^(127\.0\.0\.1|localhost):8080$/i.test(emulatorHost)) {
     throw new ProductionGuardError(
-      `CRITICAL SAFETY LOCK: Недопустимый хост эмулятора "${emulatorHost}". Разрешены только локальные адреса 127.0.0.1:<port> или localhost:<port>.`,
+      `CRITICAL SAFETY LOCK: Недопустимый адрес эмулятора "${emulatorHost}". Разрешены только локальные адреса 127.0.0.1:8080 или localhost:8080.`,
     );
   }
 
-  const projectId = (targetProjectId || '').trim();
-  if (!projectId.startsWith('demo-') || projectId === 'tg-1-675b4') {
+  const projectId = (resolvedProjectId || '').trim();
+  if (projectId === 'tg-1-675b4' || projectId !== 'demo-stars-shop-audit') {
     throw new ProductionGuardError(
-      `CRITICAL SAFETY LOCK: Недопустимый projectId "${projectId}". Для независимого аудита и эмулятора разрешены только синтетические проекты с префиксом "demo-" (например, "demo-stars-shop-audit").`,
+      `CRITICAL SAFETY LOCK: Недопустимый projectId "${projectId}". Для независимого аудита разрешён исключительно изолированный проект "demo-stars-shop-audit".`,
     );
   }
 
   if (
-    process.env.FIREBASE_PRIVATE_KEY ||
-    process.env.FIREBASE_CLIENT_EMAIL ||
-    process.env.GOOGLE_APPLICATION_CREDENTIALS
+    envObj.FIREBASE_PRIVATE_KEY ||
+    envObj.FIREBASE_CLIENT_EMAIL ||
+    envObj.GOOGLE_APPLICATION_CREDENTIALS
   ) {
     throw new ProductionGuardError(
-      'CRITICAL SAFETY LOCK: Обнаружены переменные реальных сервисных ключей Firebase (FIREBASE_PRIVATE_KEY / FIREBASE_CLIENT_EMAIL / GOOGLE_APPLICATION_CREDENTIALS). Очистите их перед работой с Emulator.',
+      'CRITICAL SAFETY LOCK: Обнаружены переменные реальных сервисных ключей Firebase (FIREBASE_PRIVATE_KEY / FIREBASE_CLIENT_EMAIL / GOOGLE_APPLICATION_CREDENTIALS). Использование реальных учётных данных запрещено.',
     );
   }
 

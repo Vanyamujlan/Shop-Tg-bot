@@ -5,8 +5,9 @@
 - **Целевая среда тестирования:** Локальный **Firebase Firestore Emulator v1.22.0** (`127.0.0.1:8080`, `firebase-tools@15.34.1`, `OpenJDK 21.0.13`)
 - **Изолированный проект эмулятора:** `demo-stars-shop-audit`
 - **Подключение к Production Firestore (`tg-1-675b4`):** `ЗАБЛОКИРОВАНО (0 обращений)`
+- **Модификация переменных окружения родительского процесса:** `0 (создаётся изолированный childEnv для дочернего процесса)`
 - **Использование реальных секретов, токенов и персональных данных:** `0 (100% синтетический набор данных: 54 документа в 7 коллекциях)`
-- **Итоговый результат тестового прогона:** **`37 / 37 PASS (0 FAIL)`**
+- **Итоговый результат тестового прогона:** **`38 / 38 PASS (0 FAIL)`**
 
 ---
 
@@ -14,27 +15,28 @@
 
 | Раздел аудита (Suite) | Код проверок | Выполнено тестов | Успешно (`PASS`) | Ошибок (`FAIL`) | Статус |
 |---|---|---:|---:|---:|---|
-| 1. Защита окружения и изоляция от Production (`Environment`) | `ENV-01` .. `ENV-04` | 4 | 4 | 0 | **PASS** |
+| 1. Защита окружения, проверка Java >= 21 и изоляция от Production (`Environment`) | `ENV-01` .. `ENV-05` | 5 | 5 | 0 | **PASS** |
 | 2. Целостность данных и инварианты схемы (`Integrity`) | `INT-01` .. `INT-11` | 11 | 11 | 0 | **PASS** |
 | 3. Правила безопасности Firestore (`SecurityRules`) | `SEC-01` .. `SEC-10` | 10 | 10 | 0 | **PASS** |
 | 4. Индексы, запросы и курсорная пагинация (`IndexesQueries`) | `IDX-01` .. `IDX-06` | 6 | 6 | 0 | **PASS** |
 | 5. Конкурентность, идемпотентность и отказоустойчивость (`Concurrency`) | `CON-01` .. `CON-06` | 6 | 6 | 0 | **PASS** |
-| **ИТОГО** | **`37 проверок`** | **37** | **37** | **0** | **PASS** |
+| **ИТОГО** | **`38 проверок`** | **38** | **38** | **0** | **PASS** |
 
 > Дополнительно внутри проверки `SEC-10` выполнены **12 негативных векторов атак («Dirty Dozen»)** через `@firebase/rules-unit-testing` против реального движка правил эмулятора — все `12/12` заблокированы с кодом `PERMISSION_DENIED`.
 
 ---
 
-## 2. Детальный реестр всех 37 выполненных проверок
+## 2. Детальный реестр всех 38 выполненных проверок
 
-### Блок 1. Защита окружения и изоляция от Production (`Environment`)
+### Блок 1. Защита окружения, проверка Java >= 21 и изоляция от Production (`Environment`)
 
 | ID | Название проверки | Что проверялось | Результат | Детали выполнения |
 |---|---|---|---|---|
 | `ENV-01` | Блокировка при отсутствии `FIRESTORE_EMULATOR_HOST` | Проверка того, что `assertEmulatorOnlyEnvironment()` выбрасывает `ProductionGuardError`, если переменная `FIRESTORE_EMULATOR_HOST` не задана | **PASS** | Выброшен `ProductionGuardError` до инициализации SDK |
-| `ENV-02` | Блокировка Production `projectId` и внешних хостов | Проверка запрета подключения к реальному проекту `tg-1-675b4`, проекту без префикса `demo-` или хосту вне `127.0.0.1` / `localhost` | **PASS** | Реальный `projectId` и внешние хосты жёстко отклонены |
-| `ENV-03` | Блокировка при наличии реальных сервисных ключей в окружении | Проверка запрета запуска при наличии `FIREBASE_PRIVATE_KEY`, `FIREBASE_CLIENT_EMAIL` или `GOOGLE_APPLICATION_CREDENTIALS` | **PASS** | Присутствие реальных ключей в окружении вызывает немедленный `ProductionGuardError` |
-| `ENV-04` | Реальное подключение к Firebase Firestore Emulator и загрузка 12 сценариев | Инициализация `firebase-admin` поверх `127.0.0.1:8080` (`demo-stars-shop-audit`) и запись 54 синтетических документов в 7 коллекций | **PASS** | Записано 54 документа: `settings` (1), `admins` (2), `products` (6), `users` (4), `orders` (12), `payments` (10), `transactions` (19) |
+| `ENV-02` | Блокировка Production `projectId` и внешних/нестандартных хостов | Проверка запрета подключения к реальному проекту `tg-1-675b4`, сторонним проектам или хостам вне `127.0.0.1:8080` / `localhost:8080` | **PASS** | Разрешены строго `demo-stars-shop-audit` и `127.0.0.1:8080` / `localhost:8080` |
+| `ENV-03` | Блокировка при наличии реальных ключей и защита родительского `process.env` | Проверка блокировки при наличии `FIREBASE_PRIVATE_KEY` и проверка того, что `buildIsolatedEmulatorChildEnv()` не изменяет секреты родительского процесса | **PASS** | Родительские переменные окружения остаются неизменными, дочернее окружение изолировано |
+| `ENV-04` | Проверка парсера и валидатора версии Java (`Java >= 21`) | Автоматические тесты `parseJavaMajorVersion`, `assertSupportedJavaVersion` и `verifyJavaRuntime` для Java 8 (`1.8.0_392`), Java 17, Java 21, Java 22, отсутствующей Java и некорректного вывода | **PASS** | Java 8/17, отсутствующая Java и битый вывод отклоняются с `JavaVersionError`; Java 21/22 и системная Java (`21.0.13.0.3`) проходят валидацию |
+| `ENV-05` | Реальное подключение к Firebase Firestore Emulator и загрузка 12 сценариев | Инициализация `firebase-admin` поверх `127.0.0.1:8080` (`demo-stars-shop-audit`) и запись 54 синтетических документов в 7 коллекций | **PASS** | Записано 54 документа: `settings` (1), `admins` (2), `products` (6), `users` (4), `orders` (12), `payments` (10), `transactions` (19) |
 
 ### Блок 2. Проверка целостности данных (`Integrity`)
 
@@ -93,21 +95,23 @@
 
 ## 3. Обнаруженные и исправленные проблемы
 
-1. **Синхронизация `firestore-audit-package/README.md` с фактическим кодом (`src/types.ts` и `seedSyntheticData.ts`):**
-   - Устранены расхождения в названиях ID документов, статусов и полей в документации: теперь в `README.md` указаны точные ID всех 54 синтетических документов в 7 коллекциях (`settings/global`, `admins/tg_900000001..002`, `products/stars_pack_100..gift_archived_limited`, `users/tg_900001001..1004`, `orders/ord_syn_pending_01..ord_syn_same_ts_12`, `payments/pay_chg_syn_paid_02..11`, `transactions/tx_syn_001_invoice..019_cancelled_12`), а также точные типы `OrderStatus`, `TransactionType`, `ProductCategory`, `FulfillmentType`.
-2. **Добавление воспроизводимой команды `npm run audit:emulator` (`runAuditEmulatorCli.ts`):**
-   - Добавлен скрипт `firestore-audit-package/scripts/runAuditEmulatorCli.ts` и команда `npm run audit:emulator` в `package.json`, проверяющая наличие Firebase CLI и Java 21, запускающая `ProductionGuard` до любых операций, поднимающая эмулятор строго на `127.0.0.1:8080` с проектом `demo-stars-shop-audit`, прогоняющая все 37 тестов и проверяющая целостность экспортированных артефактов.
-3. **Синхронизация `firestore.rules` и `firebase-blueprint.json` с `src/types.ts` и обезличивание `isAdmin()`:**
-   - Добавлена поддержка всех полей идемпотентности/ретраев `Order` и типов транзакций `StoreTransaction`, проверка `totalPrice == product.price * quantity` при создании заказа и валидация дат ISO-8601 (`isValidDateVal()`).
-   - Полностью удалён персональный email из `isAdmin()`.
-4. **Стабильная курсорная пагинация при одинаковых `createdAt` (`src/db/firestore.ts`):**
+1. **Настоящая проверка версии Java (`Java >= 21`) в `runAuditEmulatorCli.ts`:**
+   - Ранее вызов `java -version` через `execFileSync` читал только `stdout` (тогда как `java -version` выводит версию в `stderr`) и не проверял major-версию.
+   - Теперь функции `parseJavaMajorVersion()`, `assertSupportedJavaVersion()` и `verifyJavaRuntime()` получают вывод одновременно из `stderr` и `stdout` через `spawnSync`, распознают форматы `java version "..."`, `openjdk version "..."`, `1.8.0_x` и современные форматы без кавычек (`openjdk 21.0.4 ...`), извлекают `major` и блокируют запуск при `major < 21`, отсутствии Java или некорректном выводе. Покрыто тестом `ENV-04`.
+2. **Защита переменных окружения родительского процесса (`buildIsolatedEmulatorChildEnv`):**
+   - `runAuditEmulatorCli.ts`, `seedSyntheticData.ts` и `runEmulatorAuditSuite.ts` больше не модифицируют и не удаляют переменные в `process.env` родительского процесса. Создаётся отдельный объект `childEnv` для дочернего процесса эмулятора, который проходит проверку `assertEmulatorOnlyEnvironment('demo-stars-shop-audit', childEnv)` до запуска Firebase.
+3. **Синхронизация `firestore-audit-package/README.md` с фактическим кодом (`src/types.ts` и `seedSyntheticData.ts`):**
+   - В `README.md` указаны точные ID всех 54 синтетических документов в 7 коллекциях и всех 12 сценариев.
+4. **Синхронизация `firestore.rules` и `firebase-blueprint.json` с `src/types.ts` и обезличивание `isAdmin()`:**
+   - Добавлена поддержка всех полей идемпотентности/ретраев `Order` и типов транзакций `StoreTransaction`, проверка `totalPrice == product.price * quantity` при создании заказа, валидация дат ISO-8601 (`isValidDateVal()`) и полное удаление личного email из `isAdmin()`.
+5. **Стабильная курсорная пагинация при одинаковых `createdAt` (`src/db/firestore.ts`):**
    - В `FirestoreRepository.queryDocs()` передаётся `DocumentSnapshot` в `query.startAfter(cursorSnap)`, обеспечивая детерминированный tie-breaker `(__name__)` без пропусков и дублей.
 
 ---
 
 ## 4. Ограничения эмулятора (что не подтверждается только локальным Firebase Emulator)
 
-> **ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ:** Прохождение всех 37/37 тестов на локальном Firebase Firestore Emulator подтверждает корректность схемы данных, бизнес-логики, правил безопасности и транзакционной идемпотентности в коде, но **само по себе НЕ означает автоматическую готовность Production Firestore без проверки облачной инфраструктуры.**
+> **ВАЖНОЕ ПРЕДУПРЕЖДЕНИЕ:** Прохождение всех 38/38 тестов на локальном Firebase Firestore Emulator подтверждает корректность схемы данных, бизнес-логики, правил безопасности и транзакционной идемпотентности в коде, но **само по себе НЕ означает автоматическую готовность Production Firestore без проверки облачной инфраструктуры.**
 
 1. **Физическое наличие построенных Composite Indexes в Production Firestore:** Эмулятор выполняет составные запросы даже без предварительно построенных индексов. Перед эксплуатацией в Production все 10 индексов из `firestore.indexes.json` должны быть развёрнуты и находиться в статусе `READY`.
 2. **Лимиты числа вычислений выражений в `firestore.rules`:** При стресс-тесте `SEC-10` на больших невалидных пейлоадах эмулятор фиксирует лимит в 1000 вычислений выражений, безопасно отклоняя запрос (`PERMISSION_DENIED`, режим fail-closed).
