@@ -127,23 +127,55 @@ export function assertSupportedJavaVersion(
   return parsed;
 }
 
-/**
- * Executes `java -version` in an OS-independent way, captures both stderr and stdout,
- * and verifies that Java >= minMajor is installed.
- */
-export function verifyJavaRuntime(
-  javaCommand = 'java',
-  minMajor: number = MIN_REQUIRED_JAVA_MAJOR,
-): ParsedJavaVersion {
-  const res = spawnSync(javaCommand, ['-version'], {
+export interface JavaSpawnResult {
+  error?: Error;
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout?: string | null;
+  stderr?: string | null;
+}
+
+export type JavaSpawnRunner = (
+  command: string,
+  args: string[],
+) => JavaSpawnResult;
+
+export const defaultJavaSpawnRunner: JavaSpawnRunner = (command, args) =>
+  spawnSync(command, args, {
     encoding: 'utf-8',
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
 
+/**
+ * Executes `java -version` in an OS-independent way, strictly verifies process completion
+ * (no error, no signal termination, and exit status === 0), captures both stderr and stdout,
+ * and only then validates that Java >= minMajor is installed.
+ */
+export function verifyJavaRuntime(
+  javaCommand = 'java',
+  minMajor: number = MIN_REQUIRED_JAVA_MAJOR,
+  runner: JavaSpawnRunner = defaultJavaSpawnRunner,
+): ParsedJavaVersion {
+  const safeCmdName = path.basename(String(javaCommand || 'java')).replace(/[^\w.-]/g, '_');
+  const res = runner(javaCommand, ['-version']);
+
   if (res.error) {
+    const errCode = (res.error as NodeJS.ErrnoException).code || res.error.name || 'SPAWN_ERROR';
     throw new JavaVersionError(
-      `Java Runtime ("${javaCommand}") не найден или не удалось запустить процесс: ${res.error.message}. Установите JDK/JRE версии ${minMajor} или выше.`,
+      `Java Runtime ("${safeCmdName}") не найден или не удалось запустить процесс (${errCode}). Установите JDK/JRE версии ${minMajor} или выше.`,
+    );
+  }
+
+  if (res.signal) {
+    throw new JavaVersionError(
+      `Процесс "${safeCmdName} -version" был прерван сигналом ${res.signal} (status: ${String(res.status)}).`,
+    );
+  }
+
+  if (res.status !== 0) {
+    throw new JavaVersionError(
+      `Команда "${safeCmdName} -version" завершилась с ненулевым кодом возврата (status: ${String(res.status)}). Требуется успешное завершение (status: 0).`,
     );
   }
 
@@ -154,7 +186,7 @@ export function verifyJavaRuntime(
 
   if (!combinedOutput) {
     throw new JavaVersionError(
-      `Команда "${javaCommand} -version" не вернула версию Java (код выхода: ${res.status ?? 'unknown'}).`,
+      `Команда "${safeCmdName} -version" завершилась с кодом 0, но вернула пустой вывод.`,
     );
   }
 

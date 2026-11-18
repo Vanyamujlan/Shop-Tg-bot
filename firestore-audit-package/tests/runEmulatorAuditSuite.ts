@@ -245,93 +245,175 @@ async function main(): Promise<void> {
   await runCheck(
     'ENV-04',
     'Environment',
-    'Проверка парсера и валидатора версии Java (Java 17, 21, 22, отсутствие Java, некорректный вывод)',
-    'Автоматическая проверка parseJavaMajorVersion, assertSupportedJavaVersion и verifyJavaRuntime на версиях 8, 17, 21, 22, пустом/битом выводе и отсутствующем бинарнике',
+    'Проверка verifyJavaRuntime (Java 17, 21, 22, 8, отсутствие Java, битый вывод, status=1, status=null, status=0)',
+    'Прямое тестирование функции verifyJavaRuntime (а также parseJavaMajorVersion и assertSupportedJavaVersion) на всех позитивных и негативных сценариях завершения процесса',
     async () => {
-      // 1. Java 17 (quoted & unquoted) -> must parse major=17 and FAIL assertSupportedJavaVersion(..., 21)
-      const parsed17 = parseJavaMajorVersion(
-        'openjdk version "17.0.21" 2026-04-14\nOpenJDK Runtime Environment (build 17.0.21+9-Ubuntu)',
-      );
-      assert.equal(parsed17.major, 17);
+      // 1. Java 17 (status: 0, valid Java 17 output in stderr/stdout) -> FAIL
       assert.throws(
         () =>
-          assertSupportedJavaVersion(
-            'openjdk version "17.0.21" 2026-04-14\nOpenJDK Runtime Environment',
-            21,
-          ),
+          verifyJavaRuntime('java', 21, () => ({
+            status: 0,
+            signal: null,
+            stderr: 'openjdk version "17.0.21" 2026-04-14\nOpenJDK Runtime Environment (build 17.0.21+9-Ubuntu)',
+            stdout: '',
+          })),
         (err: unknown) => err instanceof JavaVersionError && /Java 17/.test(err.message),
       );
       assert.throws(
-        () => assertSupportedJavaVersion('java version "17.0.10" 2024-01-16 LTS', 21),
-        (err: unknown) => err instanceof JavaVersionError,
-      );
-      assert.throws(
-        () => assertSupportedJavaVersion('openjdk 17.0.8 2023-07-18', 21),
-        (err: unknown) => err instanceof JavaVersionError,
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: 0,
+            signal: null,
+            stderr: '',
+            stdout: 'openjdk 17.0.8 2023-07-18',
+          })),
+        (err: unknown) => err instanceof JavaVersionError && /Java 17/.test(err.message),
       );
 
-      // 2. Legacy Java 8 ("1.8.0_392") -> must parse major=8 and FAIL
-      const parsed8 = parseJavaMajorVersion('java version "1.8.0_392"\nJava(TM) SE Runtime Environment');
+      // 2. Java 21 (status: 0, quoted in stderr and unquoted in stdout) -> PASS
+      const v21Stderr = verifyJavaRuntime('java', 21, () => ({
+        status: 0,
+        signal: null,
+        stderr: 'openjdk version "21.0.13.0.3" 2026-10-24\nOpenJDK Runtime Environment',
+        stdout: '',
+      }));
+      assert.equal(v21Stderr.major, 21);
+
+      const v21Stdout = verifyJavaRuntime('java', 21, () => ({
+        status: 0,
+        signal: null,
+        stderr: '',
+        stdout: 'openjdk 21.0.4 2024-07-16\nOpenJDK Runtime Environment Temurin-21.0.4+7',
+      }));
+      assert.equal(v21Stdout.major, 21);
+
+      // 3. Java 22 (status: 0, quoted & unquoted) -> PASS
+      const v22Quoted = verifyJavaRuntime('java', 21, () => ({
+        status: 0,
+        signal: null,
+        stderr: 'java version "22.0.1" 2024-04-16\nJava(TM) SE Runtime Environment',
+        stdout: '',
+      }));
+      assert.equal(v22Quoted.major, 22);
+
+      const v22Unquoted = verifyJavaRuntime('java', 21, () => ({
+        status: 0,
+        signal: null,
+        stderr: '',
+        stdout: 'openjdk 22 2024-03-19',
+      }));
+      assert.equal(v22Unquoted.major, 22);
+
+      // 4. Java 8 ("1.8.0_392", status: 0) -> FAIL
+      const parsed8 = parseJavaMajorVersion('java version "1.8.0_392"');
       assert.equal(parsed8.major, 8);
       assert.throws(
-        () => assertSupportedJavaVersion('java version "1.8.0_392"', 21),
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: 0,
+            signal: null,
+            stderr: 'java version "1.8.0_392"\nJava(TM) SE Runtime Environment',
+            stdout: '',
+          })),
         (err: unknown) => err instanceof JavaVersionError && /Java 8/.test(err.message),
       );
 
-      // 3. Java 21 (quoted & modern unquoted) -> must PASS with major=21
-      const v21OpenJdk = assertSupportedJavaVersion(
-        'openjdk version "21.0.13.0.3" 2026-10-24\nOpenJDK Runtime Environment (build 21.0.13.0.3+1-Ubuntu)',
-        21,
+      // 5. Missing Java executable (both via spawn error ENOENT and real OS call) -> FAIL
+      assert.throws(
+        () =>
+          verifyJavaRuntime('java', 21, () => {
+            const err = new Error('spawnSync java ENOENT') as NodeJS.ErrnoException;
+            err.code = 'ENOENT';
+            return {
+              error: err,
+              status: null,
+              signal: null,
+              stderr: '',
+              stdout: '',
+            };
+          }),
+        (err: unknown) => err instanceof JavaVersionError && /ENOENT/.test(err.message),
       );
-      assert.equal(v21OpenJdk.major, 21);
-
-      const v21JavaQuoted = assertSupportedJavaVersion(
-        'java version "21.0.2" 2024-01-16 LTS\nJava(TM) SE Runtime Environment',
-        21,
-      );
-      assert.equal(v21JavaQuoted.major, 21);
-
-      const v21Unquoted = assertSupportedJavaVersion(
-        'openjdk 21.0.4 2024-07-16\nOpenJDK Runtime Environment Temurin-21.0.4+7',
-        21,
-      );
-      assert.equal(v21Unquoted.major, 21);
-
-      // 4. Java 22 (quoted & modern unquoted) -> must PASS with major=22
-      const v22Java = assertSupportedJavaVersion(
-        'java version "22.0.1" 2024-04-16\nJava(TM) SE Runtime Environment (build 22.0.1+8-16)',
-        21,
-      );
-      assert.equal(v22Java.major, 22);
-
-      const v22Unquoted = assertSupportedJavaVersion('openjdk 22 2024-03-19', 21);
-      assert.equal(v22Unquoted.major, 22);
-
-      // 5. Missing Java executable -> must throw JavaVersionError
       assert.throws(
         () => verifyJavaRuntime('__non_existent_java_binary_audit_check__', 21),
         (err: unknown) => err instanceof JavaVersionError,
       );
 
-      // 6. Empty & malformed outputs -> must throw JavaVersionError
+      // 6. Empty or malformed output (status: 0) -> FAIL
       assert.throws(
-        () => assertSupportedJavaVersion('', 21),
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: 0,
+            signal: null,
+            stderr: '   ',
+            stdout: '',
+          })),
+        (err: unknown) => err instanceof JavaVersionError && /пустой вывод/.test(err.message),
+      );
+      assert.throws(
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: 0,
+            signal: null,
+            stderr: 'Picked up _JAVA_OPTIONS: -Xmx512m\nUnrecognized output without version',
+            stdout: '',
+          })),
         (err: unknown) => err instanceof JavaVersionError,
       );
       assert.throws(
-        () => assertSupportedJavaVersion('Picked up _JAVA_OPTIONS: -Xmx512m\nInvalid output without version', 21),
-        (err: unknown) => err instanceof JavaVersionError,
-      );
-      assert.throws(
-        () => assertSupportedJavaVersion('openjdk version "abc.def"', 21),
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: 0,
+            signal: null,
+            stderr: 'openjdk version "abc.def"',
+            stdout: '',
+          })),
         (err: unknown) => err instanceof JavaVersionError,
       );
 
-      // 7. Actual system Java runtime -> must be >= 21
+      // 7. Exit code 1 (status: 1) EVEN WHEN output contains valid Java 21 -> MUST FAIL!
+      assert.throws(
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: 1,
+            signal: null,
+            stderr: 'openjdk version "21.0.13.0.3" 2026-10-24\nOpenJDK Runtime Environment',
+            stdout: '',
+          })),
+        (err: unknown) =>
+          err instanceof JavaVersionError && /status: 1/.test(err.message),
+      );
+
+      // 8. status: null (both with signal="SIGTERM" and without signal) EVEN WHEN output contains valid Java 21 -> MUST FAIL!
+      assert.throws(
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: null,
+            signal: 'SIGTERM',
+            stderr: 'openjdk version "21.0.13.0.3" 2026-10-24\nOpenJDK Runtime Environment',
+            stdout: '',
+          })),
+        (err: unknown) =>
+          err instanceof JavaVersionError && /SIGTERM/.test(err.message),
+      );
+      assert.throws(
+        () =>
+          verifyJavaRuntime('java', 21, () => ({
+            status: null,
+            signal: null,
+            stderr: 'openjdk version "21.0.13.0.3" 2026-10-24\nOpenJDK Runtime Environment',
+            stdout: '',
+          })),
+        (err: unknown) =>
+          err instanceof JavaVersionError && /status: null/.test(err.message),
+      );
+
+      // 9. status: 0 with valid Java 21 (real OS call) -> MUST PASS!
       const systemJava = verifyJavaRuntime('java', 21);
       assert.ok(systemJava.major >= 21);
+      assertSupportedJavaVersion(systemJava.firstLine, 21);
 
-      return `Проверены все форматы: Java 8/17 отклонены (JavaVersionError), Java 21/22 приняты, отсутствующий бинарник и битый вывод отклонены. Системная Java: ${systemJava.rawVersion} (major=${systemJava.major}).`;
+      return `Проверено поведение verifyJavaRuntime на всех 9 сценариях: Java 17/8 отклонены, отсутствующая Java и битый вывод отклонены, status=1 и status=null/SIGTERM при валидном выводе Java 21 жёстко отклонены, status=0 с Java 21/22 принят. Системная Java: ${systemJava.rawVersion} (major=${systemJava.major}).`;
     },
   );
 
