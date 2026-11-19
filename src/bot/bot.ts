@@ -155,8 +155,6 @@ class TelegramBotManager {
           config.webhookSecret,
           config.firebasePrivateKey,
           config.cryptobotApiToken,
-          config.lolzteamApiToken,
-          config.lolzteamWebhookSecret,
           config.xrocketApiKey,
         ]);
         console.error(
@@ -237,8 +235,6 @@ class TelegramBotManager {
               token,
               config.webhookSecret,
               config.cryptobotApiToken,
-              config.lolzteamApiToken,
-              config.lolzteamWebhookSecret,
               config.xrocketApiKey,
             ]);
             console.error(`[TelegramBot] Ошибка фонового polling: ${safeMsg}`);
@@ -271,8 +267,6 @@ class TelegramBotManager {
         config.webhookSecret,
         config.firebasePrivateKey,
         config.cryptobotApiToken,
-        config.lolzteamApiToken,
-        config.lolzteamWebhookSecret,
         config.xrocketApiKey,
       ]);
       this.pollingStarted = false;

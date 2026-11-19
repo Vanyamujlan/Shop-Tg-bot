@@ -49,7 +49,6 @@ export function fromMinorUnits(minorUnits: number): number {
  * Formula: amountCredited = amountPaid * (1 - feePercent / 100)
  * Examples:
  * - CryptoBot (3%): 100 -> 97 (fee 3)
- * - Lolzteam (5%): 100 -> 95 (fee 5)
  * - xRocket (2%): 100 -> 98 (fee 2)
  */
 export function calculateTopUpCommission(
@@ -145,6 +144,7 @@ export class BalanceService {
     provider: BalanceTopUpProvider;
     amountPaid: number;
     currency?: string;
+    network?: string;
     expiresInSeconds?: number;
   }): Promise<BalanceTopUpRecord> {
     firestoreRepo.assertReadyForOrdersAndPayments();
@@ -190,13 +190,16 @@ export class BalanceService {
 
     const calc = calculateTopUpCommission(params.amountPaid, params.provider);
     const paymentId = `topup_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-    const description = `Пополнение баланса Stars Shop (${paymentId}) — к зачислению ${calc.amountCredited} ${ normalizeCurrencyCode(requestedCurrency) }`;
+    const normalizedCurr = normalizeCurrencyCode(requestedCurrency);
+    const networkTag = params.network ? ` [${params.network}]` : '';
+    const description = `Пополнение баланса Stars Shop (${paymentId}) — к зачислению ${calc.amountCredited} ${normalizedCurr}${networkTag}`;
 
     const createdInvoice = await this.gateway.createInvoice({
       paymentId,
       provider: params.provider,
       amountPaid: calc.amountPaid,
       currency: requestedCurrency,
+      network: params.network,
       description,
       expiresInSeconds: params.expiresInSeconds ?? 1800,
     });
@@ -214,7 +217,8 @@ export class BalanceService {
       feePercent: calc.feePercent,
       feeAmount: calc.feeAmount,
       amountCredited: calc.amountCredited,
-      currency: normalizeCurrencyCode(requestedCurrency),
+      currency: normalizedCurr,
+      ...(params.network ? { network: params.network } : {}),
       paymentStatus: 'pending',
       recipientMerchantId: createdInvoice.recipientMerchantId,
       expiresAt: createdInvoice.expiresAt,
@@ -550,7 +554,7 @@ export class BalanceService {
       };
     }
 
-    // 3. Recipient / Merchant ID match (when applicable, e.g., Lolzteam merchant_id)
+    // 3. Recipient / Merchant ID match (when applicable)
     if (
       existingTopUp.recipientMerchantId &&
       ((verified.recipientMerchantId &&

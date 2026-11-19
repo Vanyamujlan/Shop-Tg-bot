@@ -43,7 +43,7 @@ export type RefundExecutionState =
   | 'refund_failed_needs_reconciliation'
   | 'refunded';
 
-export type BalanceTopUpProvider = 'cryptobot' | 'lolzteam' | 'xrocket';
+export type BalanceTopUpProvider = 'cryptobot' | 'xrocket';
 
 export type BalanceTopUpStatus =
   | 'pending'
@@ -58,6 +58,15 @@ export type OrderPaymentMethod =
   | 'telegram_stars'
   | 'internal_balance';
 
+export interface XRocketErrorProblemDetails {
+  status?: number;
+  type?: string;
+  title?: string;
+  detail?: string;
+  instance?: string;
+  kind?: string;
+}
+
 export interface BalanceTopUpRecord {
   paymentId: string;
   userId: string;
@@ -69,6 +78,7 @@ export interface BalanceTopUpRecord {
   feeAmount: number;
   amountCredited: number;
   currency: string;
+  network?: string;
   paymentStatus: BalanceTopUpStatus;
   externalInvoiceId: string;
   payUrl?: string;
@@ -95,6 +105,42 @@ export interface StoreUser {
   updatedAt: string;
 }
 
+export type KeyGeneratorAlgorithm =
+  | 'none'
+  | 'stars_promo_v1'
+  | 'gift_voucher_v1';
+
+export type DigitalKeyStatus =
+  | 'available'
+  | 'reserved'
+  | 'delivered'
+  | 'disabled';
+
+export interface DigitalKeyRecord {
+  keyId: string;
+  productId: string;
+  productName: string;
+  keyHash: string;
+  keyValue: string;
+  maskedPreview: string;
+  status: DigitalKeyStatus;
+  source: 'manual' | 'generated';
+  algorithm?: KeyGeneratorAlgorithm;
+  reservedOrderId?: string;
+  reservedUserId?: string;
+  reservedUserTelegramId?: number;
+  reservedAt?: string;
+  deliveredOrderId?: string;
+  deliveredUserId?: string;
+  deliveredUserTelegramId?: number;
+  deliveredAt?: string;
+  disabledAt?: string;
+  disabledByTelegramId?: number;
+  createdByTelegramId: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Product {
   id: string;
   name: string;
@@ -105,6 +151,7 @@ export interface Product {
   imageUrl: string;
   isActive: boolean;
   fulfillmentType: FulfillmentType;
+  keyGeneratorAlgorithm?: KeyGeneratorAlgorithm;
   createdAt: string;
   updatedAt: string;
 }
@@ -135,6 +182,9 @@ export interface Order {
   fulfillmentIdempotencyKey?: string;
   externalExecutionReference?: string;
   needsManualReconciliation?: boolean;
+  assignedKeyIds?: string[];
+  deliveredKeyValues?: string[];
+  awaitingKeyStock?: boolean;
   refundState?: RefundExecutionState;
   refundLockToken?: string;
   refundStartedAt?: string;
@@ -178,6 +228,11 @@ export type TransactionType =
   | 'balance_topup_expired'
   | 'balance_deducted'
   | 'balance_refunded'
+  | 'key_added'
+  | 'key_generated'
+  | 'key_delivered'
+  | 'key_disabled'
+  | 'key_stock_empty'
   | 'admin_action'
   | 'error';
 
@@ -228,7 +283,8 @@ export interface AdminInteractiveSession {
     | 'add_product_price'
     | 'message_user'
     | 'block_user_id'
-    | 'complete_order_note';
+    | 'complete_order_note'
+    | 'owner_add_keys';
   targetId?: string;
   draftProduct?: {
     category: ProductCategory;

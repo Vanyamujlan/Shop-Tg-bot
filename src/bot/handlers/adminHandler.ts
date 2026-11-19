@@ -18,7 +18,13 @@ import {
   paymentProviderGateway,
 } from '../../services/PaymentProviders.ts';
 import { firestoreRepo } from '../../db/firestore.ts';
-import { getEnvConfig } from '../../config/env.ts';
+import { getEnvConfig, isOwnerTelegramId } from '../../config/env.ts';
+import {
+  DigitalKeyService,
+  DuplicateDigitalKeyError,
+  OwnerAccessDeniedError,
+  UnsupportedKeyGeneratorError,
+} from '../../services/DigitalKeyService.ts';
 import {
   buildAdminCategoryPickKeyboard,
   buildAdminMainKeyboard,
@@ -32,6 +38,9 @@ import {
   buildAdminTopUpsKeyboard,
   buildAdminUserManageKeyboard,
   buildAdminUsersKeyboard,
+  buildOwnerAvailableKeysKeyboard,
+  buildOwnerKeysHomeKeyboard,
+  buildOwnerProductKeysKeyboard,
 } from '../keyboards.ts';
 import {
   escapeHtml,
@@ -39,6 +48,11 @@ import {
   formatAdminStatsMessage,
   formatAdminTopUpCard,
   formatDateRu,
+  formatOwnerAvailableKeysListMessage,
+  formatOwnerDeliveredKeysListMessage,
+  formatOwnerKeyDeliveryHistoryMessage,
+  formatOwnerKeysOverviewMessage,
+  formatOwnerProductKeysMessage,
   formatProductCardMessage,
   formatUserProfileMessage,
 } from '../formatters.ts';
@@ -107,6 +121,25 @@ export async function ensureAdmin(ctx: Context): Promise<boolean> {
   return true;
 }
 
+export async function ensureOwner(ctx: Context): Promise<boolean> {
+  const telegramId = ctx.from?.id;
+  if (!isOwnerTelegramId(telegramId)) {
+    if (ctx.callbackQuery) {
+      await safeAnswerCbQuery(
+        ctx,
+        '⛔ Доступ к генератору и складу ключей разрешён исключительно владельцу бота (OWNER_TELEGRAM_ID).',
+        true,
+      );
+    } else {
+      await ctx.reply(
+        '⛔ Доступ запрещён: управление цифровыми ключами доступно исключительно владельцу бота (OWNER_TELEGRAM_ID).',
+      );
+    }
+    return false;
+  }
+  return true;
+}
+
 async function logAdminAudit(
   adminTelegramId: number,
   orderId: string,
@@ -137,6 +170,7 @@ export function registerAdminHandlers(
   bot.command('admin', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
     clearAdminSession(ctx.from!.id);
+    const isOwner = isOwnerTelegramId(ctx.from!.id);
     await safeRespondOrEdit(
       ctx,
       [
@@ -144,7 +178,7 @@ export function registerAdminHandlers(
         '',
         'Выберите раздел для управления каталогом, заказами, пользователями или просмотра статуса интеграций:',
       ].join('\n'),
-      buildAdminMainKeyboard(),
+      buildAdminMainKeyboard(isOwner),
     );
   });
 
@@ -153,6 +187,7 @@ export function registerAdminHandlers(
     if (!(await ensureAdmin(ctx))) return;
     if (isDuplicateCallbackClick(ctx.from!.id, 'adm:home')) return;
     clearAdminSession(ctx.from!.id);
+    const isOwner = isOwnerTelegramId(ctx.from!.id);
     await safeRespondOrEdit(
       ctx,
       [
@@ -160,7 +195,7 @@ export function registerAdminHandlers(
         '',
         'Выберите раздел для управления:',
       ].join('\n'),
-      buildAdminMainKeyboard(),
+      buildAdminMainKeyboard(isOwner),
     );
   });
 
@@ -214,7 +249,11 @@ export function registerAdminHandlers(
       totalTopUpFees,
     });
 
-    await safeRespondOrEdit(ctx, text, buildAdminMainKeyboard());
+    await safeRespondOrEdit(
+      ctx,
+      text,
+      buildAdminMainKeyboard(isOwnerTelegramId(ctx.from!.id)),
+    );
   });
 
   // 1b. Просмотр и фильтрация пополнений баланса в админ-панели
@@ -1296,7 +1335,7 @@ export function registerAdminHandlers(
       `👑 <b>Администраторов в ADMIN_IDS:</b> ${envConfig.adminIds.length}`,
       '',
       '💳 <b>Платёжные провайдеры пополнения баланса:</b>',
-      ...(['cryptobot', 'lolzteam', 'xrocket'] as const).map((p) => {
+      ...(['cryptobot', 'xrocket'] as const).map((p) => {
         const meta = PAYMENT_PROVIDER_CATALOG[p];
         const st = paymentProviderGateway.getProviderStatusSummary()[p];
         return `• <b>${escapeHtml(meta.shortTitle)} (${meta.feePercent}%):</b> ${
@@ -1310,7 +1349,278 @@ export function registerAdminHandlers(
       ...errorLines,
     ].join('\n');
 
-    await safeRespondOrEdit(ctx, text, buildAdminMainKeyboard());
+    await safeRespondOrEdit(
+      ctx,
+      text,
+      buildAdminMainKeyboard(isOwnerTelegramId(ctx.from!.id)),
+    );
+  });
+
+  // =========================================================================
+  // 7. ГЕНЕРАТОР И СКЛАД ЦИФРОВЫХ КЛЮЧЕЙ (OWNER-ONLY — STAGE 3.3)
+  // =========================================================================
+
+  const renderOwnerKeysOverview = async (ctx: Context) => {
+    if (!(await ensureOwner(ctx))) return;
+    clearAdminSession(ctx.from!.id);
+    const [products, summaries] = await Promise.all([
+      ProductService.getAllProducts(true),
+      DigitalKeyService.getAllProductsStockSummary(ctx.from!.id),
+    ]);
+    await safeRespondOrEdit(
+      ctx,
+      formatOwnerKeysOverviewMessage(summaries),
+      buildOwnerKeysHomeKeyboard(products, summaries),
+    );
+  };
+
+  bot.command('keys', async (ctx) => {
+    await renderOwnerKeysOverview(ctx);
+  });
+
+  bot.action('own:keys:home', async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    if (isDuplicateCallbackClick(ctx.from!.id, 'own:keys:home')) return;
+    await renderOwnerKeysOverview(ctx);
+  });
+
+  bot.action(/^own:keys:prod:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    const productId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `own:keys:prod:${productId}`)) {
+      return;
+    }
+    clearAdminSession(ctx.from!.id);
+
+    const product = await ProductService.getProductById(productId);
+    if (!product) {
+      await safeAnswerCbQuery(ctx, 'Товар не найден.', true);
+      return;
+    }
+
+    const summary = await DigitalKeyService.getProductStockSummary({
+      actorTelegramId: ctx.from!.id,
+      productId,
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      formatOwnerProductKeysMessage(product, summary),
+      buildOwnerProductKeysKeyboard(product, summary),
+    );
+  });
+
+  // Ручное добавление ключей (одиночное или пакетное)
+  bot.action(/^own:keys:add:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    const productId = ctx.match[1];
+    const product = await ProductService.getProductById(productId);
+    if (!product) {
+      await safeAnswerCbQuery(ctx, 'Товар не найден.', true);
+      return;
+    }
+
+    setAdminSession(ctx.from!.id, {
+      action: 'owner_add_keys',
+      targetId: productId,
+      createdAt: Date.now(),
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      [
+        `➕ <b>Добавление цифровых ключей: ${escapeHtml(product.name)}</b>`,
+        `🆔 Товар: <code>${escapeHtml(product.id)}</code>`,
+        '',
+        'Отправьте в чат один ключ или список ключей (каждый ключ — с новой строки).',
+        '🔒 Перед сохранением каждый ключ проверяется на уникальность.',
+      ].join('\n'),
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            '❌ Отмена',
+            `own:keys:prod:${product.id}`,
+          ),
+        ],
+      ]),
+    );
+  });
+
+  // Автогенерация ключей по внутреннему алгоритму товара
+  bot.action(/^own:keys:gen:([a-zA-Z0-9_-]+):(\d+)$/, async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    const productId = ctx.match[1];
+    const count = Number(ctx.match[2]);
+    if (
+      isDuplicateCallbackClick(
+        ctx.from!.id,
+        `own:keys:gen:${productId}:${count}`,
+        1500,
+      )
+    ) {
+      return;
+    }
+
+    try {
+      const created = await DigitalKeyService.generateKeys({
+        actorTelegramId: ctx.from!.id,
+        productId,
+        count,
+      });
+
+      const product = await ProductService.getProductById(productId);
+      const summary = await DigitalKeyService.getProductStockSummary({
+        actorTelegramId: ctx.from!.id,
+        productId,
+      });
+
+      await safeAnswerCbQuery(
+        ctx,
+        `Сгенерировано ключей: ${created.length} шт.`,
+        true,
+      );
+
+      if (product) {
+        const previewList = created
+          .map((k, idx) => `${idx + 1}. <code>${escapeHtml(k.keyValue)}</code>`)
+          .join('\n');
+        await safeRespondOrEdit(
+          ctx,
+          [
+            `✅ <b>Сгенерировано ${created.length} новых ключей!</b>`,
+            previewList,
+            '',
+            formatOwnerProductKeysMessage(product, summary),
+          ].join('\n'),
+          buildOwnerProductKeysKeyboard(product, summary),
+        );
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
+  });
+
+  // Список доступных ключей (с возможностью отключения)
+  bot.action(/^own:keys:avail:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    const productId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `own:keys:avail:${productId}`)) {
+      return;
+    }
+
+    const product = await ProductService.getProductById(productId);
+    if (!product) {
+      await safeAnswerCbQuery(ctx, 'Товар не найден.', true);
+      return;
+    }
+
+    const availKeys = await DigitalKeyService.listKeysForProduct({
+      actorTelegramId: ctx.from!.id,
+      productId,
+      status: 'available',
+      limit: 20,
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      formatOwnerAvailableKeysListMessage(product, availKeys),
+      buildOwnerAvailableKeysKeyboard(productId, availKeys),
+    );
+  });
+
+  // Отключение неиспользованного ключа
+  bot.action(/^own:keys:disable:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    const keyId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `own:keys:disable:${keyId}`, 1500)) {
+      return;
+    }
+
+    try {
+      const disabled = await DigitalKeyService.disableKey({
+        actorTelegramId: ctx.from!.id,
+        keyId,
+      });
+
+      await safeAnswerCbQuery(
+        ctx,
+        `Ключ ${disabled.maskedPreview} отключён (disabled).`,
+        true,
+      );
+
+      const product = await ProductService.getProductById(disabled.productId);
+      if (product) {
+        const availKeys = await DigitalKeyService.listKeysForProduct({
+          actorTelegramId: ctx.from!.id,
+          productId: disabled.productId,
+          status: 'available',
+          limit: 20,
+        });
+        await safeRespondOrEdit(
+          ctx,
+          formatOwnerAvailableKeysListMessage(product, availKeys),
+          buildOwnerAvailableKeysKeyboard(disabled.productId, availKeys),
+        );
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+    }
+  });
+
+  // Список выданных ключей по товару
+  bot.action(/^own:keys:deliv:([a-zA-Z0-9_-]+)$/, async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    const productId = ctx.match[1];
+    if (isDuplicateCallbackClick(ctx.from!.id, `own:keys:deliv:${productId}`)) {
+      return;
+    }
+
+    const product = await ProductService.getProductById(productId);
+    if (!product) {
+      await safeAnswerCbQuery(ctx, 'Товар не найден.', true);
+      return;
+    }
+
+    const deliveredKeys = await DigitalKeyService.listKeysForProduct({
+      actorTelegramId: ctx.from!.id,
+      productId,
+      status: 'delivered',
+      limit: 20,
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      formatOwnerDeliveredKeysListMessage(product, deliveredKeys),
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback(
+            '⬅️ Назад к товару',
+            `own:keys:prod:${productId}`,
+          ),
+        ],
+      ]),
+    );
+  });
+
+  // Общая история выдачи ключей
+  bot.action('own:keys:history', async (ctx) => {
+    if (!(await ensureOwner(ctx))) return;
+    if (isDuplicateCallbackClick(ctx.from!.id, 'own:keys:history')) return;
+
+    const history = await DigitalKeyService.getKeyDeliveryHistory({
+      actorTelegramId: ctx.from!.id,
+      limit: 25,
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      formatOwnerKeyDeliveryHistoryMessage(history),
+      Markup.inlineKeyboard([
+        [Markup.button.callback('⬅️ К складу ключей', 'own:keys:home')],
+      ]),
+    );
   });
 
   // Обработка текстового ввода для активных админ-сессий
@@ -1513,12 +1823,63 @@ export function registerAdminHandlers(
           `✅ Сообщение успешно доставлено пользователю <code>${targetTgId}</code>.`,
           {
             parse_mode: 'HTML',
-            ...buildAdminMainKeyboard(),
+            ...buildAdminMainKeyboard(isOwnerTelegramId(ctx.from.id)),
+          },
+        );
+        return;
+      }
+
+      if (session.action === 'owner_add_keys' && session.targetId) {
+        if (!(await ensureOwner(ctx))) {
+          clearAdminSession(ctx.from.id);
+          return;
+        }
+        const productId = session.targetId;
+        const lines = text
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
+
+        const added = await DigitalKeyService.addKeys({
+          actorTelegramId: ctx.from.id,
+          productId,
+          keys: lines,
+        });
+        clearAdminSession(ctx.from.id);
+
+        const product = await ProductService.getProductById(productId);
+        const summary = await DigitalKeyService.getProductStockSummary({
+          actorTelegramId: ctx.from.id,
+          productId,
+        });
+
+        await ctx.reply(
+          [
+            `✅ <b>Успешно добавлено ключей на склад: ${added.length} шт.</b>`,
+            product ? formatOwnerProductKeysMessage(product, summary) : '',
+          ]
+            .filter(Boolean)
+            .join('\n\n'),
+          {
+            parse_mode: 'HTML',
+            ...(product
+              ? buildOwnerProductKeysKeyboard(product, summary)
+              : buildAdminMainKeyboard(true)),
           },
         );
         return;
       }
     } catch (error) {
+      if (
+        error instanceof OwnerAccessDeniedError ||
+        error instanceof DuplicateDigitalKeyError ||
+        error instanceof UnsupportedKeyGeneratorError
+      ) {
+        await ctx.reply(`⚠️ <b>Ошибка:</b> ${escapeHtml(error.message)}`, {
+          parse_mode: 'HTML',
+        });
+        return;
+      }
       const msg = error instanceof Error ? error.message : String(error);
       await ctx.reply(`⚠️ <b>Ошибка:</b> ${escapeHtml(msg)}`, {
         parse_mode: 'HTML',

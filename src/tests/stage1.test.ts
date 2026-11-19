@@ -21,10 +21,15 @@ import {
   verifyWebhookSecretToken,
   isValidTelegramUpdatePayload,
 } from '../bot/bot.ts';
-import { ensureAdmin } from '../bot/handlers/adminHandler.ts';
+import { ensureAdmin, ensureOwner } from '../bot/handlers/adminHandler.ts';
 import {
+  buildAdminMainKeyboard,
   buildAdminOrderActionKeyboard,
   buildAdminOrderRefundConfirmKeyboard,
+  buildTopUpInvoiceKeyboard,
+  buildTopUpStep1ProviderKeyboard,
+  buildTopUpStep2AmountKeyboard,
+  buildTopUpStep3XRocketCurrencyKeyboard,
   buildUserProfileKeyboard,
 } from '../bot/keyboards.ts';
 import {
@@ -34,11 +39,19 @@ import {
 import {
   PaymentProviderGateway,
   PAYMENT_PROVIDER_CATALOG,
+  XRocketApiError,
+  buildXRocketApiV1Url,
   computeCryptoBotWebhookSignature,
   computeXRocketWebhookSignature,
   type HttpTransportRequest,
   type HttpTransportResponse,
 } from '../services/PaymentProviders.ts';
+import {
+  DigitalKeyService,
+  DuplicateDigitalKeyError,
+  OwnerAccessDeniedError,
+  UnsupportedKeyGeneratorError,
+} from '../services/DigitalKeyService.ts';
 import type { Order, StoreUser } from '../types.ts';
 
 // Force isolated test environment so production Firestore and .data/ are NEVER touched
@@ -1791,30 +1804,20 @@ async function runFullAuditTestSuite(): Promise<void> {
   const mockCreds = {
     cryptobotApiToken: 'test_crypto_token_secret_111',
     cryptobotApiUrl: 'https://pay.crypt.bot/api',
-    lolzteamApiToken: 'test_lzt_token_secret_222',
-    lolzteamMerchantId: '777',
-    lolzteamWebhookSecret: 'test_lzt_webhook_secret_333',
-    lolzteamApiUrl: 'https://prod-api.lzt.market',
     xrocketApiKey: 'test_xrocket_key_secret_444',
-    xrocketApiUrl: 'https://pay.xrocket.tg',
+    xrocketApiUrl: 'https://pay.api.testnet.xrocket.exchange',
   };
 
   await runTest(
     'B-01',
     'Payments',
-    'Проверка всех 3 комиссий (CryptoBot 3%, Lolzteam 5%, xRocket 2%), копеечной точности и кнопки «💳 Пополнить баланс» в профиле',
+    'Проверка комиссий (CryptoBot 3%, xRocket 2%), копеечной точности и минималистичного 3-шагового интерфейса пополнения',
     async () => {
       const cb100 = calculateTopUpCommission(100, 'cryptobot');
       assert.equal(cb100.amountPaid, 100);
       assert.equal(cb100.feePercent, 3);
       assert.equal(cb100.feeAmount, 3);
       assert.equal(cb100.amountCredited, 97);
-
-      const lzt100 = calculateTopUpCommission(100, 'lolzteam');
-      assert.equal(lzt100.amountPaid, 100);
-      assert.equal(lzt100.feePercent, 5);
-      assert.equal(lzt100.feeAmount, 5);
-      assert.equal(lzt100.amountCredited, 95);
 
       const xr100 = calculateTopUpCommission(100, 'xrocket');
       assert.equal(xr100.amountPaid, 100);
@@ -1835,12 +1838,31 @@ async function runFullAuditTestSuite(): Promise<void> {
         'Кнопка «💳 Пополнить баланс» (menu:topup) должна присутствовать в профиле',
       );
 
-      // Проверка каталога провайдеров
+      // Проверка каталога провайдеров (ровно 2 поддерживаемых провайдера: cryptobot и xrocket)
+      assert.deepEqual(
+        Object.keys(PAYMENT_PROVIDER_CATALOG).sort(),
+        ['cryptobot', 'xrocket'],
+      );
       assert.equal(PAYMENT_PROVIDER_CATALOG.cryptobot.feePercent, 3);
-      assert.equal(PAYMENT_PROVIDER_CATALOG.lolzteam.feePercent, 5);
       assert.equal(PAYMENT_PROVIDER_CATALOG.xrocket.feePercent, 2);
 
-      return 'Комиссии провайдеров проверены: CryptoBot 100 -> 97 (3%), Lolzteam 100 -> 95 (5%), xRocket 100 -> 98 (2%), кнопка «💳 Пополнить баланс» добавлена в профиль.';
+      // Проверка 3-шагового минималистичного интерфейса
+      const step1Kb = JSON.stringify(buildTopUpStep1ProviderKeyboard());
+      assert.ok(step1Kb.includes('💎 CryptoBot [3%]'));
+      assert.ok(step1Kb.includes('🚀 xRocket [2%]'));
+
+      const step2Kb = JSON.stringify(
+        buildTopUpStep2AmountKeyboard('xrocket', 100, 'USDT'),
+      );
+      assert.ok(step2Kb.includes('topup:xr_curr:100'));
+
+      const step3XrKb = JSON.stringify(
+        buildTopUpStep3XRocketCurrencyKeyboard(100),
+      );
+      assert.ok(step3XrKb.includes('USDT (TON)'));
+      assert.ok(step3XrKb.includes('BTC (Bitcoin)'));
+
+      return 'Комиссии провайдеров проверены: CryptoBot 100 -> 97 (3%), xRocket 100 -> 98 (2%), 3-шаговый минималистичный UI активен.';
     },
   );
 
@@ -1917,6 +1939,12 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(created.amountCredited, 97);
       assert.equal(await service.getBalance(buyer1.id), 0);
 
+      // Проверка минималистичной клавиатуры созданного счёта (3 кнопки)
+      const invKb = JSON.stringify(buildTopUpInvoiceKeyboard(created));
+      assert.ok(invKb.includes('💳 Оплатить'));
+      assert.ok(invKb.includes('🔄 Проверить оплату'));
+      assert.ok(invKb.includes('« Назад'));
+
       const webhookBody = JSON.stringify({
         update_id: 5001,
         update_type: 'invoice_paid',
@@ -1957,7 +1985,7 @@ async function runFullAuditTestSuite(): Promise<void> {
   await runTest(
     'B-03',
     'Security',
-    'Отклонение вебхука с неверной подписью (CryptoBot, Lolzteam, xRocket) без зачисления средств',
+    'Отклонение вебхука с неверной подписью (CryptoBot, xRocket) без зачисления средств',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
 
@@ -2019,14 +2047,6 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(forgedCrypto.ok, false);
       assert.equal(forgedCrypto.reason, 'INVALID_WEBHOOK_SIGNATURE');
 
-      const forgedLzt = await service.processWebhook({
-        provider: 'lolzteam',
-        rawBody: forgedRawBody,
-        headers: { 'x-secret-key': 'wrong_lzt_secret' },
-      });
-      assert.equal(forgedLzt.ok, false);
-      assert.equal(forgedLzt.reason, 'INVALID_WEBHOOK_SIGNATURE');
-
       const forgedXRocket = await service.processWebhook({
         provider: 'xrocket',
         rawBody: forgedRawBody,
@@ -2038,54 +2058,85 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(verifyApiCalled, 0);
       assert.equal(await service.getBalance(buyer1.id), 0);
 
-      return 'Поддельные вебхуки всех 3 провайдеров отклонены с INVALID_WEBHOOK_SIGNATURE, баланс остался 0.';
+      return 'Поддельные вебхуки CryptoBot и xRocket отклонены с INVALID_WEBHOOK_SIGNATURE, баланс остался 0.';
     },
   );
 
   await runTest(
     'B-04',
     'Payments',
-    'Повторный webhook и конкурентная ручная проверка: идемпотентность и защита от двойного зачисления',
+    'xRocket Pay REST API v1 (POST /api/v1/invoices, Bearer Auth, HTTP 201 Created, GET /api/v1/invoices?ids=..., защита от дублирования /api/v1 и идемпотентность)',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
 
+      // Проверка buildXRocketApiV1Url: отсутствие двойного /api/v1/api/v1
+      assert.equal(
+        buildXRocketApiV1Url(
+          'https://pay.api.testnet.xrocket.exchange',
+          '/invoices',
+        ),
+        'https://pay.api.testnet.xrocket.exchange/api/v1/invoices',
+      );
+      assert.equal(
+        buildXRocketApiV1Url(
+          'https://pay.api.testnet.xrocket.exchange/api/v1/',
+          '/invoices',
+        ),
+        'https://pay.api.testnet.xrocket.exchange/api/v1/invoices',
+      );
+
       let currentTopUpId = '';
+      let capturedCreateRequest: HttpTransportRequest | null = null;
+
       const transport = async (
         req: HttpTransportRequest,
       ): Promise<HttpTransportResponse> => {
-        if (req.url.endsWith('/tg-invoices') && req.method === 'POST') {
+        if (
+          req.url === 'https://pay.api.testnet.xrocket.exchange/api/v1/invoices' &&
+          req.method === 'POST'
+        ) {
+          capturedCreateRequest = req;
           const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
           return {
-            status: 200,
+            status: 201,
             ok: true,
             json: {
-              success: true,
-              data: {
-                id: 'xr_inv_404',
-                amount: body.amount,
-                currency: 'USDT',
-                status: 'active',
-                link: 'https://t.me/xrocket?start=inv_xr_inv_404',
-                payload: body.payload,
+              id: 'xr_inv_v1_404',
+              priceAmount: String(body.priceAmount),
+              priceCurrency: String(body.priceCurrency),
+              payCurrencies: body.payCurrencies,
+              clientInvoiceId: body.clientInvoiceId,
+              status: 'PENDING',
+              createdAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 1800000).toISOString(),
+              links: {
+                telegramBotLink: 'https://t.me/xrocket?start=inv_xr_inv_v1_404',
               },
             },
           };
         }
-        if (req.url.includes('/tg-invoices/xr_inv_404') && req.method === 'GET') {
+        if (
+          req.url ===
+            'https://pay.api.testnet.xrocket.exchange/api/v1/invoices?ids=xr_inv_v1_404' &&
+          req.method === 'GET'
+        ) {
+          assert.equal(
+            req.headers.Authorization,
+            `Bearer ${mockCreds.xrocketApiKey}`,
+          );
           return {
             status: 200,
             ok: true,
-            json: {
-              success: true,
-              data: {
-                id: 'xr_inv_404',
-                amount: 100,
-                currency: 'USDT',
-                status: 'paid',
-                payload: currentTopUpId,
-                paid: new Date().toISOString(),
+            json: [
+              {
+                id: 'xr_inv_v1_404',
+                priceAmount: '100.00',
+                priceCurrency: 'USDT',
+                clientInvoiceId: currentTopUpId,
+                status: 'PAID',
+                paidAt: new Date().toISOString(),
               },
-            },
+            ],
           };
         }
         throw new Error(`Unexpected request: ${req.method} ${req.url}`);
@@ -2100,17 +2151,40 @@ async function runFullAuditTestSuite(): Promise<void> {
         provider: 'xrocket',
         amountPaid: 100,
         currency: 'USDT',
+        network: 'TON',
       });
       currentTopUpId = topUp.paymentId;
+
+      assert.ok(capturedCreateRequest, 'Запрос POST /api/v1/invoices должен быть выполнен');
+      const sentReq = capturedCreateRequest as HttpTransportRequest;
+      assert.equal(
+        sentReq.headers.Authorization,
+        `Bearer ${mockCreds.xrocketApiKey}`,
+        'Должен использоваться заголовок Authorization: Bearer <TOKEN>',
+      );
+      const parsedSentBody = JSON.parse(sentReq.body || '{}') as Record<
+        string,
+        unknown
+      >;
+      assert.equal(parsedSentBody.priceAmount, '100.00');
+      assert.equal(parsedSentBody.priceCurrency, 'USDT');
+      assert.deepEqual(parsedSentBody.payCurrencies, ['USDT']);
+      assert.equal(parsedSentBody.clientInvoiceId, topUp.paymentId);
+      assert.equal(parsedSentBody.expiresIn, 1800000);
+      assert.equal(
+        topUp.payUrl,
+        'https://t.me/xrocket?start=inv_xr_inv_v1_404',
+      );
+      assert.equal(topUp.network, 'TON');
 
       const rawBody = JSON.stringify({
         type: 'invoicePay',
         data: {
-          id: 'xr_inv_404',
-          amount: 100,
-          currency: 'USDT',
-          status: 'paid',
-          payload: topUp.paymentId,
+          id: 'xr_inv_v1_404',
+          priceAmount: '100.00',
+          priceCurrency: 'USDT',
+          status: 'PAID',
+          clientInvoiceId: topUp.paymentId,
         },
       });
       const sig = computeXRocketWebhookSignature(rawBody, mockCreds.xrocketApiKey);
@@ -2155,51 +2229,101 @@ async function runFullAuditTestSuite(): Promise<void> {
         'Баланс должен быть пополнен ровно 1 раз на 98 ⭐ (xRocket комиссия 2%)',
       );
 
-      return 'Из 5 параллельных вызовов (3 webhook + 2 проверки) баланс пополнен ровно 1 раз на 98 ⭐ (duplicate=true для повторов).';
+      return 'xRocket Pay REST API v1 (POST /api/v1/invoices, Bearer Auth, HTTP 201 Created, links.telegramBotLink) проверен; из 5 параллельных вызовов баланс пополнен ровно 1 раз на 98 ⭐.';
     },
   );
 
   await runTest(
     'B-05',
     'Security',
-    'Отклонение платежа с неверной суммой (INVALID_AMOUNT)',
+    'Диагностика структурированной ошибки xRocket Pay REST API v1 (HTTP 404 Problem Details: status, type, title, detail, instance, kind) и отклонение INVALID_AMOUNT',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
 
+      // 1. Проверка парсинга HTTP 404 Problem Details от xRocket Pay REST API v1
+      const errorTransport = async (): Promise<HttpTransportResponse> => ({
+        status: 404,
+        ok: false,
+        json: {
+          status: 404,
+          type: 'https://pay.api.xrocket.exchange/errors/not-found',
+          title: 'Not Found',
+          detail: 'Merchant app or endpoint was not found in xRocket Pay',
+          instance: '/api/v1/invoices',
+          kind: 'NOT_FOUND',
+        },
+      });
+      const errorGateway = new PaymentProviderGateway(errorTransport, mockCreds);
+
+      let caughtError: unknown = null;
+      try {
+        await errorGateway.createInvoice({
+          provider: 'xrocket',
+          paymentId: 'topup_404_check',
+          amountPaid: 100,
+          currency: 'USDT',
+          description: 'Test 404 Problem Details',
+        });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      assert.ok(
+        caughtError instanceof XRocketApiError,
+        'Ошибка xRocket HTTP 404 должна быть экземпляром XRocketApiError со структурированными полями Problem Details',
+      );
+      assert.equal(caughtError.httpStatus, 404);
+      assert.equal(caughtError.problemDetails.status, 404);
+      assert.equal(caughtError.problemDetails.title, 'Not Found');
+      assert.equal(
+        caughtError.problemDetails.detail,
+        'Merchant app or endpoint was not found in xRocket Pay',
+      );
+      assert.equal(caughtError.problemDetails.instance, '/api/v1/invoices');
+      assert.equal(caughtError.problemDetails.kind, 'NOT_FOUND');
+
+      // 2. Проверка отклонения платежа с меньшей суммой (INVALID_AMOUNT)
       let currentTopUpId = '';
       const transport = async (
         req: HttpTransportRequest,
       ): Promise<HttpTransportResponse> => {
-        if (req.url.endsWith('/invoice') && req.method === 'POST') {
+        if (req.url.endsWith('/createInvoice') && req.method === 'POST') {
           const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
           return {
             status: 200,
             ok: true,
             json: {
-              invoice: {
+              ok: true,
+              result: {
                 invoice_id: 55001,
-                amount: body.amount,
-                currency: 'rub',
-                status: 'pending',
-                url: 'https://lzt.market/invoice/55001',
-                merchant_id: 777,
+                amount: String(body.amount),
+                fiat: 'RUB',
+                currency_type: 'fiat',
+                status: 'active',
+                bot_invoice_url: 'https://t.me/CryptoBot?start=IV55001',
+                payload: body.payload,
               },
             },
           };
         }
-        if (req.url.includes('/invoice?') && req.method === 'GET') {
+        if (req.url.includes('/getInvoices') && req.method === 'GET') {
           // Провайдер возвращает меньшую сумму (50 вместо 200)
           return {
             status: 200,
             ok: true,
             json: {
-              invoice: {
-                invoice_id: 55001,
-                payment_id: currentTopUpId,
-                merchant_id: 777,
-                amount: 50,
-                currency: 'rub',
-                status: 'paid',
+              ok: true,
+              result: {
+                items: [
+                  {
+                    invoice_id: 55001,
+                    payload: currentTopUpId,
+                    amount: '50.00',
+                    fiat: 'RUB',
+                    currency_type: 'fiat',
+                    status: 'paid',
+                  },
+                ],
               },
             },
           };
@@ -2212,7 +2336,7 @@ async function runFullAuditTestSuite(): Promise<void> {
 
       const topUp = await service.createTopUp({
         telegramId: buyer1.id,
-        provider: 'lolzteam',
+        provider: 'cryptobot',
         amountPaid: 200,
         currency: 'RUB',
       });
@@ -2227,7 +2351,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       const updated = await service.getTopUpById(topUp.paymentId);
       assert.equal(updated?.paymentStatus, 'failed');
 
-      return 'Несовпадение суммы (ожидалось 200 RUB, получено 50 RUB) заблокировано с кодом INVALID_AMOUNT, баланс не изменён.';
+      return 'Структурированный ответ xRocket HTTP 404 (status, type, title, detail, instance, kind) сохраняется в XRocketApiError; несовпадение суммы заблокировано с кодом INVALID_AMOUNT.';
     },
   );
 
@@ -2242,39 +2366,40 @@ async function runFullAuditTestSuite(): Promise<void> {
       const transport = async (
         req: HttpTransportRequest,
       ): Promise<HttpTransportResponse> => {
-        if (req.url.endsWith('/tg-invoices') && req.method === 'POST') {
+        if (req.url.endsWith('/api/v1/invoices') && req.method === 'POST') {
           const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
           return {
-            status: 200,
+            status: 201,
             ok: true,
             json: {
-              success: true,
-              data: {
-                id: 'xr_curr_606',
-                amount: body.amount,
-                currency: 'USDT',
-                status: 'active',
-                link: 'https://t.me/xrocket?start=xr_curr_606',
-                payload: body.payload,
+              id: 'xr_curr_606',
+              priceAmount: String(body.priceAmount),
+              priceCurrency: 'USDT',
+              status: 'PENDING',
+              clientInvoiceId: body.clientInvoiceId,
+              links: {
+                telegramBotLink: 'https://t.me/xrocket?start=xr_curr_606',
               },
             },
           };
         }
-        if (req.url.includes('/tg-invoices/xr_curr_606') && req.method === 'GET') {
+        if (
+          req.url.includes('/api/v1/invoices?ids=xr_curr_606') &&
+          req.method === 'GET'
+        ) {
           // Провайдер возвращает TRX вместо ожидаемого USDT
           return {
             status: 200,
             ok: true,
-            json: {
-              success: true,
-              data: {
+            json: [
+              {
                 id: 'xr_curr_606',
-                amount: 100,
-                currency: 'TRX',
-                status: 'paid',
-                payload: currentTopUpId,
+                priceAmount: '100.00',
+                priceCurrency: 'TRX',
+                status: 'PAID',
+                clientInvoiceId: currentTopUpId,
               },
-            },
+            ],
           };
         }
         throw new Error(`Unexpected request: ${req.url}`);
@@ -2382,7 +2507,7 @@ async function runFullAuditTestSuite(): Promise<void> {
   await runTest(
     'B-08',
     'Database',
-    'Одновременные пополнения баланса одного пользователя через все 3 провайдера (атомарность транзакций без потери начислений)',
+    'Одновременные пополнения баланса одного пользователя через CryptoBot и xRocket (атомарность транзакций без потери начислений)',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
 
@@ -2398,11 +2523,12 @@ async function runFullAuditTestSuite(): Promise<void> {
         if (req.method === 'POST') {
           const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
           const extId = `ext_conc_${seq++}`;
-          const paymentId = String(body.payload ?? body.payment_id ?? '');
-          const amount = Number(body.amount ?? 100);
+          const paymentId = String(body.payload ?? body.clientInvoiceId ?? '');
+          const amount = Number(body.amount ?? body.priceAmount ?? 100);
 
           if (req.url.includes('crypt.bot')) {
-            invoicesByExtId.set(extId, { paymentId, amount, currency: 'RUB' });
+            const curr = String(body.fiat ?? body.asset ?? 'RUB');
+            invoicesByExtId.set(extId, { paymentId, amount, currency: curr });
             return {
               status: 200,
               ok: true,
@@ -2412,43 +2538,27 @@ async function runFullAuditTestSuite(): Promise<void> {
                   invoice_id: extId,
                   status: 'active',
                   amount: String(amount),
-                  fiat: 'RUB',
-                  currency_type: 'fiat',
+                  fiat: curr,
+                  asset: curr,
+                  currency_type: body.currency_type ?? 'fiat',
                   bot_invoice_url: `https://t.me/CryptoBot?start=${extId}`,
                 },
               },
             };
           }
-          if (req.url.includes('lzt.market')) {
-            invoicesByExtId.set(extId, { paymentId, amount, currency: 'RUB' });
-            return {
-              status: 200,
-              ok: true,
-              json: {
-                invoice: {
-                  invoice_id: extId,
-                  amount,
-                  currency: 'rub',
-                  status: 'pending',
-                  url: `https://lzt.market/invoice/${extId}`,
-                  merchant_id: 777,
-                },
-              },
-            };
-          }
-          if (req.url.includes('xrocket.tg')) {
+          if (req.url.includes('xrocket.exchange')) {
             invoicesByExtId.set(extId, { paymentId, amount, currency: 'USDT' });
             return {
-              status: 200,
+              status: 201,
               ok: true,
               json: {
-                success: true,
-                data: {
-                  id: extId,
-                  amount,
-                  currency: 'USDT',
-                  status: 'active',
-                  link: `https://t.me/xrocket?start=${extId}`,
+                id: extId,
+                priceAmount: amount.toFixed(2),
+                priceCurrency: 'USDT',
+                clientInvoiceId: paymentId,
+                status: 'PENDING',
+                links: {
+                  telegramBotLink: `https://t.me/xrocket?start=${extId}`,
                 },
               },
             };
@@ -2471,7 +2581,8 @@ async function runFullAuditTestSuite(): Promise<void> {
                         status: 'paid',
                         amount: String(info.amount),
                         fiat: info.currency,
-                        currency_type: 'fiat',
+                        asset: info.currency,
+                        currency_type: info.currency === 'RUB' ? 'fiat' : 'crypto',
                         payload: info.paymentId,
                       },
                     ],
@@ -2479,36 +2590,19 @@ async function runFullAuditTestSuite(): Promise<void> {
                 },
               };
             }
-            if (req.url.includes('lzt.market')) {
+            if (req.url.includes('xrocket.exchange')) {
               return {
                 status: 200,
                 ok: true,
-                json: {
-                  invoice: {
-                    invoice_id: extId,
-                    payment_id: info.paymentId,
-                    merchant_id: 777,
-                    amount: info.amount,
-                    currency: info.currency,
-                    status: 'paid',
-                  },
-                },
-              };
-            }
-            if (req.url.includes('xrocket.tg')) {
-              return {
-                status: 200,
-                ok: true,
-                json: {
-                  success: true,
-                  data: {
+                json: [
+                  {
                     id: extId,
-                    amount: info.amount,
-                    currency: info.currency,
-                    status: 'paid',
-                    payload: info.paymentId,
+                    priceAmount: info.amount.toFixed(2),
+                    priceCurrency: info.currency,
+                    status: 'PAID',
+                    clientInvoiceId: info.paymentId,
                   },
-                },
+                ],
               };
             }
           }
@@ -2519,9 +2613,9 @@ async function runFullAuditTestSuite(): Promise<void> {
       const gateway = new PaymentProviderGateway(transport, mockCreds);
       const service = new BalanceService(gateway);
 
-      // Создаём 3 счёта по 100 единиц у каждого из 3 провайдеров:
-      // CryptoBot (3% -> +97), Lolzteam (5% -> +95), xRocket (2% -> +98). Итого должно быть 97 + 95 + 98 = 290.
-      const [tCrypto, tLzt, tXRocket] = await Promise.all([
+      // Создаём 3 счёта по 100 единиц:
+      // CryptoBot #1 (3% -> +97), CryptoBot #2 (3% -> +97), xRocket (2% -> +98). Итого: 97 + 97 + 98 = 292.
+      const [tCrypto1, tCrypto2, tXRocket] = await Promise.all([
         service.createTopUp({
           telegramId: buyer1.id,
           provider: 'cryptobot',
@@ -2530,9 +2624,9 @@ async function runFullAuditTestSuite(): Promise<void> {
         }),
         service.createTopUp({
           telegramId: buyer1.id,
-          provider: 'lolzteam',
+          provider: 'cryptobot',
           amountPaid: 100,
-          currency: 'RUB',
+          currency: 'USDT',
         }),
         service.createTopUp({
           telegramId: buyer1.id,
@@ -2544,8 +2638,8 @@ async function runFullAuditTestSuite(): Promise<void> {
 
       // Одновременно подтверждаем все 3 пополнения
       const settled = await Promise.all([
-        service.verifyAndProcessTopUp(tCrypto.paymentId),
-        service.verifyAndProcessTopUp(tLzt.paymentId),
+        service.verifyAndProcessTopUp(tCrypto1.paymentId),
+        service.verifyAndProcessTopUp(tCrypto2.paymentId),
         service.verifyAndProcessTopUp(tXRocket.paymentId),
       ]);
 
@@ -2553,11 +2647,11 @@ async function runFullAuditTestSuite(): Promise<void> {
       const finalBalance = await service.getBalance(buyer1.id);
       assert.equal(
         finalBalance,
-        290,
-        'Сумма параллельных зачислений (97 + 95 + 98) должна составить ровно 290 ⭐ без потери обновлений',
+        292,
+        'Сумма параллельных зачислений (97 + 97 + 98) должна составить ровно 292 ⭐ без потери обновлений',
       );
 
-      return 'Три параллельных пополнения через CryptoBot (+97), Lolzteam (+95) и xRocket (+98) атомарно зачислены: итоговый баланс 290 ⭐.';
+      return 'Три параллельных пополнения через CryptoBot (+97, +97) и xRocket (+98) атомарно зачислены: итоговый баланс 292 ⭐.';
     },
   );
 
@@ -2566,7 +2660,7 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Payments',
     'Защита от двойного списания внутреннего баланса при параллельной оплате заказа',
     async () => {
-      // На балансе buyer1 сейчас 290 ⭐ после теста B-08.
+      // На балансе buyer1 сейчас 292 ⭐ после теста B-08.
       // Покупаем товар stars_pack_250 (цена 50 ⭐) двумя параллельными запросами с одним orderId.
       const service = new BalanceService();
       const sharedOrderId = 'ord_bal_concurrent_b09';
@@ -2597,8 +2691,8 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(dupCalls.length, 1, 'Второй параллельный вызов должен вернуть duplicate=true');
       assert.equal(
         await service.getBalance(buyer1.id),
-        240,
-        'С баланса 290 ⭐ должно списаться ровно 50 ⭐ один раз (остаток 240 ⭐)',
+        242,
+        'С баланса 292 ⭐ должно списаться ровно 50 ⭐ один раз (остаток 242 ⭐)',
       );
 
       const userProfile = await UserService.getUserByTelegramId(buyer1.id);
@@ -2608,7 +2702,7 @@ async function runFullAuditTestSuite(): Promise<void> {
         'Оплата с внутреннего баланса НЕ должна смешиваться с реальными платежами Telegram Stars (totalSpentStars = 0)',
       );
 
-      return 'При параллельной оплате одного заказа баланс списан ровно 1 раз (290 -> 240 ⭐), повторный запрос вернул duplicate=true.';
+      return 'При параллельной оплате одного заказа баланс списан ровно 1 раз (292 -> 242 ⭐), повторный запрос вернул duplicate=true.';
     },
   );
 
@@ -2651,9 +2745,9 @@ async function runFullAuditTestSuite(): Promise<void> {
     'Безопасный возврат заказа на внутренний баланс (refundOrderToInternalBalance) и защита от повторного возврата',
     async () => {
       const service = new BalanceService();
-      // У buyer1 баланс 240 ⭐, заказ ord_bal_concurrent_b09 на 50 ⭐ оплачен с внутреннего баланса
+      // У buyer1 баланс 242 ⭐, заказ ord_bal_concurrent_b09 на 50 ⭐ оплачен с внутреннего баланса
       const balanceBefore = await service.getBalance(buyer1.id);
-      assert.equal(balanceBefore, 240);
+      assert.equal(balanceBefore, 242);
 
       const [ref1, ref2] = await Promise.all([
         service.refundOrderToInternalBalance({
@@ -2677,8 +2771,8 @@ async function runFullAuditTestSuite(): Promise<void> {
       const balanceAfter = await service.getBalance(buyer1.id);
       assert.equal(
         balanceAfter,
-        290,
-        'После возврата заказа на 50 ⭐ внутренний баланс должен восстановиться с 240 до 290 ⭐ ровно 1 раз',
+        292,
+        'После возврата заказа на 50 ⭐ внутренний баланс должен восстановиться с 242 до 292 ⭐ ровно 1 раз',
       );
 
       const refundedOrder = await OrderService.getOrderById(
@@ -2688,7 +2782,442 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(refundedOrder?.fulfillmentStatus, 'refunded');
       assert.equal(refundedOrder?.balanceRefunded, true);
 
-      return 'Возврат заказа на внутренний баланс выполнен атомарно (240 -> 290 ⭐), повторный вызов идемпотентно заблокирован.';
+      return 'Возврат заказа на внутренний баланс выполнен атомарно (242 -> 292 ⭐), повторный вызов идемпотентно заблокирован.';
+    },
+  );
+
+  // ===========================================================================
+  // 8. STAGE 3.3: ADMIN-ONLY KEY GENERATOR & AUTOMATIC DIGITAL KEY FULFILLMENT (K-01..K-08)
+  // ===========================================================================
+  const ownerTelegramId = 999000999;
+  const nonOwnerAdminTelegramId = 777000111;
+  process.env.OWNER_TELEGRAM_ID = String(ownerTelegramId);
+
+  await runTest(
+    'K-01',
+    'Security',
+    'Обычный пользователь (покупатель) не может открыть или использовать генератор и склад ключей',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      let deniedReply = '';
+      const buyerCtx = {
+        from: { id: buyer1.id, first_name: 'Buyer' },
+        reply: async (text: string) => {
+          deniedReply = text;
+        },
+      } as unknown as Context;
+
+      const allowed = await ensureOwner(buyerCtx);
+      assert.equal(allowed, false);
+      assert.ok(deniedReply.includes('OWNER_TELEGRAM_ID'));
+
+      await assert.rejects(
+        async () => {
+          await DigitalKeyService.addKeys({
+            actorTelegramId: buyer1.id,
+            productId: 'gift_star_box',
+            keys: ['GIFT-BUYER-UNAUTHORIZED-01'],
+          });
+        },
+        (err) => err instanceof OwnerAccessDeniedError,
+      );
+
+      await assert.rejects(
+        async () => {
+          await DigitalKeyService.generateKeys({
+            actorTelegramId: buyer1.id,
+            productId: 'gift_star_box',
+            count: 1,
+          });
+        },
+        (err) => err instanceof OwnerAccessDeniedError,
+      );
+
+      return 'Доступ обычного пользователя к ensureOwner, addKeys и generateKeys заблокирован на сервере (OwnerAccessDeniedError).';
+    },
+  );
+
+  await runTest(
+    'K-02',
+    'Security',
+    'Другой администратор из ADMIN_IDS (не являющийся OWNER_TELEGRAM_ID) не имеет доступа к генератору и складу ключей',
+    async () => {
+      // nonOwnerAdminTelegramId (777000111) входит в ADMIN_IDS, но НЕ равен OWNER_TELEGRAM_ID (999000999)
+      const isRegularAdmin = await UserService.isAdmin(nonOwnerAdminTelegramId);
+      assert.equal(isRegularAdmin, true);
+
+      let callbackAlert = '';
+      const adminCtx = {
+        from: { id: nonOwnerAdminTelegramId, first_name: 'RegularAdmin' },
+        callbackQuery: { id: 'cb_non_owner_1', data: 'own:keys:home' },
+        answerCbQuery: async (text: string) => {
+          callbackAlert = text;
+        },
+      } as unknown as Context;
+
+      const allowed = await ensureOwner(adminCtx);
+      assert.equal(allowed, false);
+      assert.ok(callbackAlert.includes('OWNER_TELEGRAM_ID'));
+
+      const nonOwnerAdminKb = JSON.stringify(buildAdminMainKeyboard(false));
+      const ownerAdminKb = JSON.stringify(buildAdminMainKeyboard(true));
+      assert.equal(nonOwnerAdminKb.includes('own:keys:home'), false);
+      assert.equal(ownerAdminKb.includes('own:keys:home'), true);
+
+      await assert.rejects(
+        async () => {
+          await DigitalKeyService.getProductStockSummary({
+            actorTelegramId: nonOwnerAdminTelegramId,
+            productId: 'gift_star_box',
+          });
+        },
+        (err) => err instanceof OwnerAccessDeniedError,
+      );
+
+      return 'Обычный администратор из ADMIN_IDS (777000111) отклонён при попытке вызова ensureOwner и DigitalKeyService (OwnerAccessDeniedError).';
+    },
+  );
+
+  await runTest(
+    'K-03',
+    'Fulfillment',
+    'Владелец бота (OWNER_TELEGRAM_ID) может добавлять ключи вручную, генерировать ключи по алгоритму и отключать ключи',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      // 1. Ручное добавление 2 ключей владельцем
+      const manualKeys = await DigitalKeyService.addKeys({
+        actorTelegramId: ownerTelegramId,
+        productId: 'stars_pack_50',
+        keys: ['STARS50-MANUAL-KEY-0001', 'STARS50-MANUAL-KEY-0002'],
+      });
+      assert.equal(manualKeys.length, 2);
+      assert.equal(manualKeys[0].status, 'available');
+
+      // 2. Генерация 3 ключей для товара с заданным алгоритмом (gift_star_box -> gift_voucher_v1)
+      const generatedKeys = await DigitalKeyService.generateKeys({
+        actorTelegramId: ownerTelegramId,
+        productId: 'gift_star_box',
+        count: 3,
+      });
+      assert.equal(generatedKeys.length, 3);
+      for (const gk of generatedKeys) {
+        assert.match(
+          gk.keyValue,
+          /^STARS-GIFT-GIFT-[A-F0-9]{6}-[A-F0-9]{6}-[A-F0-9]{4}-[A-F0-9]{4}$/,
+        );
+        assert.equal(gk.status, 'available');
+      }
+
+      // 3. Попытка автогенерации для товара без внутреннего алгоритма (stars_pack_50) должна отклоняться
+      await assert.rejects(
+        async () => {
+          await DigitalKeyService.generateKeys({
+            actorTelegramId: ownerTelegramId,
+            productId: 'stars_pack_50',
+            count: 1,
+          });
+        },
+        (err) => err instanceof UnsupportedKeyGeneratorError,
+      );
+
+      // 4. Отключение одного неиспользованного ключа владельцем
+      const disabled = await DigitalKeyService.disableKey({
+        actorTelegramId: ownerTelegramId,
+        keyId: manualKeys[1].keyId,
+      });
+      assert.equal(disabled.status, 'disabled');
+
+      const summary = await DigitalKeyService.getProductStockSummary({
+        actorTelegramId: ownerTelegramId,
+        productId: 'stars_pack_50',
+      });
+      assert.equal(summary.available, 1);
+      assert.equal(summary.disabled, 1);
+
+      return 'Владелец успешно добавил ключи вручную, сгенерировал 3 ключа по алгоритму gift_voucher_v1, отключил 1 ключ; генерация без алгоритма запрещена.';
+    },
+  );
+
+  await runTest(
+    'K-04',
+    'Security',
+    'Дубликаты ключей отклоняются как внутри одной пачки, так и при повторной загрузке существующего ключа',
+    async () => {
+      // Попытка загрузить дубликат уже существующего на складе ключа STARS50-MANUAL-KEY-0001
+      await assert.rejects(
+        async () => {
+          await DigitalKeyService.addKeys({
+            actorTelegramId: ownerTelegramId,
+            productId: 'stars_pack_50',
+            keys: ['STARS50-MANUAL-KEY-0001'],
+          });
+        },
+        (err) => err instanceof DuplicateDigitalKeyError,
+      );
+
+      // Попытка загрузить пачку с одинаковыми ключами внутри одного запроса
+      await assert.rejects(
+        async () => {
+          await DigitalKeyService.addKeys({
+            actorTelegramId: ownerTelegramId,
+            productId: 'stars_pack_50',
+            keys: ['UNIQUE-BATCH-KEY-99', 'unique-batch-key-99'],
+          });
+        },
+        (err) => err instanceof DuplicateDigitalKeyError,
+      );
+
+      return 'Повторная загрузка существующего ключа и дубликаты внутри одной пачки отклонены с DuplicateDigitalKeyError.';
+    },
+  );
+
+  await runTest(
+    'K-05',
+    'Database',
+    'Два одновременных заказа на один и тот же товар гарантированно получают разные ключи (отсутствие двойной выдачи)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      await DigitalKeyService.addKeys({
+        actorTelegramId: ownerTelegramId,
+        productId: 'gift_star_box',
+        keys: ['GIFT-CONC-UNIQUE-KEY-A', 'GIFT-CONC-UNIQUE-KEY-B'],
+      });
+
+      const orderA = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'gift_star_box',
+        quantity: 1,
+      });
+      const orderB = await OrderService.createOrder({
+        telegramUser: buyer2,
+        productId: 'gift_star_box',
+        quantity: 1,
+      });
+
+      const paidA = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        currency: 'XTR',
+        totalAmount: orderA.totalPrice,
+        invoicePayload: orderA.orderId,
+        telegramPaymentChargeId: 'chg_key_conc_a',
+        providerPaymentChargeId: 'prov_key_conc_a',
+      });
+      const paidB = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer2.id,
+        currency: 'XTR',
+        totalAmount: orderB.totalPrice,
+        invoicePayload: orderB.orderId,
+        telegramPaymentChargeId: 'chg_key_conc_b',
+        providerPaymentChargeId: 'prov_key_conc_b',
+      });
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      // Запускаем выдачу обоих заказов одновременно
+      const [resA, resB] = await Promise.all([
+        FulfillmentService.initiateFulfillment(paidA.order, mockBot),
+        FulfillmentService.initiateFulfillment(paidB.order, mockBot),
+      ]);
+
+      assert.equal(resA.fulfillmentStatus, 'completed');
+      assert.equal(resB.fulfillmentStatus, 'completed');
+      assert.equal(resA.deliveredKeyValues?.length, 1);
+      assert.equal(resB.deliveredKeyValues?.length, 1);
+      assert.notEqual(
+        resA.deliveredKeyValues?.[0],
+        resB.deliveredKeyValues?.[0],
+        'Два параллельных заказа не должны получить один и тот же цифровой ключ',
+      );
+      assert.notEqual(resA.assignedKeyIds?.[0], resB.assignedKeyIds?.[0]);
+
+      const stock = await DigitalKeyService.getProductStockSummary({
+        actorTelegramId: ownerTelegramId,
+        productId: 'gift_star_box',
+      });
+      assert.equal(stock.available, 0);
+      assert.equal(stock.delivered, 2);
+
+      return `Два параллельных заказа атомарно получили разные ключи (${resA.deliveredKeyValues?.[0]} и ${resB.deliveredKeyValues?.[0]}), остаток на складе: 0.`;
+    },
+  );
+
+  await runTest(
+    'K-06',
+    'Fulfillment',
+    'Повторный webhook или повторный вызов выдачи для того же заказа идемпотентен и не выдаёт второй ключ',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      await DigitalKeyService.addKeys({
+        actorTelegramId: ownerTelegramId,
+        productId: 'gift_star_box',
+        keys: ['GIFT-IDEMPOTENT-KEY-1', 'GIFT-IDEMPOTENT-KEY-2'],
+      });
+
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'gift_star_box',
+        quantity: 1,
+      });
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        invoicePayload: order.orderId,
+        telegramPaymentChargeId: 'chg_key_idem_1',
+        providerPaymentChargeId: 'prov_key_idem_1',
+      });
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      // Первый вызов выдачи
+      const firstFulfill = await FulfillmentService.initiateFulfillment(
+        paid.order,
+        mockBot,
+      );
+      // Повторный вызов (например, дубликат webhook или повторный запуск воркера)
+      const secondFulfill = await DigitalKeyService.fulfillOrderWithDigitalKey(
+        paid.order,
+        mockBot,
+      );
+
+      assert.equal(firstFulfill.fulfillmentStatus, 'completed');
+      assert.equal(secondFulfill.duplicate, true);
+      assert.deepEqual(
+        firstFulfill.assignedKeyIds,
+        secondFulfill.order.assignedKeyIds,
+      );
+      assert.deepEqual(
+        firstFulfill.deliveredKeyValues,
+        secondFulfill.order.deliveredKeyValues,
+      );
+
+      // Второй ключ на складе должен остаться нетронутым (available: 1, delivered: 1)
+      const stock = await DigitalKeyService.getProductStockSummary({
+        actorTelegramId: ownerTelegramId,
+        productId: 'gift_star_box',
+      });
+      assert.equal(stock.available, 1);
+      assert.equal(stock.delivered, 1);
+
+      return 'Повторный вызов выдачи вернул duplicate=true с тем же ключом; второй ключ на складе остался доступным.';
+    },
+  );
+
+  await runTest(
+    'K-07',
+    'Fulfillment',
+    'Оплаченный заказ без доступных ключей НЕ помечается как выданный (остаётся processing + awaitingKeyStock=true) и уведомляет владельца',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      // Склад пуст (0 ключей для gift_star_box)
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'gift_star_box',
+        quantity: 1,
+      });
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        invoicePayload: order.orderId,
+        telegramPaymentChargeId: 'chg_key_empty_stock',
+        providerPaymentChargeId: 'prov_key_empty_stock',
+      });
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      const res = await DigitalKeyService.fulfillOrderWithDigitalKey(
+        paid.order,
+        mockBot,
+      );
+
+      assert.equal(res.fulfilled, false);
+      assert.equal(res.awaitingStock, true);
+      assert.notEqual(
+        res.order.fulfillmentStatus,
+        'completed',
+        'Заказ без доступных ключей НЕ должен помечаться как completed',
+      );
+      assert.equal(res.order.fulfillmentStatus, 'processing');
+      assert.equal(res.order.awaitingKeyStock, true);
+
+      // Проверяем, что владельцу (OWNER_TELEGRAM_ID = 999000999) отправлено уведомление о нехватке ключей
+      const ownerNotice = sentMessages.find(
+        (m) => Number(m.chatId) === ownerTelegramId,
+      );
+      assert.ok(
+        ownerNotice &&
+          ownerNotice.text.includes('НЕХВАТКА ЦИФРОВЫХ КЛЮЧЕЙ НА СКЛАДЕ'),
+        'Владельцу должно быть отправлено уведомление о нехватке ключей на складе',
+      );
+
+      return 'Оплаченный заказ при пустом складе переведён в статус processing (awaitingKeyStock=true, НЕ completed), владельцу отправлено уведомление.';
+    },
+  );
+
+  await runTest(
+    'K-08',
+    'Fulfillment',
+    'Ошибка отправки сообщения Telegram не приводит к потере выданного ключа (ключ остаётся привязанным к заказу в БД)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      await DigitalKeyService.addKeys({
+        actorTelegramId: ownerTelegramId,
+        productId: 'gift_star_box',
+        keys: ['GIFT-RESILIENT-KEY-777'],
+      });
+
+      const order = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'gift_star_box',
+        quantity: 1,
+      });
+      const paid = await PaymentService.processSuccessfulPayment({
+        telegramUserId: buyer1.id,
+        currency: 'XTR',
+        totalAmount: order.totalPrice,
+        invoicePayload: order.orderId,
+        telegramPaymentChargeId: 'chg_key_tg_fail_1',
+        providerPaymentChargeId: 'prov_key_tg_fail_1',
+      });
+
+      // Имитируем падение Telegram API (502 Bad Gateway) при отправке сообщения покупателю
+      const failingBot = createMockBot([], true);
+
+      const fulfilled = await FulfillmentService.initiateFulfillment(
+        paid.order,
+        failingBot,
+      );
+
+      assert.equal(fulfilled.fulfillmentStatus, 'completed');
+      assert.deepEqual(fulfilled.deliveredKeyValues, ['GIFT-RESILIENT-KEY-777']);
+      assert.equal(fulfilled.assignedKeyIds?.length, 1);
+
+      // Проверяем, что в БД заказ и ключ надёжно связаны и покупатель видит свой ключ в деталях заказа
+      const savedOrder = await OrderService.getOrderById(order.orderId);
+      assert.deepEqual(savedOrder?.deliveredKeyValues, [
+        'GIFT-RESILIENT-KEY-777',
+      ]);
+
+      const deliveredKeys = await DigitalKeyService.listKeysForProduct({
+        actorTelegramId: ownerTelegramId,
+        productId: 'gift_star_box',
+        status: 'delivered',
+      });
+      assert.equal(deliveredKeys.length, 1);
+      assert.equal(deliveredKeys[0].deliveredOrderId, order.orderId);
+      assert.equal(deliveredKeys[0].deliveredUserTelegramId, buyer1.id);
+
+      return 'При сбое Telegram API (502) выданный ключ GIFT-RESILIENT-KEY-777 сохранён в заказе и имеет статус delivered с привязкой к orderId.';
     },
   );
 

@@ -24,6 +24,7 @@ import {
   StoreSettings,
   OperationType,
   BalanceTopUpRecord,
+  DigitalKeyRecord,
 } from '../types.ts';
 import { handleFirestoreError, testConnection } from './firestoreErrorHandler.ts';
 
@@ -36,7 +37,10 @@ export type CollectionName =
   | 'admins'
   | 'settings';
 
-export type StoreCollectionName = CollectionName | 'balance_topups';
+export type StoreCollectionName =
+  | CollectionName
+  | 'balance_topups'
+  | 'digital_keys';
 
 export interface QueryWhereFilter {
   field: string;
@@ -80,6 +84,7 @@ interface LocalDatabaseState {
   orders: Record<string, Order>;
   payments: Record<string, PaymentRecord>;
   balance_topups: Record<string, BalanceTopUpRecord>;
+  digital_keys: Record<string, DigitalKeyRecord>;
   transactions: Record<string, StoreTransaction>;
   admins: Record<string, AdminRecord>;
   settings: Record<string, StoreSettings>;
@@ -168,6 +173,7 @@ export function sanitizeDocId(rawId: string): string {
 function getDocumentPrimaryKey(doc: Record<string, unknown>): string {
   return String(
     doc.orderId ??
+      doc.keyId ??
       doc.id ??
       doc.userId ??
       doc.paymentId ??
@@ -327,6 +333,7 @@ export class FirestoreRepository {
       orders: {},
       payments: {},
       balance_topups: {},
+      digital_keys: {},
       transactions: {},
       admins: {},
       settings: {},
@@ -538,6 +545,7 @@ export class FirestoreRepository {
           orders: parsed.orders || {},
           payments: parsed.payments || {},
           balance_topups: parsed.balance_topups || {},
+          digital_keys: parsed.digital_keys || {},
           transactions: parsed.transactions || {},
           admins: parsed.admins || {},
           settings: parsed.settings || {},

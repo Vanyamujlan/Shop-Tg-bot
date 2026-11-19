@@ -76,6 +76,7 @@ export const INITIAL_TEST_PRODUCTS: Omit<Product, 'createdAt' | 'updatedAt'>[] =
     imageUrl: '',
     isActive: true,
     fulfillmentType: 'manual',
+    keyGeneratorAlgorithm: 'gift_voucher_v1',
   },
   {
     id: 'gift_crystal_rose',

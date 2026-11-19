@@ -64,6 +64,7 @@ export interface AppConfig {
   webhookUrl: string;
   webhookSecret: string;
   adminIds: number[];
+  ownerTelegramId: number | null;
   storeSupportUsername: string;
   firebaseProjectId: string;
   firebaseDatabaseId: string;
@@ -72,10 +73,6 @@ export interface AppConfig {
   appletFirebaseConfig: AppletFirebaseConfig;
   cryptobotApiToken: string;
   cryptobotApiUrl: string;
-  lolzteamApiToken: string;
-  lolzteamMerchantId: string;
-  lolzteamWebhookSecret: string;
-  lolzteamApiUrl: string;
   xrocketApiKey: string;
   xrocketApiUrl: string;
 }
@@ -87,6 +84,13 @@ function parseAdminIds(raw: string | undefined): number[] {
     .split(',')
     .map((item) => Number(item.replace(/^ADMIN_IDS\s*=\s*/i, '').trim()))
     .filter((id) => Number.isInteger(id) && id > 0);
+}
+
+function parseOwnerTelegramId(raw: string | undefined): number | null {
+  const cleaned = cleanEnvValue('OWNER_TELEGRAM_ID', raw);
+  if (!cleaned) return null;
+  const num = Number(cleaned.replace(/^OWNER_TELEGRAM_ID\s*=\s*/i, '').trim());
+  return Number.isInteger(num) && num > 0 ? num : null;
 }
 
 function normalizePrivateKey(raw: string | undefined): string {
@@ -162,6 +166,17 @@ export function getEnvConfig(): AppConfig {
     appletConfig.projectId,
   );
 
+  const ownerTelegramId = parseOwnerTelegramId(process.env.OWNER_TELEGRAM_ID);
+  const parsedAdmins = parseAdminIds(process.env.ADMIN_IDS);
+  const adminIds =
+    ownerTelegramId && !parsedAdmins.includes(ownerTelegramId)
+      ? [ownerTelegramId, ...parsedAdmins]
+      : parsedAdmins;
+
+  const xrocketToken =
+    cleanEnvValue('XROCKET_API_KEY', process.env.XROCKET_API_KEY) ||
+    cleanEnvValue('XROCKET_API_TOKEN', process.env.XROCKET_API_TOKEN);
+
   return {
     port: Number(process.env.PORT || 3000),
     nodeEnv,
@@ -173,7 +188,8 @@ export function getEnvConfig(): AppConfig {
     botMode,
     webhookUrl: cleanEnvValue('WEBHOOK_URL', process.env.WEBHOOK_URL),
     webhookSecret: cleanEnvValue('WEBHOOK_SECRET', process.env.WEBHOOK_SECRET),
-    adminIds: parseAdminIds(process.env.ADMIN_IDS),
+    adminIds,
+    ownerTelegramId,
     storeSupportUsername,
     firebaseProjectId,
     firebaseDatabaseId: appletConfig.firestoreDatabaseId || '(default)',
@@ -187,28 +203,10 @@ export function getEnvConfig(): AppConfig {
     cryptobotApiUrl:
       cleanEnvValue('CRYPTOBOT_API_URL', process.env.CRYPTOBOT_API_URL) ||
       'https://pay.crypt.bot/api',
-    lolzteamApiToken: cleanEnvValue(
-      'LOLZTEAM_API_TOKEN',
-      process.env.LOLZTEAM_API_TOKEN,
-    ),
-    lolzteamMerchantId: cleanEnvValue(
-      'LOLZTEAM_MERCHANT_ID',
-      process.env.LOLZTEAM_MERCHANT_ID,
-    ),
-    lolzteamWebhookSecret: cleanEnvValue(
-      'LOLZTEAM_WEBHOOK_SECRET',
-      process.env.LOLZTEAM_WEBHOOK_SECRET,
-    ),
-    lolzteamApiUrl:
-      cleanEnvValue('LOLZTEAM_API_URL', process.env.LOLZTEAM_API_URL) ||
-      'https://prod-api.lzt.market',
-    xrocketApiKey: cleanEnvValue(
-      'XROCKET_API_KEY',
-      process.env.XROCKET_API_KEY,
-    ),
+    xrocketApiKey: xrocketToken,
     xrocketApiUrl:
       cleanEnvValue('XROCKET_API_URL', process.env.XROCKET_API_URL) ||
-      'https://pay.xrocket.tg',
+      'https://pay.api.xrocket.exchange',
   };
 }
 
@@ -217,3 +215,19 @@ export function isAdminTelegramId(telegramId: number | undefined): boolean {
   const config = getEnvConfig();
   return config.adminIds.includes(telegramId);
 }
+
+/**
+ * Checks whether the given Telegram ID strictly matches OWNER_TELEGRAM_ID.
+ * Regular admins in ADMIN_IDS who are not OWNER_TELEGRAM_ID return false.
+ */
+export function isOwnerTelegramId(telegramId: number | undefined): boolean {
+  if (!telegramId || !Number.isInteger(telegramId) || telegramId <= 0) {
+    return false;
+  }
+  const config = getEnvConfig();
+  if (!config.ownerTelegramId) {
+    return false;
+  }
+  return config.ownerTelegramId === telegramId;
+}
+

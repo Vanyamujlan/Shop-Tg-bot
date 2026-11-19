@@ -40,8 +40,6 @@ async function bootstrap(): Promise<void> {
         latest.webhookSecret,
         latest.firebasePrivateKey,
         latest.cryptobotApiToken,
-        latest.lolzteamApiToken,
-        latest.lolzteamWebhookSecret,
         latest.xrocketApiKey,
       ]),
     );
@@ -57,8 +55,6 @@ async function bootstrap(): Promise<void> {
         latest.webhookSecret,
         latest.firebasePrivateKey,
         latest.cryptobotApiToken,
-        latest.lolzteamApiToken,
-        latest.lolzteamWebhookSecret,
         latest.xrocketApiKey,
       ]),
     );
@@ -91,8 +87,6 @@ async function bootstrap(): Promise<void> {
           latest.telegramBotToken,
           latest.webhookSecret,
           latest.cryptobotApiToken,
-          latest.lolzteamApiToken,
-          latest.lolzteamWebhookSecret,
           latest.xrocketApiKey,
         ]),
       );
@@ -105,7 +99,7 @@ async function bootstrap(): Promise<void> {
     await botManager.handleWebhookRequest(req, res);
   });
 
-  // 4b. Payment Provider Webhook endpoints (CryptoBot, Lolzteam, xRocket)
+  // 4b. Payment Provider Webhook endpoints (CryptoBot, xRocket)
   const handleProviderWebhook = async (
     provider: BalanceTopUpProvider,
     req: RawBodyRequest,
@@ -176,8 +170,6 @@ async function bootstrap(): Promise<void> {
         `[Webhook:${provider}] Ошибка обработки webhook:`,
         maskSecretsInText(raw, [
           latest.cryptobotApiToken,
-          latest.lolzteamApiToken,
-          latest.lolzteamWebhookSecret,
           latest.xrocketApiKey,
         ]),
       );
@@ -187,10 +179,6 @@ async function bootstrap(): Promise<void> {
 
   app.post('/webhook/cryptobot', async (req: RawBodyRequest, res: Response) => {
     await handleProviderWebhook('cryptobot', req, res);
-  });
-
-  app.post('/webhook/lolzteam', async (req: RawBodyRequest, res: Response) => {
-    await handleProviderWebhook('lolzteam', req, res);
   });
 
   app.post('/webhook/xrocket', async (req: RawBodyRequest, res: Response) => {
@@ -218,10 +206,6 @@ async function bootstrap(): Promise<void> {
         cryptobot: {
           configured: providerDiag.cryptobot.configured,
           feePercent: providerDiag.cryptobot.feePercent,
-        },
-        lolzteam: {
-          configured: providerDiag.lolzteam.configured,
-          feePercent: providerDiag.lolzteam.feePercent,
         },
         xrocket: {
           configured: providerDiag.xrocket.configured,
@@ -253,7 +237,7 @@ async function bootstrap(): Promise<void> {
         `База данных Firestore: проект ${dbStatus.projectId} (${dbStatus.databaseId})`,
         `Статус хранилища: ${dbStatus.degradedMode ? 'АВАРИЙНЫЙ РЕЖИМ (НЕДОСТУПНО)' : ' АКТИВНО'}`,
         `Проверка здоровья (JSON): /health`,
-        `Webhook endpoints: POST /webhook/telegram, /webhook/cryptobot, /webhook/lolzteam, /webhook/xrocket`,
+        `Webhook endpoints: POST /webhook/telegram, /webhook/cryptobot, /webhook/xrocket`,
       ].join('\n'),
     );
   });

@@ -1,11 +1,68 @@
 import crypto from 'crypto';
 import { getEnvConfig } from '../config/env.ts';
-import { BalanceTopUpProvider, BalanceTopUpStatus } from '../types.ts';
+import {
+  BalanceTopUpProvider,
+  BalanceTopUpStatus,
+  XRocketErrorProblemDetails,
+} from '../types.ts';
+
+export interface XRocketAssetOption {
+  code: string;
+  label: string;
+  networks: string[];
+  defaultNetwork: string;
+}
+
+export const XROCKET_SUPPORTED_ASSETS: XRocketAssetOption[] = [
+  {
+    code: 'USDT',
+    label: 'USDT',
+    networks: ['TON', 'TRC-20', 'BEP-20', 'ERC-20'],
+    defaultNetwork: 'TON',
+  },
+  {
+    code: 'TON',
+    label: 'TON',
+    networks: ['TON'],
+    defaultNetwork: 'TON',
+  },
+  {
+    code: 'BTC',
+    label: 'BTC',
+    networks: ['Bitcoin'],
+    defaultNetwork: 'Bitcoin',
+  },
+  {
+    code: 'ETH',
+    label: 'ETH',
+    networks: ['ERC-20'],
+    defaultNetwork: 'ERC-20',
+  },
+  {
+    code: 'TRX',
+    label: 'TRX',
+    networks: ['TRC-20'],
+    defaultNetwork: 'TRC-20',
+  },
+  {
+    code: 'BNB',
+    label: 'BNB',
+    networks: ['BEP-20'],
+    defaultNetwork: 'BEP-20',
+  },
+  {
+    code: 'USDC',
+    label: 'USDC',
+    networks: ['ERC-20', 'BEP-20'],
+    defaultNetwork: 'ERC-20',
+  },
+];
 
 export interface ProviderMetadata {
   id: BalanceTopUpProvider;
   title: string;
   shortTitle: string;
+  buttonLabel: string;
   feePercent: number;
   defaultCurrency: string;
   supportedCurrencies: string[];
@@ -23,9 +80,10 @@ export const PAYMENT_PROVIDER_CATALOG: Record<BalanceTopUpProvider, ProviderMeta
     id: 'cryptobot',
     title: 'CryptoBot (@CryptoBot)',
     shortTitle: 'CryptoBot',
+    buttonLabel: '💎 CryptoBot [3%]',
     feePercent: 3,
-    defaultCurrency: 'RUB',
-    supportedCurrencies: ['RUB', 'USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC', 'LTC'],
+    defaultCurrency: 'USDT',
+    supportedCurrencies: ['USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC', 'LTC', 'RUB'],
     supportedNetworks: [
       'TON (The Open Network)',
       'TRC-20 (TRON)',
@@ -34,50 +92,36 @@ export const PAYMENT_PROVIDER_CATALOG: Record<BalanceTopUpProvider, ProviderMeta
       'Bitcoin Network',
       'Litecoin Network',
     ],
-    minAmount: 10,
+    minAmount: 1,
     maxAmount: 500000,
     presetAmounts: [100, 250, 500, 1000, 2500, 5000],
     apiBaseUrl: 'https://pay.crypt.bot/api',
     officialDocsUrl: 'https://help.send.tg/en/articles/10279948-crypto-pay-api',
     description:
-      'Оплата криптовалютой (USDT, TON, BTC, ETH, TRX, BNB, USDC, LTC) через официальный Telegram-сервис @CryptoBot (с поддержкой автоконвертации из RUB).',
-  },
-  lolzteam: {
-    id: 'lolzteam',
-    title: 'Lolzteam Market (LZT)',
-    shortTitle: 'Lolzteam',
-    feePercent: 5,
-    defaultCurrency: 'RUB',
-    supportedCurrencies: ['RUB'],
-    supportedNetworks: ['Lolzteam Market Balance / СБП / Карты / Криптовалюта через LZT'],
-    minAmount: 10,
-    maxAmount: 500000,
-    presetAmounts: [100, 250, 500, 1000, 2500, 5000],
-    apiBaseUrl: 'https://prod-api.lzt.market',
-    officialDocsUrl: 'https://lzt-market.readme.io/reference/invoicecreate',
-    description: 'Пополнение через официальный инвойс Lolzteam Market API (POST /invoice).',
+      'Оплата через официальный сервис @CryptoBot (комиссия магазина 3%).',
   },
   xrocket: {
     id: 'xrocket',
     title: 'xRocket Pay (@xrocket)',
     shortTitle: 'xRocket',
+    buttonLabel: '🚀 xRocket [2%]',
     feePercent: 2,
     defaultCurrency: 'USDT',
     supportedCurrencies: ['USDT', 'TON', 'TONCOIN', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC'],
     supportedNetworks: [
-      'TON (The Open Network)',
-      'TRC-20 (TRON)',
-      'ERC-20 (Ethereum)',
-      'BEP-20 (BNB Smart Chain)',
-      'Bitcoin Network',
+      'TON',
+      'TRC-20',
+      'BEP-20',
+      'ERC-20',
+      'Bitcoin',
     ],
     minAmount: 1,
     maxAmount: 500000,
     presetAmounts: [100, 250, 500, 1000, 2500, 5000],
-    apiBaseUrl: 'https://pay.xrocket.tg',
-    officialDocsUrl: 'https://pay.xrocket.tg/api',
+    apiBaseUrl: 'https://pay.api.xrocket.exchange',
+    officialDocsUrl: 'https://docs.xrocket.exchange/ru/api/pay/reference/pay-rest-api',
     description:
-      'Прямая оплата криптовалютой (USDT, TONCOIN, BTC, ETH, TRX, BNB, USDC) с минимальной комиссией 2% через @xrocket.',
+      'Оплата криптовалютой (USDT, TON, BTC, ETH, TRX, BNB, USDC) через xRocket Pay REST API v1 (комиссия магазина 2%).',
   },
 };
 
@@ -86,6 +130,7 @@ export interface CreateProviderInvoiceInput {
   provider: BalanceTopUpProvider;
   amountPaid: number;
   currency: string;
+  network?: string;
   description: string;
   expiresInSeconds?: number;
 }
@@ -137,6 +182,37 @@ export type ProviderHttpTransport = (
   req: HttpTransportRequest,
 ) => Promise<HttpTransportResponse>;
 
+export class XRocketApiError extends Error {
+  public readonly httpStatus: number;
+  public readonly problemDetails: XRocketErrorProblemDetails;
+
+  constructor(
+    message: string,
+    httpStatus: number,
+    problemDetails: XRocketErrorProblemDetails = {},
+  ) {
+    super(message);
+    this.name = 'XRocketApiError';
+    this.httpStatus = httpStatus;
+    this.problemDetails = problemDetails;
+  }
+}
+
+/**
+ * Builds a canonical xRocket Pay REST API v1 URL without ever duplicating `/api/v1`.
+ * Supports both Production (`https://pay.api.xrocket.exchange`) and
+ * Testnet (`https://pay.api.testnet.xrocket.exchange`), as well as base URLs that
+ * already include `/api/v1`.
+ */
+export function buildXRocketApiV1Url(baseUrl: string, endpointPath: string): string {
+  const cleanBase = (baseUrl || 'https://pay.api.xrocket.exchange')
+    .trim()
+    .replace(/\/+$/, '')
+    .replace(/\/api\/v1$/i, '');
+  const cleanPath = endpointPath.startsWith('/') ? endpointPath : `/${endpointPath}`;
+  return `${cleanBase}/api/v1${cleanPath}`;
+}
+
 /**
  * Masks API tokens and secrets so they are never exposed in logs or error messages.
  */
@@ -155,8 +231,6 @@ export function redactSecretsFromText(text: string): string {
   const cfg = getEnvConfig();
   const secrets = [
     cfg.cryptobotApiToken,
-    cfg.lolzteamApiToken,
-    cfg.lolzteamWebhookSecret,
     cfg.xrocketApiKey,
     cfg.telegramBotToken,
     cfg.webhookSecret,
@@ -206,7 +280,7 @@ export function verifyCryptoBotWebhookSignature(
 
 /**
  * Official xRocket Pay Webhook Signature Verification:
- * Secret key = SHA256(Rocket-Pay-Key) (raw 32-byte digest).
+ * Secret key = SHA256(XROCKET_API_KEY) (raw 32-byte digest).
  * Signature = HMAC-SHA256(rawBody, secretKey) in hex.
  * Header: `rocket-pay-signature`
  */
@@ -227,37 +301,6 @@ export function verifyXRocketWebhookSignature(
   if (!key || !signatureHeader) return false;
   const expected = computeXRocketWebhookSignature(rawBody, key);
   return safeTimingEqualHexOrUtf8(expected.toLowerCase(), signatureHeader.trim().toLowerCase());
-}
-
-/**
- * Official Lolzteam Market Invoice Webhook Verification:
- * Checks `x-secret-key` header against configured `LOLZTEAM_WEBHOOK_SECRET` (or `LOLZTEAM_API_TOKEN` fallback)
- * using constant-time comparison. Also supports HMAC-SHA256 hex of rawBody if signed with secret.
- */
-export function computeLolzteamWebhookSignature(
-  rawBody: string,
-  secret: string,
-): string {
-  return crypto.createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex');
-}
-
-export function verifyLolzteamWebhookSignature(
-  rawBody: string,
-  secretHeader: string | undefined,
-  configuredSecret?: string,
-): boolean {
-  const cfg = getEnvConfig();
-  const secret = (
-    configuredSecret ??
-    (cfg.lolzteamWebhookSecret || cfg.lolzteamApiToken)
-  ).trim();
-  if (!secret || !secretHeader) return false;
-  const cleanHeader = secretHeader.trim();
-  if (safeTimingEqualHexOrUtf8(secret, cleanHeader)) {
-    return true;
-  }
-  const expectedHmac = computeLolzteamWebhookSignature(rawBody, secret);
-  return safeTimingEqualHexOrUtf8(expectedHmac.toLowerCase(), cleanHeader.toLowerCase());
 }
 
 function normalizeProviderStatus(rawStatus: string | undefined): BalanceTopUpStatus {
@@ -283,6 +326,43 @@ export function normalizeCurrencyCode(currency: string): string {
   return upper;
 }
 
+function parseXRocketErrorDetails(
+  httpStatus: number,
+  rawJson: unknown,
+): { errorMessage: string; details: XRocketErrorProblemDetails } {
+  const obj =
+    rawJson && typeof rawJson === 'object'
+      ? (rawJson as Record<string, unknown>)
+      : {};
+
+  const details: XRocketErrorProblemDetails = {
+    status: typeof obj.status === 'number' ? obj.status : httpStatus,
+    type: typeof obj.type === 'string' ? obj.type : undefined,
+    title: typeof obj.title === 'string' ? obj.title : undefined,
+    detail:
+      typeof obj.detail === 'string'
+        ? obj.detail
+        : typeof obj.message === 'string'
+          ? obj.message
+          : undefined,
+    instance: typeof obj.instance === 'string' ? obj.instance : undefined,
+    kind: typeof obj.kind === 'string' ? obj.kind : undefined,
+  };
+
+  const parts: string[] = [`HTTP ${httpStatus}`];
+  if (details.title) parts.push(details.title);
+  if (details.detail && details.detail !== details.title) {
+    parts.push(details.detail);
+  }
+  if (details.kind) parts.push(`kind=${details.kind}`);
+  if (details.instance) parts.push(`instance=${details.instance}`);
+
+  const formatted = redactSecretsFromText(
+    `Ошибка xRocket Pay API (${parts.join(' | ')})`,
+  );
+  return { errorMessage: formatted, details };
+}
+
 const defaultFetchTransport: ProviderHttpTransport = async (req) => {
   const response = await fetch(req.url, {
     method: req.method,
@@ -305,10 +385,6 @@ const defaultFetchTransport: ProviderHttpTransport = async (req) => {
 export interface ProviderCredentialsOverride {
   cryptobotApiToken?: string;
   cryptobotApiUrl?: string;
-  lolzteamApiToken?: string;
-  lolzteamMerchantId?: string;
-  lolzteamWebhookSecret?: string;
-  lolzteamApiUrl?: string;
   xrocketApiKey?: string;
   xrocketApiUrl?: string;
 }
@@ -340,14 +416,6 @@ export class PaymentProviderGateway {
         this.credentialsOverride.cryptobotApiToken ?? cfg.cryptobotApiToken,
       cryptobotApiUrl:
         this.credentialsOverride.cryptobotApiUrl ?? cfg.cryptobotApiUrl,
-      lolzteamApiToken:
-        this.credentialsOverride.lolzteamApiToken ?? cfg.lolzteamApiToken,
-      lolzteamMerchantId:
-        this.credentialsOverride.lolzteamMerchantId ?? cfg.lolzteamMerchantId,
-      lolzteamWebhookSecret:
-        this.credentialsOverride.lolzteamWebhookSecret ?? cfg.lolzteamWebhookSecret,
-      lolzteamApiUrl:
-        this.credentialsOverride.lolzteamApiUrl ?? cfg.lolzteamApiUrl,
       xrocketApiKey:
         this.credentialsOverride.xrocketApiKey ?? cfg.xrocketApiKey,
       xrocketApiUrl:
@@ -359,14 +427,6 @@ export class PaymentProviderGateway {
     const creds = this.getCredentials();
     if (provider === 'cryptobot') {
       return Boolean(creds.cryptobotApiToken && creds.cryptobotApiToken.trim().length > 0);
-    }
-    if (provider === 'lolzteam') {
-      return Boolean(
-        creds.lolzteamApiToken &&
-          creds.lolzteamApiToken.trim().length > 0 &&
-          creds.lolzteamMerchantId &&
-          creds.lolzteamMerchantId.trim().length > 0,
-      );
     }
     if (provider === 'xrocket') {
       return Boolean(creds.xrocketApiKey && creds.xrocketApiKey.trim().length > 0);
@@ -384,11 +444,6 @@ export class PaymentProviderGateway {
         configured: this.isProviderConfigured('cryptobot'),
         feePercent: PAYMENT_PROVIDER_CATALOG.cryptobot.feePercent,
         maskedKey: maskSecret(creds.cryptobotApiToken),
-      },
-      lolzteam: {
-        configured: this.isProviderConfigured('lolzteam'),
-        feePercent: PAYMENT_PROVIDER_CATALOG.lolzteam.feePercent,
-        maskedKey: maskSecret(creds.lolzteamApiToken),
       },
       xrocket: {
         configured: this.isProviderConfigured('xrocket'),
@@ -421,13 +476,6 @@ export class PaymentProviderGateway {
         creds.cryptobotApiToken,
       );
     }
-    if (provider === 'lolzteam') {
-      return verifyLolzteamWebhookSignature(
-        rawBody,
-        getHeader('x-secret-key') ?? getHeader('x-lolzteam-signature'),
-        creds.lolzteamWebhookSecret || creds.lolzteamApiToken,
-      );
-    }
     if (provider === 'xrocket') {
       return verifyXRocketWebhookSignature(
         rawBody,
@@ -453,7 +501,6 @@ export class PaymentProviderGateway {
     const obj = body as Record<string, unknown>;
 
     if (provider === 'cryptobot') {
-      // CryptoBot official webhook: { update_id, update_type: "invoice_paid", request_date, payload: { invoice_id, status, amount, asset, fiat, currency_type, payload } }
       const payloadObj =
         obj.payload && typeof obj.payload === 'object'
           ? (obj.payload as Record<string, unknown>)
@@ -477,30 +524,7 @@ export class PaymentProviderGateway {
       };
     }
 
-    if (provider === 'lolzteam') {
-      // Lolzteam official webhook: { invoice_id, payment_id, amount, status, merchant_id, currency, ... } or { invoice: { ... } }
-      const invObj =
-        obj.invoice && typeof obj.invoice === 'object'
-          ? (obj.invoice as Record<string, unknown>)
-          : obj;
-      const externalInvoiceId = String(invObj.invoice_id ?? invObj.id ?? '');
-      if (!externalInvoiceId) {
-        throw new Error('В вебхуке Lolzteam отсутствует invoice_id');
-      }
-      return {
-        provider: 'lolzteam',
-        externalInvoiceId,
-        paymentId: invObj.payment_id ? String(invObj.payment_id) : undefined,
-        status: normalizeProviderStatus(String(invObj.status ?? 'paid')),
-        amountPaid: invObj.amount !== undefined ? Number(invObj.amount) : undefined,
-        currency: normalizeCurrencyCode(String(invObj.currency ?? 'RUB')),
-        recipientMerchantId:
-          invObj.merchant_id !== undefined ? String(invObj.merchant_id) : undefined,
-      };
-    }
-
     if (provider === 'xrocket') {
-      // xRocket official webhook: { type: "invoicePay", data: { id, amount, currency, status, payload, payment: ... } }
       const dataObj =
         obj.data && typeof obj.data === 'object'
           ? (obj.data as Record<string, unknown>)
@@ -509,13 +533,18 @@ export class PaymentProviderGateway {
       if (!externalInvoiceId) {
         throw new Error('В вебхуке xRocket отсутствует id инвойса');
       }
+      const rawPaymentId =
+        dataObj.clientInvoiceId ?? dataObj.payload ?? undefined;
+      const rawAmount = dataObj.priceAmount ?? dataObj.amount;
+      const rawCurrency = dataObj.priceCurrency ?? dataObj.currency ?? 'USDT';
+
       return {
         provider: 'xrocket',
         externalInvoiceId,
-        paymentId: dataObj.payload ? String(dataObj.payload) : undefined,
+        paymentId: rawPaymentId ? String(rawPaymentId) : undefined,
         status: normalizeProviderStatus(String(dataObj.status ?? 'paid')),
-        amountPaid: dataObj.amount !== undefined ? Number(dataObj.amount) : undefined,
-        currency: normalizeCurrencyCode(String(dataObj.currency ?? 'USDT')),
+        amountPaid: rawAmount !== undefined ? Number(rawAmount) : undefined,
+        currency: normalizeCurrencyCode(String(rawCurrency)),
       };
     }
 
@@ -617,121 +646,92 @@ export class PaymentProviderGateway {
       };
     }
 
-    if (input.provider === 'lolzteam') {
-      const appUrl = (
-        getEnvConfig().webhookUrl || 'http://localhost:3000'
-      ).replace(/\/+$/, '');
+    if (input.provider === 'xrocket') {
+      // Official xRocket Pay REST API v1: POST /api/v1/invoices
+      // Docs: https://docs.xrocket.exchange/ru/api/pay/reference/pay-rest-api
+      const priceCurrency = normalizeCurrencyCode(input.currency);
+      const expiresInMs = expiresInSeconds * 1000;
       const bodyPayload = {
-        currency: input.currency.trim().toLowerCase(),
-        amount: input.amountPaid,
-        payment_id: input.paymentId,
-        comment: input.description,
-        url_success: `${appUrl}/health`,
-        merchant_id: Number(creds.lolzteamMerchantId) || creds.lolzteamMerchantId,
-        lifetime: expiresInSeconds,
+        priceAmount: input.amountPaid.toFixed(2),
+        priceCurrency,
+        payCurrencies: [priceCurrency],
+        clientInvoiceId: input.paymentId,
+        description: input.description,
+        expiresIn: expiresInMs,
       };
 
+      const url = buildXRocketApiV1Url(creds.xrocketApiUrl, '/invoices');
       const res = await this.transport({
-        url: `${creds.lolzteamApiUrl.replace(/\/+$/, '')}/invoice`,
+        url,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          Authorization: `Bearer ${creds.lolzteamApiToken}`,
+          Authorization: `Bearer ${creds.xrocketApiKey}`,
         },
         body: JSON.stringify(bodyPayload),
       });
 
-      const data = res.json as {
-        invoice?: {
-          invoice_id?: number | string;
-          amount?: number | string;
-          currency?: string;
-          status?: string;
-          url?: string;
-          merchant_id?: number | string;
-          expires_at?: number | string;
-        };
-        errors?: string[];
-      } | null;
+      if (!res.ok) {
+        const { errorMessage, details } = parseXRocketErrorDetails(
+          res.status,
+          res.json,
+        );
+        throw new XRocketApiError(errorMessage, res.status, details);
+      }
 
-      if (!res.ok || !data?.invoice?.invoice_id || !data.invoice.url) {
-        const errMsg = data?.errors?.join(', ') || `HTTP_${res.status}`;
-        throw new Error(
-          redactSecretsFromText(`Ошибка создания счёта Lolzteam Market: ${errMsg}`),
+      const rawObj =
+        res.json && typeof res.json === 'object'
+          ? (res.json as Record<string, unknown>)
+          : {};
+      const inv =
+        rawObj.data && typeof rawObj.data === 'object'
+          ? (rawObj.data as Record<string, unknown>)
+          : rawObj;
+
+      const linksObj =
+        inv.links && typeof inv.links === 'object'
+          ? (inv.links as Record<string, unknown>)
+          : {};
+
+      const externalId = inv.id !== undefined ? String(inv.id) : '';
+      const payUrl = String(
+        linksObj.telegramBotLink ??
+          linksObj.webLink ??
+          inv.telegramBotLink ??
+          inv.link ??
+          inv.payUrl ??
+          '',
+      );
+
+      if (!externalId || !payUrl) {
+        const { errorMessage, details } = parseXRocketErrorDetails(
+          res.status,
+          res.json,
+        );
+        throw new XRocketApiError(
+          `${errorMessage} — ответ API не содержит id или links.telegramBotLink`,
+          res.status,
+          details,
         );
       }
 
-      const inv = data.invoice;
-      const expiresAtIso =
-        typeof inv.expires_at === 'number'
-          ? new Date(inv.expires_at * 1000).toISOString()
-          : typeof inv.expires_at === 'string'
-            ? inv.expires_at
-            : new Date(Date.now() + expiresInSeconds * 1000).toISOString();
+      const resolvedAmount = Number(inv.priceAmount ?? inv.amount ?? input.amountPaid);
+      const resolvedCurrency = normalizeCurrencyCode(
+        String(inv.priceCurrency ?? inv.currency ?? priceCurrency),
+      );
+      const resolvedExpiresAt =
+        typeof inv.expiresAt === 'string' && inv.expiresAt.length > 0
+          ? inv.expiresAt
+          : new Date(Date.now() + expiresInMs).toISOString();
 
       return {
-        externalInvoiceId: String(inv.invoice_id),
-        payUrl: inv.url!,
-        status: normalizeProviderStatus(inv.status || 'pending'),
-        amountPaid: Number(inv.amount ?? input.amountPaid),
-        currency: normalizeCurrencyCode(String(inv.currency || input.currency)),
-        recipientMerchantId: String(inv.merchant_id ?? creds.lolzteamMerchantId),
-        expiresAt: expiresAtIso,
-      };
-    }
-
-    if (input.provider === 'xrocket') {
-      const apiCurrency =
-        input.currency.trim().toUpperCase() === 'TON'
-          ? 'TONCOIN'
-          : input.currency.trim().toUpperCase();
-      const bodyPayload = {
-        amount: input.amountPaid,
-        currency: apiCurrency,
-        description: input.description,
-        payload: input.paymentId,
-        expiredIn: expiresInSeconds,
-      };
-
-      const res = await this.transport({
-        url: `${creds.xrocketApiUrl.replace(/\/+$/, '')}/tg-invoices`,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Rocket-Pay-Key': creds.xrocketApiKey,
-        },
-        body: JSON.stringify(bodyPayload),
-      });
-
-      const data = res.json as {
-        success?: boolean;
-        message?: string;
-        data?: {
-          id?: string | number;
-          amount?: number | string;
-          currency?: string;
-          status?: string;
-          link?: string;
-          payload?: string;
-        };
-      } | null;
-
-      if (!res.ok || !data?.success || !data.data?.id || !data.data.link) {
-        const errMsg = data?.message || `HTTP_${res.status}`;
-        throw new Error(
-          redactSecretsFromText(`Ошибка создания счёта xRocket Pay: ${errMsg}`),
-        );
-      }
-
-      const inv = data.data;
-      return {
-        externalInvoiceId: String(inv.id),
-        payUrl: inv.link!,
-        status: normalizeProviderStatus(inv.status || 'active'),
-        amountPaid: Number(inv.amount ?? input.amountPaid),
-        currency: normalizeCurrencyCode(String(inv.currency || input.currency)),
-        expiresAt: new Date(Date.now() + expiresInSeconds * 1000).toISOString(),
+        externalInvoiceId: externalId,
+        payUrl,
+        status: normalizeProviderStatus(String(inv.status ?? 'PENDING')),
+        amountPaid: resolvedAmount,
+        currency: resolvedCurrency,
+        expiresAt: resolvedExpiresAt,
       };
     }
 
@@ -740,7 +740,7 @@ export class PaymentProviderGateway {
 
   /**
    * Queries the provider's authoritative server-side API to verify the real status,
-   * amount, currency, paymentId/payload, and merchantId of an invoice.
+   * amount, currency, and clientInvoiceId/payload of an invoice.
    */
   public async verifyInvoiceStatus(params: {
     provider: BalanceTopUpProvider;
@@ -828,101 +828,83 @@ export class PaymentProviderGateway {
       };
     }
 
-    if (params.provider === 'lolzteam') {
-      const query = new URLSearchParams({
-        invoice_id: params.externalInvoiceId,
-        payment_id: params.paymentId,
-      });
-      const url = `${creds.lolzteamApiUrl.replace(/\/+$/, '')}/invoice?${query.toString()}`;
+    if (params.provider === 'xrocket') {
+      // Official xRocket Pay REST API v1: GET /api/v1/invoices?ids=<id>
+      const url = buildXRocketApiV1Url(
+        creds.xrocketApiUrl,
+        `/invoices?ids=${encodeURIComponent(params.externalInvoiceId)}`,
+      );
       const res = await this.transport({
         url,
         method: 'GET',
         headers: {
           Accept: 'application/json',
-          Authorization: `Bearer ${creds.lolzteamApiToken}`,
+          Authorization: `Bearer ${creds.xrocketApiKey}`,
         },
       });
 
-      const data = res.json as {
-        invoice?: {
-          invoice_id?: number | string;
-          payment_id?: string;
-          merchant_id?: number | string;
-          amount?: number | string;
-          currency?: string;
-          status?: string;
-          paid_at?: number | string;
-        };
-        errors?: string[];
-      } | null;
+      if (!res.ok) {
+        const { errorMessage, details } = parseXRocketErrorDetails(
+          res.status,
+          res.json,
+        );
+        throw new XRocketApiError(errorMessage, res.status, details);
+      }
 
-      if (!res.ok || !data?.invoice) {
-        throw new Error(
-          redactSecretsFromText(
-            `Ошибка проверки счёта Lolzteam Market: ${data?.errors?.join(', ') || res.status}`,
-          ),
+      const raw = res.json;
+      let items: Array<Record<string, unknown>> = [];
+      if (Array.isArray(raw)) {
+        items = raw as Array<Record<string, unknown>>;
+      } else if (raw && typeof raw === 'object') {
+        const obj = raw as Record<string, unknown>;
+        if (Array.isArray(obj.data)) {
+          items = obj.data as Array<Record<string, unknown>>;
+        } else if (Array.isArray(obj.items)) {
+          items = obj.items as Array<Record<string, unknown>>;
+        } else if (obj.data && typeof obj.data === 'object') {
+          items = [obj.data as Record<string, unknown>];
+        } else if (obj.id !== undefined) {
+          items = [obj];
+        }
+      }
+
+      const found = items.find(
+        (item) => String(item.id) === String(params.externalInvoiceId),
+      );
+      if (!found) {
+        throw new XRocketApiError(
+          `Счёт xRocket Pay #${params.externalInvoiceId} не найден в ответе API v1`,
+          404,
+          {
+            status: 404,
+            title: 'Not Found',
+            detail: `Invoice ${params.externalInvoiceId} not returned by GET /api/v1/invoices`,
+            kind: 'invoice_not_found',
+          },
         );
       }
 
-      const inv = data.invoice;
-      const paidAtIso =
-        typeof inv.paid_at === 'number'
-          ? new Date(inv.paid_at * 1000).toISOString()
-          : typeof inv.paid_at === 'string'
-            ? inv.paid_at
+      const resolvedPaymentId =
+        found.clientInvoiceId !== undefined
+          ? String(found.clientInvoiceId)
+          : found.payload !== undefined
+            ? String(found.payload)
             : undefined;
 
       return {
-        externalInvoiceId: String(inv.invoice_id),
-        paymentId: inv.payment_id ? String(inv.payment_id) : undefined,
-        status: normalizeProviderStatus(inv.status),
-        amountPaid: Number(inv.amount ?? 0),
-        currency: normalizeCurrencyCode(String(inv.currency || 'RUB')),
-        recipientMerchantId:
-          inv.merchant_id !== undefined ? String(inv.merchant_id) : undefined,
-        paidAt: paidAtIso,
-      };
-    }
-
-    if (params.provider === 'xrocket') {
-      const url = `${creds.xrocketApiUrl.replace(/\/+$/, '')}/tg-invoices/${encodeURIComponent(params.externalInvoiceId)}`;
-      const res = await this.transport({
-        url,
-        method: 'GET',
-        headers: {
-          'Rocket-Pay-Key': creds.xrocketApiKey,
-        },
-      });
-
-      const data = res.json as {
-        success?: boolean;
-        message?: string;
-        data?: {
-          id?: string | number;
-          amount?: number | string;
-          currency?: string;
-          status?: string;
-          payload?: string;
-          paid?: string;
-        };
-      } | null;
-
-      if (!res.ok || !data?.success || !data.data) {
-        throw new Error(
-          redactSecretsFromText(
-            `Ошибка проверки счёта xRocket Pay: ${data?.message || res.status}`,
-          ),
-        );
-      }
-
-      const inv = data.data;
-      return {
-        externalInvoiceId: String(inv.id),
-        paymentId: inv.payload ? String(inv.payload) : undefined,
-        status: normalizeProviderStatus(inv.status),
-        amountPaid: Number(inv.amount ?? 0),
-        currency: normalizeCurrencyCode(String(inv.currency || 'USDT')),
-        paidAt: inv.paid,
+        externalInvoiceId: String(found.id),
+        paymentId: resolvedPaymentId,
+        status: normalizeProviderStatus(String(found.status ?? 'PENDING')),
+        amountPaid: Number(found.priceAmount ?? found.amount ?? 0),
+        currency: normalizeCurrencyCode(
+          String(found.priceCurrency ?? found.currency ?? 'USDT'),
+        ),
+        paidAt:
+          typeof found.paidAt === 'string'
+            ? found.paidAt
+            : typeof found.paid === 'string'
+              ? found.paid
+              : undefined,
       };
     }
 

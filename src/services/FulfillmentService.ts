@@ -4,6 +4,7 @@ import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import { Order, StoreTransaction } from '../types.ts';
 import { OrderService } from './OrderService.ts';
 import { PaymentService } from './PaymentService.ts';
+import { DigitalKeyService } from './DigitalKeyService.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
 import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
 
@@ -242,6 +243,24 @@ export class FulfillmentService {
   ): Promise<Order> {
     const idempotencyKey =
       orderInput.fulfillmentIdempotencyKey || `fulfill_${orderInput.orderId}`;
+
+    // Stage 3.3: If default ManualAdminFulfillmentAdapter is active, check if digital keys
+    // are available for this product and atomically fulfill from DigitalKeyService.
+    if (this.adapter instanceof ManualAdminFulfillmentAdapter) {
+      const candidateKeyIds = await DigitalKeyService.getAvailableCandidateKeyIds(
+        orderInput.productId,
+        orderInput.quantity,
+      );
+      if (candidateKeyIds.length >= orderInput.quantity) {
+        const keyOutcome = await DigitalKeyService.fulfillOrderWithDigitalKey(
+          orderInput,
+          bot,
+        );
+        if (keyOutcome.fulfilled) {
+          return keyOutcome.order;
+        }
+      }
+    }
 
     type ClaimOutcome =
       | { action: 'already_completed'; order: Order }

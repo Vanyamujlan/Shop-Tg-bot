@@ -16,7 +16,9 @@ import {
   buildMainMenuKeyboard,
   buildProductDetailKeyboard,
   buildTopUpInvoiceKeyboard,
-  buildTopUpMenuKeyboard,
+  buildTopUpStep1ProviderKeyboard,
+  buildTopUpStep2AmountKeyboard,
+  buildTopUpStep3XRocketCurrencyKeyboard,
   buildUserOrderDetailKeyboard,
   buildUserOrdersKeyboard,
   buildUserProfileKeyboard,
@@ -32,7 +34,9 @@ import {
   formatSupportedCryptoInfoMessage,
   formatTermsMessage,
   formatTopUpInvoiceCardMessage,
-  formatTopUpMenuMessage,
+  formatTopUpStep1ProviderMessage,
+  formatTopUpStep2AmountMessage,
+  formatTopUpStep3XRocketCurrencyMessage,
   formatUserOrdersListMessage,
   formatUserProfileMessage,
   formatUserTopUpHistoryMessage,
@@ -96,7 +100,6 @@ function pruneCallbackDebounceMap(now: number): void {
       callbackDebounceMap.delete(k);
     }
   }
-  // If still above max size, evict oldest entries
   while (callbackDebounceMap.size > MAX_DEBOUNCE_ENTRIES) {
     const oldestKey = callbackDebounceMap.keys().next().value;
     if (!oldestKey) break;
@@ -170,15 +173,24 @@ export async function safeRespondOrEdit(
   });
 }
 
-async function renderTopUpMenu(
-  ctx: Context,
-  provider: BalanceTopUpProvider = 'cryptobot',
-  currency?: string,
-  amountPaid = 500,
-): Promise<void> {
+async function renderTopUpStep1(ctx: Context): Promise<void> {
   if (!ctx.from) return;
   clearUserTopUpSession(ctx.from.id);
   const currentBalance = await balanceService.getBalance(ctx.from.id);
+  await safeRespondOrEdit(
+    ctx,
+    formatTopUpStep1ProviderMessage(currentBalance),
+    buildTopUpStep1ProviderKeyboard(),
+  );
+}
+
+async function renderTopUpStep2(
+  ctx: Context,
+  provider: BalanceTopUpProvider,
+  currency?: string,
+  amountPaid = 100,
+): Promise<void> {
+  if (!ctx.from) return;
   const meta = PAYMENT_PROVIDER_CATALOG[provider];
   const resolvedCurrency =
     currency && meta.supportedCurrencies.includes(currency)
@@ -186,16 +198,35 @@ async function renderTopUpMenu(
       : meta.defaultCurrency;
   const providerConfigured = paymentProviderGateway.isProviderConfigured(provider);
 
+  // Allow user to type custom amount directly in chat on Step 2/3
+  setUserTopUpSession(ctx.from.id, {
+    provider,
+    currency: resolvedCurrency,
+    createdAt: Date.now(),
+  });
+
   await safeRespondOrEdit(
     ctx,
-    formatTopUpMenuMessage({
-      currentBalance,
+    formatTopUpStep2AmountMessage({
       provider,
-      currency: resolvedCurrency,
       amountPaid,
+      currency: resolvedCurrency,
       providerConfigured,
     }),
-    buildTopUpMenuKeyboard(provider, resolvedCurrency, amountPaid),
+    buildTopUpStep2AmountKeyboard(provider, amountPaid, resolvedCurrency),
+  );
+}
+
+async function renderTopUpStep3XRocketCurrency(
+  ctx: Context,
+  amountPaid: number,
+): Promise<void> {
+  if (!ctx.from) return;
+  clearUserTopUpSession(ctx.from.id);
+  await safeRespondOrEdit(
+    ctx,
+    formatTopUpStep3XRocketCurrencyMessage(amountPaid),
+    buildTopUpStep3XRocketCurrencyKeyboard(amountPaid),
   );
 }
 
@@ -287,9 +318,9 @@ export function registerUserHandlers(bot: Telegraf): void {
     );
   });
 
-  // /topup — Пополнение баланса
+  // /topup — Пополнение баланса (Шаг 1/3)
   bot.command('topup', async (ctx) => {
-    await renderTopUpMenu(ctx, 'cryptobot', undefined, 500);
+    await renderTopUpStep1(ctx);
   });
 
   // /help — Помощь
@@ -359,25 +390,25 @@ export function registerUserHandlers(bot: Telegraf): void {
     );
   });
 
-  // Callback: Меню пополнения баланса («💳 Пополнить баланс»)
+  // Callback: Меню пополнения баланса («💳 Пополнить баланс» -> Шаг 1/3)
   bot.action('menu:topup', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:topup')) return;
-    await renderTopUpMenu(ctx, 'cryptobot', undefined, 500);
+    await renderTopUpStep1(ctx);
   });
 
-  // Callback: Выбор способа пополнения (topup:prov:<provider>)
-  bot.action(/^topup:prov:(cryptobot|lolzteam|xrocket)$/, async (ctx) => {
+  // Callback: Шаг 1/3 -> Шаг 2/3 Выбор способа пополнения (topup:prov:<provider>)
+  bot.action(/^topup:prov:(cryptobot|xrocket)$/, async (ctx) => {
     const provider = ctx.match[1] as BalanceTopUpProvider;
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `topup:prov:${provider}`)) {
       return;
     }
     const meta = PAYMENT_PROVIDER_CATALOG[provider];
-    await renderTopUpMenu(ctx, provider, meta.defaultCurrency, 500);
+    await renderTopUpStep2(ctx, provider, meta.defaultCurrency, 100);
   });
 
   // Callback: Выбор валюты пополнения (topup:curr:<provider>:<currency>)
   bot.action(
-    /^topup:curr:(cryptobot|lolzteam|xrocket):([A-Z0-9]+)$/,
+    /^topup:curr:(cryptobot|xrocket):([A-Z0-9]+)$/,
     async (ctx) => {
       const provider = ctx.match[1] as BalanceTopUpProvider;
       const currency = ctx.match[2];
@@ -387,13 +418,13 @@ export function registerUserHandlers(bot: Telegraf): void {
       ) {
         return;
       }
-      await renderTopUpMenu(ctx, provider, currency, 500);
+      await renderTopUpStep2(ctx, provider, currency, 100);
     },
   );
 
-  // Callback: Выбор суммы пополнения (topup:amt:<provider>:<currency>:<amount>)
+  // Callback: Выбор суммы пополнения на Шаге 2/3 (topup:amt:<provider>:<currency>:<amount>)
   bot.action(
-    /^topup:amt:(cryptobot|lolzteam|xrocket):([A-Z0-9]+):([0-9.]+)$/,
+    /^topup:amt:(cryptobot|xrocket):([A-Z0-9]+):([0-9.]+)$/,
     async (ctx) => {
       const provider = ctx.match[1] as BalanceTopUpProvider;
       const currency = ctx.match[2];
@@ -407,13 +438,68 @@ export function registerUserHandlers(bot: Telegraf): void {
       ) {
         return;
       }
-      await renderTopUpMenu(ctx, provider, currency, amount);
+      await renderTopUpStep2(ctx, provider, currency, amount);
+    },
+  );
+
+  // Callback: Шаг 3/3 (для xRocket) — экран выбора монеты и сети (topup:xr_curr:<amount>)
+  bot.action(/^topup:xr_curr:([0-9.]+)$/, async (ctx) => {
+    const amountPaid = Number(ctx.match[1]);
+    if (
+      !ctx.from ||
+      isDuplicateCallbackClick(ctx.from.id, `topup:xr_curr:${amountPaid}`)
+    ) {
+      return;
+    }
+    await renderTopUpStep3XRocketCurrency(ctx, amountPaid);
+  });
+
+  // Callback: Шаг 3/3 (для xRocket) — создание счёта по выбранной монете и сети (topup:xr_pay:<currency>:<network>:<amount>)
+  bot.action(
+    /^topup:xr_pay:([A-Z0-9]+):([^:]+):([0-9.]+)$/,
+    async (ctx) => {
+      const currency = ctx.match[1];
+      const network = decodeURIComponent(ctx.match[2]);
+      const amountPaid = Number(ctx.match[3]);
+      if (
+        !ctx.from ||
+        isDuplicateCallbackClick(
+          ctx.from.id,
+          `topup:xr_pay:${currency}:${network}:${amountPaid}`,
+          1500,
+        )
+      ) {
+        return;
+      }
+
+      try {
+        clearUserTopUpSession(ctx.from.id);
+        const topUp = await balanceService.createTopUp({
+          telegramId: ctx.from.id,
+          username: ctx.from.username,
+          firstName: ctx.from.first_name,
+          provider: 'xrocket',
+          amountPaid,
+          currency,
+          network,
+        });
+
+        await safeAnswerCbQuery(ctx, 'Счёт xRocket создан!');
+        await safeRespondOrEdit(
+          ctx,
+          formatTopUpInvoiceCardMessage(topUp),
+          buildTopUpInvoiceKeyboard(topUp),
+        );
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
+      }
     },
   );
 
   // Callback: Ввод произвольной суммы пополнения (topup:custom:<provider>:<currency>)
   bot.action(
-    /^topup:custom:(cryptobot|lolzteam|xrocket):([A-Z0-9]+)$/,
+    /^topup:custom:(cryptobot|xrocket):([A-Z0-9]+)$/,
     async (ctx) => {
       const provider = ctx.match[1] as BalanceTopUpProvider;
       const currency = ctx.match[2];
@@ -429,18 +515,19 @@ export function registerUserHandlers(bot: Telegraf): void {
       await safeRespondOrEdit(
         ctx,
         [
-          `✏️ <b>Ввод суммы пополнения через ${escapeHtml(meta.title)}</b>`,
-          `💱 Валюта: <code>${escapeHtml(currency)}</code>`,
-          `📉 Комиссия магазина: <code>${meta.feePercent}%</code>`,
-          `📏 Допустимый диапазон: от <code>${meta.minAmount}</code> до <code>${meta.maxAmount} ${escapeHtml(currency)}</code>`,
+          '💵 <b>СУММА ПОПОЛНЕНИЯ</b>',
+          '<i>Шаг 2/3</i>',
           '',
-          'Отправьте в чат желаемую сумму пополнения (например: <code>350</code>):',
+          `🏦 Способ оплаты: <b>${escapeHtml(meta.shortTitle)}</b> [${meta.feePercent}%]`,
+          `📝 <b>Введите сумму в ${escapeHtml(currency)} (минимум ${meta.minAmount} ${escapeHtml(currency)}):</b>`,
+          '',
+          'Отправьте число в чат (например: <code>100</code>):',
         ].join('\n'),
         Markup.inlineKeyboard([
           [
             Markup.button.callback(
-              '⬅️ Назад к выбору суммы',
-              `topup:curr:${provider}:${currency}`,
+              '« Назад',
+              `topup:prov:${provider}`,
             ),
           ],
         ]),
@@ -450,7 +537,7 @@ export function registerUserHandlers(bot: Telegraf): void {
 
   // Callback: Создание счёта у провайдера (topup:create:<provider>:<currency>:<amount>)
   bot.action(
-    /^topup:create:(cryptobot|lolzteam|xrocket):([A-Z0-9]+):([0-9.]+)$/,
+    /^topup:create:(cryptobot|xrocket):([A-Z0-9]+):([0-9.]+)$/,
     async (ctx) => {
       const provider = ctx.match[1] as BalanceTopUpProvider;
       const currency = ctx.match[2];
@@ -467,6 +554,7 @@ export function registerUserHandlers(bot: Telegraf): void {
       }
 
       try {
+        clearUserTopUpSession(ctx.from.id);
         const topUp = await balanceService.createTopUp({
           telegramId: ctx.from.id,
           username: ctx.from.username,
@@ -576,8 +664,7 @@ export function registerUserHandlers(bot: Telegraf): void {
       ctx,
       formatSupportedCryptoInfoMessage(),
       Markup.inlineKeyboard([
-        [Markup.button.callback('⬅️ Назад к пополнению баланса', 'menu:topup')],
-        [Markup.button.callback('👤 В профиль', 'menu:profile')],
+        [Markup.button.callback('« Назад', 'menu:topup')],
       ]),
     );
   });
@@ -596,7 +683,7 @@ export function registerUserHandlers(bot: Telegraf): void {
       formatUserTopUpHistoryMessage(topUps, currentBalance),
       Markup.inlineKeyboard([
         [Markup.button.callback('💳 Пополнить баланс', 'menu:topup')],
-        [Markup.button.callback('👤 В профиль', 'menu:profile')],
+        [Markup.button.callback('« Назад', 'menu:profile')],
       ]),
     );
   });
@@ -742,7 +829,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     }
   });
 
-  // Обработка текстового ввода пользовательской суммы пополнения
+  // Обработка текстового ввода пользовательской суммы пополнения на Шаге 2/3
   bot.on('text', async (ctx, next) => {
     if (!ctx.from) return next();
     const session = getUserTopUpSession(ctx.from.id);
@@ -770,7 +857,10 @@ export function registerUserHandlers(bot: Telegraf): void {
 
     const roundedAmount = Number(parsedAmount.toFixed(2));
     clearUserTopUpSession(ctx.from.id);
-    await renderTopUpMenu(ctx, session.provider, session.currency, roundedAmount);
+    if (session.provider === 'xrocket') {
+      await renderTopUpStep3XRocketCurrency(ctx, roundedAmount);
+    } else {
+      await renderTopUpStep2(ctx, session.provider, session.currency, roundedAmount);
+    }
   });
 }
-
