@@ -1011,13 +1011,7 @@ export function registerUserHandlers(bot: Telegraf): void {
         }
 
         if (checkoutSession.mode === 'custom_qty') {
-          if (!/^\d+$/.test(text)) {
-            throw new Error(
-              `Введите целое число (от ${product.minQuantity ?? 50} до ${product.maxQuantity ?? 100000}).`,
-            );
-          }
-          const qty = Number(text);
-          const calc = ProductService.calculateOrderPriceUsdCents(product, qty);
+          const calc = ProductService.calculateOrderPriceUsdCents(product, text);
           setUserCheckoutSession(ctx.from.id, {
             mode: 'recipient_username',
             productId: product.id,

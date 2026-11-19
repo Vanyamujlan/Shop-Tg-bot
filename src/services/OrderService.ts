@@ -11,20 +11,51 @@ import { formatUsdCents } from './Money.ts';
 import { ProductService } from './ProductService.ts';
 import { UserService } from './UserService.ts';
 
+const TELEGRAM_USERNAME_REGEX = /^[a-zA-Z](?:[a-zA-Z0-9]|_(?=[a-zA-Z0-9])){4,31}$/;
+
 /**
  * Validates and normalizes a Telegram recipient @username (stores without leading @, lowercased).
- * Telegram rules: 5..32 chars total (letter first, then letters/digits/underscores).
+ * Official Telegram rules:
+ * - 5..32 characters total
+ * - Allowed characters: Latin letters (a-z), digits (0-9), underscore (_)
+ * - Must start with a Latin letter; cannot start/end with "_" or contain "__"
+ * - Only a single optional leading "@" is allowed; internal whitespace and extra "@" are rejected
+ * - Explicitly passing an empty string ("", "   ", "@") throws an error; only `undefined` returns `undefined`.
  */
 export function normalizeRecipientUsername(raw?: string): string | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  const trimmed = raw.trim().replace(/^@+/, '');
-  if (!trimmed) return undefined;
-  if (!/^[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(trimmed)) {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string') {
     throw new Error(
-      'Некорректный @username получателя. Укажите от 4 до 32 символов латиницы, цифр или "_" (начинается с буквы).',
+      'Некорректный @username получателя: ожидается непустая строка.',
     );
   }
-  return trimmed.toLowerCase();
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error(
+      'Укажите @username получателя: имя пользователя не может быть пустым.',
+    );
+  }
+  if (/\s/.test(trimmed)) {
+    throw new Error(
+      'Некорректный @username получателя: пробелы внутри имени пользователя недопустимы.',
+    );
+  }
+
+  const withoutAt = trimmed.startsWith('@') ? trimmed.slice(1) : trimmed;
+  if (!withoutAt) {
+    throw new Error(
+      'Укажите @username получателя: имя пользователя не может быть пустым.',
+    );
+  }
+
+  if (!TELEGRAM_USERNAME_REGEX.test(withoutAt)) {
+    throw new Error(
+      'Некорректный @username получателя. Укажите от 5 до 32 символов латиницы, цифр или "_" (начинается с буквы, без "__" и "_" в конце).',
+    );
+  }
+
+  return withoutAt.toLowerCase();
 }
 
 export class OrderService {
@@ -56,7 +87,10 @@ export class OrderService {
     }
 
     const { quantity, unitPriceUsdCents, totalPriceUsdCents } =
-      ProductService.calculateOrderPriceUsdCents(product, params.quantity ?? 1);
+      ProductService.calculateOrderPriceUsdCents(
+        product,
+        params.quantity === undefined ? 1 : params.quantity,
+      );
 
     const normalizedRecipient = normalizeRecipientUsername(params.recipientUsername);
     const now = new Date().toISOString();

@@ -18,7 +18,11 @@ import {
   formatUsdCents,
   usdInputToCents,
 } from './Money.ts';
-import { OrderService } from './OrderService.ts';
+import {
+  OrderService,
+  normalizeRecipientUsername,
+} from './OrderService.ts';
+import { ProductService } from './ProductService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
   PaymentProviderGateway,
@@ -173,6 +177,10 @@ export class PaymentService {
     const product = await firestoreRepo.getDoc<Product>('products', order.productId);
     if (!product || !product.isActive) {
       throw new Error('Товар снят с продажи.');
+    }
+    ProductService.validateOrderQuantity(product, order.quantity);
+    if (order.recipientUsername !== undefined) {
+      normalizeRecipientUsername(order.recipientUsername);
     }
 
     const { currency: normalizedCurr, network: normalizedNet } =

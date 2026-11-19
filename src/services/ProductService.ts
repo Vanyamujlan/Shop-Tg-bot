@@ -1,3 +1,4 @@
+import { INITIAL_TEST_PRODUCTS } from '../constants.ts';
 import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
   FulfillmentType,
@@ -9,25 +10,114 @@ import { assertValidUsdCents } from './Money.ts';
 
 export class ProductService {
   /**
+   * Resolves effective [minQuantity, maxQuantity] bounds for a product,
+   * cross-checking against the canonical catalog definition if present.
+   */
+  public static getCatalogQuantityBounds(product: Product): {
+    minQuantity: number;
+    maxQuantity: number;
+  } {
+    const catalogDef = INITIAL_TEST_PRODUCTS.find((p) => p.id === product.id);
+    const rawMin = product.minQuantity ?? catalogDef?.minQuantity ?? 1;
+    const rawMax = product.maxQuantity ?? catalogDef?.maxQuantity ?? 100;
+
+    if (
+      !Number.isSafeInteger(rawMin) ||
+      !Number.isSafeInteger(rawMax) ||
+      rawMin < 1 ||
+      rawMax < rawMin
+    ) {
+      throw new Error(
+        `Некорректные ограничения количества в каталоге для "${product.name}".`,
+      );
+    }
+
+    const effectiveMin =
+      catalogDef?.minQuantity !== undefined
+        ? Math.max(rawMin, catalogDef.minQuantity)
+        : rawMin;
+    const effectiveMax =
+      catalogDef?.maxQuantity !== undefined
+        ? Math.min(rawMax, catalogDef.maxQuantity)
+        : rawMax;
+
+    if (effectiveMax < effectiveMin) {
+      throw new Error(
+        `Некорректные ограничения количества в каталоге для "${product.name}".`,
+      );
+    }
+
+    return {
+      minQuantity: effectiveMin,
+      maxQuantity: effectiveMax,
+    };
+  }
+
+  /**
+   * Strictly validates order/Stars quantity as a positive safe integer within catalog bounds.
+   * NEVER rounds fractional numbers (e.g., via Math.round, Math.floor, Math.ceil).
+   */
+  public static validateOrderQuantity(
+    product: Product,
+    rawQuantity: number | string = 1,
+  ): number {
+    const { minQuantity: minQ, maxQuantity: maxQ } =
+      this.getCatalogQuantityBounds(product);
+
+    let qty: number;
+    if (typeof rawQuantity === 'number') {
+      if (
+        !Number.isFinite(rawQuantity) ||
+        !Number.isInteger(rawQuantity) ||
+        !Number.isSafeInteger(rawQuantity)
+      ) {
+        throw new Error(
+          `Некорректное количество для "${product.name}": укажите целое положительное число от ${minQ} до ${maxQ}.`,
+        );
+      }
+      qty = rawQuantity;
+    } else if (typeof rawQuantity === 'string') {
+      const trimmed = rawQuantity.trim();
+      if (!trimmed || !/^\d+$/.test(trimmed)) {
+        throw new Error(
+          `Некорректное количество для "${product.name}": укажите целое положительное число от ${minQ} до ${maxQ}.`,
+        );
+      }
+      const parsed = Number(trimmed);
+      if (!Number.isSafeInteger(parsed)) {
+        throw new Error(
+          `Некорректное количество для "${product.name}": число превышает допустимый предел (от ${minQ} до ${maxQ}).`,
+        );
+      }
+      qty = parsed;
+    } else {
+      throw new Error(
+        `Некорректное количество для "${product.name}": укажите целое положительное число от ${minQ} до ${maxQ}.`,
+      );
+    }
+
+    if (qty <= 0 || qty < minQ || qty > maxQ) {
+      throw new Error(
+        `Некорректное количество для "${product.name}": допустимо от ${minQ} до ${maxQ}.`,
+      );
+    }
+
+    return qty;
+  }
+
+  /**
    * Computes canonical integer USD cents unit and total price for a product + quantity,
-   * respecting custom Stars quantity ranges and pack pricing.
+   * respecting custom Stars quantity ranges and pack pricing without rounding quantity.
    */
   public static calculateOrderPriceUsdCents(
     product: Product,
-    rawQuantity = 1,
+    rawQuantity: number | string = 1,
   ): {
     quantity: number;
     unitPriceUsdCents: number;
     totalPriceUsdCents: number;
   } {
-    const minQ = product.minQuantity ?? 1;
-    const maxQ = product.maxQuantity ?? 100;
-    const qty = Math.round(rawQuantity);
-    if (!Number.isInteger(qty) || qty < minQ || qty > maxQ) {
-      throw new Error(
-        `Некорректное количество для "${product.name}": допустимо от ${minQ} до ${maxQ}.`,
-      );
-    }
+    const qty = this.validateOrderQuantity(product, rawQuantity);
 
     const baseCents =
       typeof product.unitPriceUsdCents === 'number' &&
@@ -38,10 +128,15 @@ export class ProductService {
             Number.isInteger(product.priceUsdCents) &&
             product.priceUsdCents > 0
           ? product.priceUsdCents
-          : Math.round(product.price);
+          : product.price;
 
     const safeUnit = assertValidUsdCents(baseCents, 'priceUsdCents');
     const total = safeUnit * qty;
+    if (!Number.isSafeInteger(total) || total <= 0) {
+      throw new Error(
+        `Итоговая стоимость для "${product.name}" превышает допустимый предел.`,
+      );
+    }
 
     return {
       quantity: qty,
@@ -123,6 +218,24 @@ export class ProductService {
     const now = new Date().toISOString();
     const id = sanitizeDocId(`${input.category}_${Date.now()}`);
 
+    const minQuantity = input.minQuantity;
+    const maxQuantity = input.maxQuantity;
+    if (
+      minQuantity !== undefined &&
+      (!Number.isSafeInteger(minQuantity) || minQuantity < 1)
+    ) {
+      throw new Error('minQuantity должен быть целым положительным числом.');
+    }
+    if (
+      maxQuantity !== undefined &&
+      (!Number.isSafeInteger(maxQuantity) ||
+        maxQuantity < (minQuantity ?? 1))
+    ) {
+      throw new Error(
+        'maxQuantity должен быть целым числом не меньше minQuantity.',
+      );
+    }
+
     const product: Product = {
       id,
       name: input.name.trim().slice(0, 120),
@@ -134,8 +247,8 @@ export class ProductService {
         : {}),
       price: cleanPriceCents,
       currency: 'USD',
-      ...(input.minQuantity !== undefined ? { minQuantity: input.minQuantity } : {}),
-      ...(input.maxQuantity !== undefined ? { maxQuantity: input.maxQuantity } : {}),
+      ...(minQuantity !== undefined ? { minQuantity } : {}),
+      ...(maxQuantity !== undefined ? { maxQuantity } : {}),
       ...(input.durationMonths !== undefined
         ? { durationMonths: input.durationMonths }
         : {}),

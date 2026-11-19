@@ -1087,6 +1087,10 @@ export class BalanceService {
         throw new Error('Ваш аккаунт заблокирован администратором.');
       }
 
+      if (existingOrder) {
+        ProductService.validateOrderQuantity(product, existingOrder.quantity);
+      }
+
       const calc = existingOrder
         ? {
             quantity: existingOrder.quantity,
@@ -1099,7 +1103,10 @@ export class BalanceService {
             totalPriceUsdCents:
               existingOrder.totalPriceUsdCents ?? existingOrder.totalPrice,
           }
-        : ProductService.calculateOrderPriceUsdCents(product, params.quantity ?? 1);
+        : ProductService.calculateOrderPriceUsdCents(
+            product,
+            params.quantity === undefined ? 1 : params.quantity,
+          );
 
       const totalPriceUsdCents = assertValidUsdCents(
         calc.totalPriceUsdCents,
@@ -1120,8 +1127,11 @@ export class BalanceService {
       const newBalanceUsd = fromMinorUnits(newBalanceCents);
       const now = new Date().toISOString();
       const balancePaymentId = `bal_pay_${resolvedOrderId}`;
-      const effectiveRecipient =
-        normalizedRecipient || existingOrder?.recipientUsername;
+      const existingRecipient =
+        existingOrder?.recipientUsername !== undefined
+          ? normalizeRecipientUsername(existingOrder.recipientUsername)
+          : undefined;
+      const effectiveRecipient = normalizedRecipient || existingRecipient;
 
       const updatedUser: StoreUser = userSnap
         ? {

@@ -5029,6 +5029,300 @@ async function runFullAuditTestSuite(): Promise<void> {
     },
   );
 
+  await runTest(
+    'S421-01',
+    'Payments',
+    'Stage 4.2.1: Строгая валидация Telegram @username (5..32 символов, правила символов/пробелов/@, запрет пустых значений)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      // Допустимые форматы (5..32 символа, нормализация одного ведущего @ без повреждения)
+      assert.equal(normalizeRecipientUsername('abcde'), 'abcde');
+      assert.equal(normalizeRecipientUsername('@AbC_1'), 'abc_1');
+      assert.equal(normalizeRecipientUsername('  @QuizyStars_5 '), 'quizystars_5');
+      const max32 = 'a' + 'b'.repeat(31);
+      assert.equal(normalizeRecipientUsername(`@${max32}`), max32);
+
+      // Недопустимая длина, символы, пробелы, лишние @, подчёркивания и пустые значения
+      const invalidUsernames = [
+        'abcd',
+        '@abcd',
+        'a' + 'b'.repeat(32), // 33 символа
+        '@@alice',
+        'alice test',
+        '@ alice',
+        'alice\ttest',
+        'user!name',
+        'иван_тест',
+        '_alice',
+        'alice_',
+        'al__ice',
+        '1abcd',
+        '',
+        '   ',
+        '@',
+      ];
+      for (const bad of invalidUsernames) {
+        assert.throws(
+          () => normalizeRecipientUsername(bad),
+          /(@username|Некорректный|Укажите)/,
+          `Ожидался отказ для username=${JSON.stringify(bad)}`,
+        );
+      }
+
+      // Неопределённый (undefined) допускается только если поле не передано
+      assert.equal(normalizeRecipientUsername(undefined), undefined);
+
+      // Проверка интеграции в OrderService.createOrder и setOrderRecipientUsername
+      await assert.rejects(
+        () =>
+          OrderService.createOrder({
+            telegramUser: buyer1,
+            productId: 'stars_custom',
+            quantity: 50,
+            recipientUsername: 'abcd',
+          }),
+        /от 5 до 32/,
+      );
+      await assert.rejects(
+        () =>
+          OrderService.createOrder({
+            telegramUser: buyer1,
+            productId: 'stars_custom',
+            quantity: 50,
+            recipientUsername: '   ',
+          }),
+        /не может быть пустым/,
+      );
+
+      const created = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'gift_star_box',
+        quantity: 1,
+      });
+      assert.equal(created.recipientUsername, undefined);
+
+      await assert.rejects(
+        () => OrderService.setOrderRecipientUsername(created.orderId, buyer1.id, '@@alice'),
+        /Некорректный @username/,
+      );
+      const updatedOrder = await OrderService.setOrderRecipientUsername(
+        created.orderId,
+        buyer1.id,
+        '@Quizy_User5',
+      );
+      assert.equal(updatedOrder.recipientUsername, 'quizy_user5');
+
+      return 'Проверены 5..32 символа, нормализация @, запрет пробелов/спецсимволов/@@/пустых строк и интеграция с OrderService.';
+    },
+  );
+
+  await runTest(
+    'S421-02',
+    'Payments',
+    'Stage 4.2.1: Строгая целочисленная валидация количества Stars (без Math.round, отказ для дробных/<=0/NaN/Infinity/строк)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const bs = new BalanceService();
+
+      const starsCustom = await ProductService.getProductById('stars_custom');
+      const stars100 = await ProductService.getProductById('stars_pack_100');
+      const prem3 = await ProductService.getProductById('premium_3m');
+      assert.ok(starsCustom && stars100 && prem3);
+
+      // Граничные корректные значения stars_custom (50..100000 @ $0.02 = 2 цента/шт)
+      const minCalc = ProductService.calculateOrderPriceUsdCents(starsCustom, 50);
+      assert.deepEqual(minCalc, {
+        quantity: 50,
+        unitPriceUsdCents: 2,
+        totalPriceUsdCents: 100,
+      });
+      const minStrCalc = ProductService.calculateOrderPriceUsdCents(starsCustom, ' 50 ');
+      assert.equal(minStrCalc.quantity, 50);
+      assert.equal(minStrCalc.totalPriceUsdCents, 100);
+
+      const maxCalc = ProductService.calculateOrderPriceUsdCents(starsCustom, 100000);
+      assert.deepEqual(maxCalc, {
+        quantity: 100000,
+        unitPriceUsdCents: 2,
+        totalPriceUsdCents: 200000,
+      });
+
+      // Цены каталога не изменились
+      assert.equal(ProductService.calculateOrderPriceUsdCents(stars100, 1).totalPriceUsdCents, 175);
+      assert.equal(ProductService.calculateOrderPriceUsdCents(prem3, 1).totalPriceUsdCents, 1390);
+
+      // Некорректные количества (включая дробные, которые ранее округлял Math.round)
+      const invalidQuantities: Array<number | string> = [
+        49,
+        100001,
+        50.4,
+        50.9,
+        100.1,
+        '50.5',
+        '50,5',
+        0,
+        '0',
+        -1,
+        -50,
+        '-50',
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        Number.NEGATIVE_INFINITY,
+        '',
+        '   ',
+        'abc',
+        '50stars',
+        '5e1',
+        '+50',
+        null as unknown as number,
+      ];
+
+      for (const badQty of invalidQuantities) {
+        assert.throws(
+          () => ProductService.calculateOrderPriceUsdCents(starsCustom, badQty),
+          /Некорректное количество/,
+          `Ожидался отказ для quantity=${String(badQty)}`,
+        );
+      }
+
+      // Проверка отказа на уровне OrderService.createOrder и BalanceService.purchaseWithInternalBalance
+      await assert.rejects(
+        () =>
+          OrderService.createOrder({
+            telegramUser: buyer1,
+            productId: 'stars_custom',
+            quantity: 50.4,
+            recipientUsername: '@alice_ok',
+          }),
+        /Некорректное количество/,
+      );
+
+      await assert.rejects(
+        () =>
+          bs.purchaseWithInternalBalance({
+            telegramId: buyer1.id,
+            productId: 'stars_custom',
+            quantity: 50.9,
+            recipientUsername: '@alice_ok',
+          }),
+        /Некорректное количество/,
+      );
+
+      return 'Дробные, <=0, NaN, Infinity, нечисловые и граничные значения валидируются строго без округления на всех точках входа.';
+    },
+  );
+
+  await runTest(
+    'S421-03',
+    'Security',
+    'Stage 4.2.1: Согласованность серверной валидации в BalanceService, PaymentService и ProductService.createProduct',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const bs = new BalanceService();
+      const ps = new PaymentService('s421-03');
+
+      await UserService.upsertFromTelegram(buyer1);
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        balanceUsdCents: 10000,
+        balance: 100,
+      });
+
+      // Искусственно повреждённый заказ с дробным количеством не должен пройти ни через BalanceService, ни через PaymentService
+      const orderBadQty = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 'valid_user5',
+      });
+      await firestoreRepo.updateDoc('orders', orderBadQty.orderId, {
+        quantity: 50.5,
+      });
+
+      await assert.rejects(
+        () =>
+          bs.purchaseWithInternalBalance({
+            telegramId: buyer1.id,
+            productId: 'stars_custom',
+            orderId: orderBadQty.orderId,
+          }),
+        /Некорректное количество/,
+      );
+
+      await assert.rejects(
+        () =>
+          ps.createOrReuseOrderPayment({
+            orderId: orderBadQty.orderId,
+            callerTelegramId: buyer1.id,
+            provider: 'cryptobot',
+            currency: 'USD',
+          }),
+        /Некорректное количество/,
+      );
+
+      // Повреждённый recipientUsername в существующем заказе тоже блокируется
+      const orderBadUser = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 50,
+        recipientUsername: 'valid_user5',
+      });
+      await firestoreRepo.updateDoc('orders', orderBadUser.orderId, {
+        recipientUsername: 'abcd',
+      });
+
+      await assert.rejects(
+        () =>
+          bs.purchaseWithInternalBalance({
+            telegramId: buyer1.id,
+            productId: 'stars_custom',
+            orderId: orderBadUser.orderId,
+          }),
+        /Некорректный @username/,
+      );
+
+      await assert.rejects(
+        () =>
+          ps.createOrReuseOrderPayment({
+            orderId: orderBadUser.orderId,
+            callerTelegramId: buyer1.id,
+            provider: 'cryptobot',
+            currency: 'USD',
+          }),
+        /Некорректный @username/,
+      );
+
+      // Админское создание товара отклоняет некорректные minQuantity/maxQuantity
+      await assert.rejects(
+        () =>
+          ProductService.createProduct({
+            name: 'Invalid Stars Pack',
+            description: 'Bad bounds',
+            category: 'stars',
+            price: 100,
+            minQuantity: 10.5,
+            fulfillmentType: 'manual',
+          }),
+        /minQuantity/,
+      );
+      await assert.rejects(
+        () =>
+          ProductService.createProduct({
+            name: 'Invalid Stars Bounds',
+            description: 'min > max',
+            category: 'stars',
+            price: 100,
+            minQuantity: 20,
+            maxQuantity: 10,
+            fulfillmentType: 'manual',
+          }),
+        /maxQuantity/,
+      );
+
+      return 'Единая серверная валидация подтверждена во всех платёжных и каталожных точках входа.';
+    },
+  );
+
   console.log('\n================================================================');
   console.log(`📊 РЕЗУЛЬТАТЫ АВТОТЕСТОВ (${testResults.length}/${testResults.length} PASS):`);
   for (const r of testResults) {
