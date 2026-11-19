@@ -100,12 +100,11 @@ export function formatWelcomeMessage(firstName: string, isAdmin: boolean): strin
   return [
     `${oe('brand')} <b>QuizyStars — привет, ${escapeHtml(firstName)}!</b>`,
     '',
-    'Минималистичный магазин цифровых сервисов Telegram:',
-    `• ${oe('stars')} <b>Telegram Stars</b> — пакеты и любое количество от 50 ⭐`,
-    `• ${oe('premium')} <b>Telegram Premium</b> — подписка на 3, 6 и 12 мес.`,
-    `• ${oe('gifts')} <b>Telegram Gifts</b> — цифровые подарочные наборы`,
+    'Покупка <b>Telegram Stars</b> и <b>Telegram Premium</b>:',
+    `• ${oe('stars')} <b>Telegram Stars</b> — от 50 до 100 000 ⭐ ($0.02 за 1 ⭐)`,
+    `• ${oe('premium')} <b>Telegram Premium</b> — 3, 6 или 12 месяцев`,
     '',
-    `${oe('lock')} <b>Оплата:</b> CryptoBot, xRocket или внутренний баланс (USD).`,
+    `${oe('lock')} <b>Оплата:</b> внутренний баланс (USD), CryptoBot, xRocket.`,
     isAdmin
       ? `\n${oe('admin')} <i>Панель администратора: /admin</i>`
       : '',
@@ -118,10 +117,9 @@ export function formatCatalogOverviewMessage(): string {
   return [
     `${oe('catalog')} <b>Каталог QuizyStars</b>`,
     '',
-    'Выберите категорию:',
-    `• ${oe('stars')} <b>Telegram Stars</b> — от $0.90 / $0.02 за 1 ⭐`,
-    `• ${oe('premium')} <b>Telegram Premium</b> — 3 / 6 / 12 месяцев`,
-    `• ${oe('gifts')} <b>Telegram Gifts</b> — цифровые подарки`,
+    'Выберите товар:',
+    `• ${oe('stars')} <b>Telegram Stars</b> — любое количество (50–100 000 ⭐), $0.02 за 1 ⭐`,
+    `• ${oe('premium')} <b>Telegram Premium</b> — 3 мес. ($13.90), 6 мес. ($19.90), 12 мес. ($34.90)`,
   ].join('\n');
 }
 
@@ -148,7 +146,30 @@ export function formatCategoryListMessage(
     '',
     ...lines,
     '',
-    'Выберите товар ниже:',
+    'Выберите тариф ниже:',
+  ].join('\n');
+}
+
+export function formatPremiumTariffsMessage(products: Product[]): string {
+  const tariffLines = products.map((p) => {
+    const cents = p.priceUsdCents ?? p.price;
+    const months = p.durationMonths ?? '';
+    return `• <b>${months} месяцев</b> — <code>${formatUsdCents(cents)}</code>`;
+  });
+
+  return [
+    `${oe('premium')} <b>Купить Telegram Premium</b>`,
+    '',
+    'Доступные тарифы:',
+    ...(tariffLines.length > 0
+      ? tariffLines
+      : [
+          '• <b>3 месяца</b> — <code>$13.90</code>',
+          '• <b>6 месяцев</b> — <code>$19.90</code>',
+          '• <b>12 месяцев</b> — <code>$34.90</code>',
+        ]),
+    '',
+    'Выберите подходящий срок подписки:',
   ].join('\n');
 }
 
@@ -173,10 +194,10 @@ export function formatPromptCustomQuantityMessage(product: Product): string {
   const maxQ = product.maxQuantity ?? 100000;
   const unitCents = product.unitPriceUsdCents ?? product.priceUsdCents ?? product.price;
   return [
-    `${oe('stars')} <b>${escapeHtml(product.name)}</b>`,
+    `${oe('stars')} <b>Купить Telegram Stars</b>`,
     '',
-    `Введите количество Telegram Stars целым числом от <b>${minQ}</b> до <b>${maxQ}</b>.`,
-    `Цена за 1 ⭐: <code>${formatUsdCents(unitCents)}</code> (пример: <code>100</code> → <code>${formatUsdCents(unitCents * 100)}</code>).`,
+    `Введите количество Stars от <b>${minQ}</b> до <b>${maxQ.toLocaleString('en-US').replace(/,/g, ' ')}</b>.`,
+    `Цена: <code>${formatUsdCents(unitCents)}</code> за 1 ⭐ (например: <code>100</code> = <code>${formatUsdCents(unitCents * 100)}</code>).`,
   ].join('\n');
 }
 
@@ -184,14 +205,54 @@ export function formatPromptRecipientUsernameMessage(params: {
   productName: string;
   quantity: number;
   totalPriceUsdCents: number;
+  category?: ProductCategory;
+  durationMonths?: 3 | 6 | 12;
 }): string {
+  const itemLine =
+    params.category === 'stars'
+      ? `${oe('stars')} Товар: <b>Telegram Stars</b> — <b>${params.quantity} ⭐</b>`
+      : params.category === 'premium' && params.durationMonths
+        ? `${oe('premium')} Тариф: <b>Telegram Premium — ${params.durationMonths} мес.</b>`
+        : `${oe('catalog')} Товар: <b>${escapeHtml(params.productName)}</b> (x${params.quantity})`;
+
   return [
-    `${oe('profile')} <b>Укажите получателя</b>`,
+    `${oe('profile')} <b>Получатель заказа</b>`,
     '',
-    `Товар: <b>${escapeHtml(params.productName)}</b> (x${params.quantity})`,
-    `Сумма: <code>${formatUsdCents(params.totalPriceUsdCents)}</code>`,
+    itemLine,
+    `${oe('amount')} Итого: <b><code>${formatUsdCents(params.totalPriceUsdCents)}</code></b>`,
     '',
-    'Отправьте в чат Telegram <code>@username</code> получателя (например: <code>@username</code>) или нажмите кнопку ниже:',
+    'Отправьте Telegram <code>@username</code> получателя или нажмите кнопку ниже:',
+  ].join('\n');
+}
+
+export function formatOrderConfirmationCardMessage(params: {
+  product: Product;
+  quantity: number;
+  unitPriceUsdCents: number;
+  totalPriceUsdCents: number;
+  recipientUsername: string;
+}): string {
+  const cleanRecipient = params.recipientUsername.replace(/^@/, '').toLowerCase();
+  const isStars = params.product.category === 'stars';
+  const isPremium = params.product.category === 'premium';
+
+  return [
+    `${oe('orderDetail')} <b>Подтверждение заказа</b>`,
+    '',
+    isStars
+      ? `${oe('stars')} Товар: <b>Telegram Stars</b>`
+      : isPremium
+        ? `${oe('premium')} Товар: <b>Telegram Premium</b>`
+        : `${oe('catalog')} Товар: <b>${escapeHtml(params.product.name)}</b>`,
+    isStars
+      ? `🔢 Количество: <b>${params.quantity} ⭐</b>`
+      : isPremium && params.product.durationMonths
+        ? `⏳ Срок подписки: <b>${params.product.durationMonths} мес.</b>`
+        : `🔢 Количество: <b>${params.quantity}</b>`,
+    `${oe('profile')} Получатель: <b>@${escapeHtml(cleanRecipient)}</b>`,
+    `${oe('amount')} Итого: <b><code>${formatUsdCents(params.totalPriceUsdCents)}</code></b>`,
+    '',
+    'Проверьте данные перед переходом к оплате:',
   ].join('\n');
 }
 
@@ -200,17 +261,28 @@ export function formatOrderCheckoutChooserMessage(
   currentBalanceUsdCents: number,
 ): string {
   const orderCents = order.totalPriceUsdCents ?? order.totalPrice;
+  const canAfford = currentBalanceUsdCents >= orderCents;
+  const itemSummary =
+    order.category === 'stars'
+      ? `${oe('stars')} Товар: <b>Telegram Stars</b> (${order.quantity} ⭐)`
+      : order.category === 'premium' && order.durationMonths
+        ? `${oe('premium')} Тариф: <b>Telegram Premium — ${order.durationMonths} мес.</b>`
+        : `${oe('catalog')} Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`;
+
   return [
-    `${oe('orderDetail')} <b>Оформление заказа #${escapeHtml(order.orderId)}</b>`,
+    `${oe('orderDetail')} <b>Оплата заказа #${escapeHtml(order.orderId)}</b>`,
     '',
-    `${oe('catalog')} Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
+    itemSummary,
     order.recipientUsername
       ? `${oe('profile')} Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
       : '',
     `${oe('amount')} К оплате: <b><code>${formatUsdCents(orderCents)}</code></b>`,
-    `${oe('wallet')} Ваш баланс: <code>${formatUsdCents(currentBalanceUsdCents)}</code>`,
+    `${oe('wallet')} Ваш USD-баланс: <code>${formatUsdCents(currentBalanceUsdCents)}</code>${canAfford ? '' : ' <i>(недостаточно средств)</i>'}`,
     '',
     'Выберите способ оплаты:',
+    '1. Внутренний USD-баланс',
+    '2. CryptoBot',
+    '3. xRocket',
   ]
     .filter(Boolean)
     .join('\n');
@@ -688,7 +760,7 @@ export function formatHelpMessage(): string {
     `${oe('help')} <b>Справка QuizyStars</b>`,
     '',
     '/start — Главное меню',
-    '/catalog — Каталог (Stars, Premium, Gifts)',
+    '/catalog — Каталог (Stars и Premium)',
     '/orders — Мои заказы',
     '/profile — Профиль и баланс (USD)',
     '/topup — Пополнить баланс (CryptoBot / xRocket)',
@@ -703,8 +775,8 @@ export function formatTermsMessage(): string {
   return [
     `${oe('terms')} <b>Правила QuizyStars</b>`,
     '',
-    '1. Магазин поставляет цифровые товары Telegram (Stars, Premium, Gifts) после серверной верификации оплаты.',
-    '2. Оплата принимается через CryptoBot, xRocket и с внутреннего баланса USD. Оплата через Telegram Stars (XTR) отключена.',
+    '1. Магазин поставляет Telegram Stars и Telegram Premium для указанного @username после серверной верификации оплаты.',
+    '2. Оплата принимается через внутренний баланс USD, CryptoBot и xRocket. Оплата через Telegram Stars (XTR) отключена.',
     '3. Комиссия на пополнение баланса: CryptoBot — 3%, xRocket — 2% (удерживается из введённой суммы в USD).',
     '4. При отмене или невозможности выдачи заказа средства возвращаются в USD на внутренний баланс либо рассматриваются поддержкой.',
   ].join('\n');

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Context, Telegraf } from 'telegraf';
+import { Telegraf, type Context } from 'telegraf';
 import type { Request, Response } from 'express';
 import {
   firestoreRepo,
@@ -9,6 +9,7 @@ import {
 } from '../db/firestore.ts';
 import {
   OrderService,
+  canUseTelegramUsernameAsRecipient,
   normalizeRecipientUsername,
 } from '../services/OrderService.ts';
 import { PaymentService } from '../services/PaymentService.ts';
@@ -27,11 +28,23 @@ import {
 } from '../bot/bot.ts';
 import { ensureAdmin, ensureOwner } from '../bot/handlers/adminHandler.ts';
 import {
+  clearAllUserInteractiveSessions,
+  clearCallbackDebounceMap,
+  getUserCheckoutSession,
+  registerUserHandlers,
+} from '../bot/handlers/userHandler.ts';
+import { registerPaymentHandlers } from '../bot/handlers/paymentHandler.ts';
+import {
   buildAdminMainKeyboard,
   buildAdminOrderActionKeyboard,
   buildAdminOrderRefundConfirmKeyboard,
+  buildCatalogCategoriesKeyboard,
+  buildMainMenuKeyboard,
   buildOrderCheckoutChooserKeyboard,
+  buildOrderConfirmationKeyboard,
   buildOrderCryptoCurrencyKeyboard,
+  buildPremiumTariffsKeyboard,
+  buildPromptRecipientKeyboard,
   buildTopUpInvoiceKeyboard,
   buildTopUpStep1ProviderKeyboard,
   buildTopUpStep2AmountKeyboard,
@@ -79,9 +92,12 @@ import {
   oeSvg,
 } from '../bot/outlineEmoji.ts';
 import {
+  formatAdminOrderCard,
   formatCatalogOverviewMessage,
   formatHelpMessage,
   formatOrderCheckoutChooserMessage,
+  formatOrderConfirmationCardMessage,
+  formatPremiumTariffsMessage,
   formatTermsMessage,
   formatTopUpInvoiceCardMessage,
   formatTopUpStep2AmountMessage,
@@ -134,6 +150,121 @@ function createMockBot(
       },
     },
   } as unknown as Telegraf;
+}
+
+interface CapturedBotCall {
+  method: string;
+  text: string;
+  showAlert?: boolean;
+  replyMarkupJson: string;
+  callbacks: string[];
+}
+
+function createWiredBotHarness() {
+  const bot = new Telegraf('000000:TEST_HARNESS_TOKEN');
+  (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = {
+    id: 999000111,
+    is_bot: true,
+    first_name: 'QuizyStars',
+    username: 'quizystars_bot',
+    can_join_groups: false,
+    can_read_all_group_messages: false,
+    supports_inline_queries: false,
+  };
+
+  const calls: CapturedBotCall[] = [];
+  let updateSeq = 1;
+  let messageSeq = 100;
+
+  const mockCallApi = async (
+    method: string,
+    payload: Record<string, unknown>,
+  ): Promise<unknown> => {
+    const markup = payload.reply_markup as
+      | { inline_keyboard?: Array<Array<{ callback_data?: string }>> }
+      | undefined;
+    const callbacks = (markup?.inline_keyboard ?? [])
+      .flat()
+      .map((b) => b.callback_data)
+      .filter((v): v is string => Boolean(v));
+    calls.push({
+      method,
+      text: String(payload.text ?? ''),
+      showAlert: payload.show_alert === true,
+      replyMarkupJson: JSON.stringify(markup ?? null),
+      callbacks,
+    });
+    if (method === 'answerCallbackQuery') return true;
+    return {
+      message_id: ++messageSeq,
+      date: 1700000000,
+      chat: { id: payload.chat_id ?? 1, type: 'private' },
+      text: String(payload.text ?? ''),
+    };
+  };
+
+  (bot.telegram as unknown as {
+    callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown>;
+  }).callApi = mockCallApi;
+
+  bot.use((ctx, next) => {
+    (ctx.telegram as unknown as {
+      callApi: (method: string, payload: Record<string, unknown>) => Promise<unknown>;
+    }).callApi = mockCallApi;
+    return next();
+  });
+
+  registerUserHandlers(bot);
+  registerPaymentHandlers(bot);
+
+  return {
+    bot,
+    calls,
+    lastUiCall: () =>
+      [...calls]
+        .reverse()
+        .find((c) => c.method === 'sendMessage' || c.method === 'editMessageText'),
+    lastAnswer: () =>
+      [...calls].reverse().find((c) => c.method === 'answerCallbackQuery'),
+    sendCallback: async (
+      from: { id: number; username?: string; first_name: string; last_name?: string },
+      data: string,
+    ) => {
+      await bot.handleUpdate({
+        update_id: ++updateSeq,
+        callback_query: {
+          id: `cb_${updateSeq}`,
+          from: { ...from, is_bot: false },
+          chat_instance: 'test_chat_instance',
+          message: {
+            message_id: messageSeq,
+            date: 1700000000,
+            chat: { id: from.id, type: 'private' },
+            text: 'previous',
+          },
+          data,
+        },
+      } as unknown as Parameters<Telegraf['handleUpdate']>[0]);
+    },
+    sendText: async (
+      from: { id: number; username?: string; first_name: string; last_name?: string },
+      text: string,
+    ) => {
+      await bot.handleUpdate({
+        update_id: ++updateSeq,
+        message: {
+          message_id: ++messageSeq,
+          date: 1700000000,
+          chat: { id: from.id, type: 'private' },
+          from: { ...from, is_bot: false },
+          text,
+          ...(text.startsWith('/')
+            ? { entities: [{ offset: 0, length: text.split(' ')[0].length, type: 'bot_command' }] }
+            : {}),
+        },
+      } as unknown as Parameters<Telegraf['handleUpdate']>[0]);
+    },
+  };
 }
 
 function createMockExpressRes(): {
@@ -5320,6 +5451,623 @@ async function runFullAuditTestSuite(): Promise<void> {
       );
 
       return 'Единая серверная валидация подтверждена во всех платёжных и каталожных точках входа.';
+    },
+  );
+
+  await runTest(
+    'S422-01',
+    'Security',
+    'Stage 4.2.2: Удаление Gifts из пользовательского UI, 6 кнопок главного меню и сохранение исторических записей Gifts в БД',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+
+      // 1. Главное меню покупателя содержит ровно 6 кнопок без Gifts и админ-кнопки (7 с админом)
+      const buyerMenu = buildMainMenuKeyboard(false);
+      const buyerButtons = buyerMenu.reply_markup.inline_keyboard.flat();
+      assert.equal(buyerButtons.length, 6);
+      assert.deepEqual(
+        buyerButtons.map((b) => (b as { callback_data?: string }).callback_data),
+        ['cat:stars', 'cat:premium', 'menu:orders', 'menu:profile', 'menu:topup', 'menu:support'],
+      );
+      assert.equal(JSON.stringify(buyerMenu).toLowerCase().includes('gift'), false);
+
+      const adminMenu = buildMainMenuKeyboard(true);
+      const adminButtons = adminMenu.reply_markup.inline_keyboard.flat();
+      assert.equal(adminButtons.length, 7);
+
+      // 2. Категории, приветствие, справка, правила и покупательский каталог не содержат Gifts
+      const catKb = JSON.stringify(buildCatalogCategoriesKeyboard());
+      assert.equal(catKb.includes('cat:gifts'), false);
+      assert.equal(catKb.includes('cat:stars'), true);
+      assert.equal(catKb.includes('cat:premium'), true);
+
+      for (const text of [
+        formatWelcomeMessage('Buyer', false),
+        formatCatalogOverviewMessage(),
+        formatHelpMessage(),
+        formatTermsMessage(),
+      ]) {
+        assert.equal(/gift|подар/i.test(text), false, `Обнаружено упоминание Gifts в тексте: ${text}`);
+      }
+
+      const buyerProducts = await ProductService.getBuyerCatalogProducts();
+      assert.deepEqual(
+        buyerProducts.map((p) => p.id).sort(),
+        ['premium_12m', 'premium_3m', 'premium_6m', 'stars_custom'],
+      );
+
+      // 3. Создаём исторический заказ Gifts в БД (имитация старой записи) и проверяем, что он читается и виден админу, но недоступен покупателю через UI
+      const historicalGift = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'gift_star_box',
+        quantity: 1,
+      });
+      assert.equal(historicalGift.category, 'gifts');
+      const loadedHistorical = await OrderService.getOrderById(historicalGift.orderId);
+      assert.ok(loadedHistorical);
+      assert.ok(formatAdminOrderCard(loadedHistorical).includes(historicalGift.orderId));
+
+      const harness = createWiredBotHarness();
+      await harness.sendCallback(buyer1, 'cat:gifts');
+      assert.equal(harness.lastAnswer()?.text?.includes('отключён'), true);
+      assert.equal(harness.lastUiCall()?.callbacks.includes('cat:gifts'), false);
+      assert.equal(harness.lastUiCall()?.callbacks.length, 6);
+
+      await harness.sendCallback(buyer1, 'prod:gift_star_box');
+      assert.equal(harness.lastAnswer()?.text?.includes('больше не доступен'), true);
+      assert.equal(harness.lastUiCall()?.callbacks.length, 6);
+
+      await harness.sendCallback(buyer1, 'buy_bal:gift_star_box');
+      assert.equal(harness.lastAnswer()?.text?.includes('отключена'), true);
+      const ordersCountAfterGiftBlocked = (await OrderService.getUserOrders(buyer1.id)).length;
+      assert.equal(ordersCountAfterGiftBlocked, 1); // Только исходный исторический заказ
+
+      return 'Gifts полностью убран из меню и сценариев покупателя (6 кнопок в главном меню), исторические записи Gifts в БД сохранены.';
+    },
+  );
+
+  await runTest(
+    'S422-02',
+    'Payments',
+    'Stage 4.2.2: Покупка Stars (произвольное целое количество 50..100000, без пакетов, подтверждение до создания заказа, идемпотентность)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+
+      // 1. Нажатие «⭐ Купить Stars» сразу запрашивает произвольное количество без показа пакетов 50/100/250/500/1000
+      await harness.sendCallback(buyer1, 'cat:stars');
+      const qtyPrompt = harness.lastUiCall()!;
+      assert.ok(qtyPrompt.text.includes('Введите количество Stars'));
+      assert.equal(qtyPrompt.callbacks.some((c) => c.startsWith('prod:stars_pack_')), false);
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      // 2. Отклонение невалидных количеств без округления и без создания Order
+      for (const badInput of ['49', '100001', '50.5', '0', '-100', 'abc']) {
+        await harness.sendText(buyer1, badInput);
+        const errReply = harness.lastUiCall()!;
+        assert.ok(
+          errReply.text.includes('Некорректное количество'),
+          `Ожидалась ошибка для "${badInput}", получено: ${errReply.text}`,
+        );
+        assert.equal(getUserCheckoutSession(buyer1.id)?.mode, 'stars_qty');
+        assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+      }
+
+      // 3. Ввод 1000 Stars -> итог $20.00 -> запрос @username с кнопкой «Купить себе»
+      await harness.sendText(buyer1, '1000');
+      const rcptPrompt = harness.lastUiCall()!;
+      assert.ok(rcptPrompt.text.includes('1000 ⭐'));
+      assert.ok(rcptPrompt.text.includes('$20.00'));
+      assert.ok(rcptPrompt.callbacks.includes('rcpt_self'));
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      // 4. Выбор себя -> отображается карточка подтверждения, заказ в БД ЕЩЁ НЕ создан!
+      await harness.sendCallback(buyer1, 'rcpt_self');
+      const confirmUi = harness.lastUiCall()!;
+      assert.ok(confirmUi.text.includes('Подтверждение заказа'));
+      assert.ok(confirmUi.text.includes('1000 ⭐'));
+      assert.ok(confirmUi.text.includes(`@${buyer1.username!.toLowerCase()}`));
+      assert.ok(confirmUi.text.includes('$20.00'));
+      assert.deepEqual(confirmUi.callbacks, [
+        'checkout:proceed',
+        'checkout:edit_qty',
+        'checkout:edit_recipient',
+        'checkout:cancel',
+      ]);
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      // 5. Двойное нажатие «Перейти к оплате» создаёт строго 1 заказ и открывает единый экран оплаты
+      await Promise.all([
+        harness.sendCallback(buyer1, 'checkout:proceed'),
+        harness.sendCallback(buyer1, 'checkout:proceed'),
+      ]);
+      const createdOrders = await OrderService.getUserOrders(buyer1.id);
+      assert.equal(createdOrders.length, 1);
+      const order = createdOrders[0];
+      assert.equal(order.productId, 'stars_custom');
+      assert.equal(order.quantity, 1000);
+      assert.equal(order.unitPriceUsdCents, 2);
+      assert.equal(order.totalPriceUsdCents, 2000);
+      assert.equal(order.recipientUsername, buyer1.username!.toLowerCase());
+      assert.equal(getUserCheckoutSession(buyer1.id), undefined);
+
+      const chooserUi = harness.lastUiCall()!;
+      assert.ok(chooserUi.text.includes('Оплата заказа'));
+      assert.ok(chooserUi.text.includes('1. Внутренний USD-баланс'));
+      assert.ok(chooserUi.text.includes('2. CryptoBot'));
+      assert.ok(chooserUi.text.includes('3. xRocket'));
+
+      return 'Stars flow проверен end-to-end: свободное количество 50..100000 ($0.02), отказ невалидного ввода, подтверждение до БД и защита от дублей.';
+    },
+  );
+
+  await runTest(
+    'S422-03',
+    'Payments',
+    'Stage 4.2.2: Покупка Telegram Premium (ровно 3 тарифа: 3/6/12 мес., фиксированное quantity=1, защита сроков)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+
+      // 1. Категория Premium показывает ровно 3 фиксированных тарифа
+      await harness.sendCallback(buyer1, 'cat:premium');
+      const tariffsUi = harness.lastUiCall()!;
+      assert.deepEqual(tariffsUi.callbacks, [
+        'prem:select:premium_3m',
+        'prem:select:premium_6m',
+        'prem:select:premium_12m',
+        'menu:home',
+      ]);
+      assert.ok(tariffsUi.text.includes('$13.90'));
+      assert.ok(tariffsUi.text.includes('$19.90'));
+      assert.ok(tariffsUi.text.includes('$34.90'));
+
+      // 2. Выбор 6 месяцев ($19.90) сразу запрашивает получателя (минуя ввод количества)
+      await harness.sendCallback(buyer1, 'prem:select:premium_6m');
+      const rcptUi = harness.lastUiCall()!;
+      assert.ok(rcptUi.text.includes('Telegram Premium — 6 мес.'));
+      assert.ok(rcptUi.text.includes('$19.90'));
+
+      // 3. Ввод другого @username -> карточка подтверждения БЕЗ кнопки изменения количества
+      await harness.sendText(buyer1, '@Target_User6');
+      const confirmUi = harness.lastUiCall()!;
+      assert.ok(confirmUi.text.includes('Подтверждение заказа'));
+      assert.ok(confirmUi.text.includes('6 мес.'));
+      assert.ok(confirmUi.text.includes('@target_user6'));
+      assert.ok(confirmUi.text.includes('$19.90'));
+      assert.deepEqual(confirmUi.callbacks, [
+        'checkout:proceed',
+        'cat:premium',
+        'checkout:edit_recipient',
+        'checkout:cancel',
+      ]);
+      assert.equal(confirmUi.callbacks.includes('checkout:edit_qty'), false);
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      // Попытка вручную вызвать checkout:edit_qty на Premium отклоняется
+      await harness.sendCallback(buyer1, 'checkout:edit_qty');
+      assert.ok(harness.lastAnswer()?.text?.includes('только при покупке Telegram Stars'));
+
+      // 4. Подтверждение создаёт 1 заказ Premium с durationMonths=6 и quantity=1
+      await harness.sendCallback(buyer1, 'checkout:proceed');
+      const orders = await OrderService.getUserOrders(buyer1.id);
+      assert.equal(orders.length, 1);
+      assert.equal(orders[0].productId, 'premium_6m');
+      assert.equal(orders[0].durationMonths, 6);
+      assert.equal(orders[0].quantity, 1);
+      assert.equal(orders[0].totalPriceUsdCents, 1990);
+      assert.equal(orders[0].recipientUsername, 'target_user6');
+
+      // 5. Защита от произвольных сроков и quantity != 1 в сервисах
+      await assert.rejects(
+        () =>
+          ProductService.createProduct({
+            name: 'Premium 9 Months Invalid',
+            description: 'Unsupported',
+            category: 'premium',
+            priceUsdCents: 2500,
+            durationMonths: 9 as unknown as 3,
+          }),
+        /только 3, 6 или 12 месяцев/,
+      );
+      await assert.rejects(
+        () =>
+          OrderService.createOrder({
+            telegramUser: buyer1,
+            productId: 'premium_3m',
+            quantity: 2,
+            recipientUsername: '@valid_user5',
+          }),
+        /количество всегда равно 1/,
+      );
+
+      return 'Premium flow проверен: ровно 3 тарифа ($13.90/$19.90/$34.90), quantity=1, редактирование срока, запрет произвольных сроков.';
+    },
+  );
+
+  await runTest(
+    'S422-04',
+    'Payments',
+    'Stage 4.2.2: Единый экран оплаты (Баланс USD, CryptoBot, xRocket), нехватка баланса и защита от подмены/отмены/пропуска получателя',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+      const bs = new BalanceService();
+
+      await UserService.upsertFromTelegram(buyer1);
+      // Баланс $0.50 (50 центов) — недостаточно для заказа за $13.90
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        balanceUsdCents: 50,
+        balance: 0.5,
+      });
+
+      const order1 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@buyer_one',
+        requireRecipient: true,
+      });
+
+      await harness.sendCallback(buyer1, `ordpay_menu:${order1.orderId}`);
+      const lowBalChooser = harness.lastUiCall()!;
+      assert.ok(lowBalChooser.text.includes('1. Внутренний USD-баланс'));
+      assert.ok(lowBalChooser.text.includes('2. CryptoBot'));
+      assert.ok(lowBalChooser.text.includes('3. xRocket'));
+      assert.equal(lowBalChooser.text.includes('XTR'), false);
+      assert.ok(lowBalChooser.callbacks.includes(`pay_bal_insuff:${order1.orderId}`));
+      assert.ok(lowBalChooser.callbacks.includes(`pay_ord_prov:cryptobot:${order1.orderId}`));
+      assert.ok(lowBalChooser.callbacks.includes(`pay_ord_prov:xrocket:${order1.orderId}`));
+
+      // Нажатие при недостатке средств показывает точный дефицит и кнопку пополнения; баланс не меняется
+      await harness.sendCallback(buyer1, `pay_bal_insuff:${order1.orderId}`);
+      assert.ok(harness.lastAnswer()?.text?.includes('Не хватает $13.40'));
+      assert.ok(harness.lastUiCall()?.callbacks.includes('menu:topup'));
+      assert.equal(await bs.getBalanceUsdCents(buyer1.id), 50);
+
+      // Пополняем баланс до $25.00 и проверяем атомарную оплату + защиту от двойного списания
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        balanceUsdCents: 2500,
+        balance: 25,
+      });
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, `ordpay_menu:${order1.orderId}`);
+      assert.ok(harness.lastUiCall()?.callbacks.includes(`pay_bal:${order1.orderId}`));
+
+      await Promise.all([
+        harness.sendCallback(buyer1, `pay_bal:${order1.orderId}`),
+        harness.sendCallback(buyer1, `pay_bal:${order1.orderId}`),
+      ]);
+      assert.equal(await bs.getBalanceUsdCents(buyer1.id), 1110); // 2500 - 1390
+      const paidOrder1 = await OrderService.getOrderById(order1.orderId);
+      assert.equal(paidOrder1?.paymentStatus, 'paid');
+
+      // CryptoBot и xRocket для второго заказа + запрет изменения получателя/цены после создания инвойса
+      const order2 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 100, // $2.00
+        recipientUsername: '@target_crypto',
+        requireRecipient: true,
+      });
+      let createdInvoiceNum = 0;
+      const transport = async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/getExchangeRates')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: [
+                { source: 'USDT', target: 'USD', rate: '1.00', is_valid: true },
+                { source: 'TON', target: 'USD', rate: '5.50', is_valid: true },
+              ],
+            },
+          };
+        }
+        if (req.url.endsWith('/api/v1/rates')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              data: { USDT: '1.00', TON: '5.50' },
+            },
+          };
+        }
+        if (req.url.endsWith('/api/v1/currencies')) {
+          return {
+            status: 200,
+            ok: true,
+            json: [
+              { currency: 'USDT', networks: ['TON', 'TRC-20', 'BEP-20', 'ERC-20'] },
+              { currency: 'TON', networks: ['TON'] },
+            ],
+          };
+        }
+        if (req.url.endsWith('/createInvoice')) {
+          createdInvoiceNum += 1;
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                invoice_id: `inv_s422_${createdInvoiceNum}`,
+                status: 'active',
+                amount: String(body.amount),
+                asset: 'USDT',
+                bot_invoice_url: `https://t.me/CryptoBot?start=s422_${createdInvoiceNum}`,
+                payload: String(body.payload),
+              },
+            },
+          };
+        }
+        if (req.url.includes('/getInvoices')) {
+          return {
+            status: 200,
+            ok: true,
+            json: {
+              ok: true,
+              result: {
+                items: [
+                  {
+                    invoice_id: 'inv_s422_1',
+                    status: 'paid',
+                    amount: '2.00',
+                    asset: 'USDT',
+                    paid_asset: 'USDT',
+                    payload: '',
+                  },
+                ],
+              },
+            },
+          };
+        }
+        if (req.url.endsWith('/api/v1/invoices') && req.method === 'POST') {
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          return {
+            status: 201,
+            ok: true,
+            json: {
+              id: 'xr_s422_1',
+              priceAmount: String(body.priceAmount || '2.00'),
+              priceCurrency: String(body.priceCurrency || 'USDT'),
+              clientInvoiceId: String(body.clientInvoiceId || ''),
+              status: 'PENDING',
+              links: {
+                telegramBotLink: 'https://t.me/xrocket?start=xr_s422_1',
+              },
+            },
+          };
+        }
+        throw new Error(`Unexpected call: ${req.url}`);
+      };
+      const ps = new PaymentService('s422-04', new PaymentProviderGateway(transport, TEST_MOCK_CREDS));
+      const invCb = await ps.createOrReuseOrderPayment({
+        orderId: order2.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'cryptobot',
+        currency: 'USDT',
+        requireRecipient: true,
+      });
+      assert.equal(invCb.payment.expectedUsdCents, 200);
+
+      // После выставления счёта менять получателя запрещено
+      await assert.rejects(
+        () => OrderService.setOrderRecipientUsername(order2.orderId, buyer1.id, '@another_user'),
+        /после выставления счёта/,
+      );
+
+      // Подмена суммы в заказе после создания счёта блокируется при проверке платежа
+      await firestoreRepo.updateDoc<Order>('orders', order2.orderId, {
+        totalPriceUsdCents: 9999,
+        totalPrice: 9999,
+      });
+      await assert.rejects(
+        () => ps.verifyAndProcessOrderPayment(invCb.payment.paymentId),
+        /Нарушение целостности суммы заказа/,
+      );
+
+      // Переиспользование xRocket на новом заказе
+      const order3 = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'stars_custom',
+        quantity: 100,
+        recipientUsername: '@target_xr',
+        requireRecipient: true,
+      });
+      const invXr = await ps.createOrReuseOrderPayment({
+        orderId: order3.orderId,
+        callerTelegramId: buyer1.id,
+        provider: 'xrocket',
+        currency: 'USDT',
+        network: 'TON',
+        requireRecipient: true,
+      });
+      assert.equal(invXr.payment.provider, 'xrocket');
+
+      // Отмена заказа и запрет его оплаты всеми способами
+      await harness.sendCallback(buyer1, `ucancel:${order3.orderId}`);
+      const cancelledOrder3 = await OrderService.getOrderById(order3.orderId);
+      assert.equal(cancelledOrder3?.paymentStatus, 'cancelled');
+      await assert.rejects(
+        () =>
+          bs.purchaseWithInternalBalance({
+            telegramId: buyer1.id,
+            productId: order3.productId,
+            quantity: order3.quantity,
+            orderId: order3.orderId,
+            recipientUsername: order3.recipientUsername,
+            requireRecipient: true,
+          }),
+        /(отменён|оплачен)/,
+      );
+      await assert.rejects(
+        () =>
+          ps.createOrReuseOrderPayment({
+            orderId: order3.orderId,
+            callerTelegramId: buyer1.id,
+            provider: 'cryptobot',
+            currency: 'USDT',
+            requireRecipient: true,
+          }),
+        /(cancelled|не может быть оплачен)/,
+      );
+
+      // Заказ без @recipient блокируется при попытке оплаты
+      const orderNoRcpt = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+      });
+      await assert.rejects(
+        () =>
+          ps.createOrReuseOrderPayment({
+            orderId: orderNoRcpt.orderId,
+            callerTelegramId: buyer1.id,
+            provider: 'cryptobot',
+            currency: 'USDT',
+            requireRecipient: true,
+          }),
+        /получателя/,
+      );
+
+      return 'Единый экран оплаты (Баланс USD/CryptoBot/xRocket), нехватка баланса, отмена заказа, защита от подмены цены и отсутствия получателя подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S422-05',
+    'Security',
+    'Stage 4.2.2: Валидация @username получателя и условный показ кнопки «Купить себе»',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+
+      const validCases: Array<[string, string]> = [
+        ['abcde', 'abcde'],
+        ['@Alice_5', 'alice_5'],
+        ['a_b_c_1', 'a_b_c_1'],
+        ['a' + '1_2'.repeat(10) + 'z', 'a' + '1_2'.repeat(10) + 'z'], // 32 chars
+      ];
+      for (const [raw, expected] of validCases) {
+        assert.equal(normalizeRecipientUsername(raw), expected);
+        assert.equal(canUseTelegramUsernameAsRecipient(raw), expected);
+      }
+
+      const invalidCases = [
+        'abcd',
+        '@ab_c',
+        'a' + 'b'.repeat(32), // 33 chars
+        '_alice5',
+        'alice5_',
+        'al__ice5',
+        '1alice5',
+        'alice test',
+        '@@alice5',
+        'alice-test',
+        'иван_55',
+        '',
+        '   ',
+        '@',
+      ];
+      for (const bad of invalidCases) {
+        assert.throws(() => normalizeRecipientUsername(bad));
+        assert.equal(canUseTelegramUsernameAsRecipient(bad), null);
+      }
+      assert.equal(canUseTelegramUsernameAsRecipient(undefined), null);
+
+      // Кнопка «Купить себе» отображается ТОЛЬКО если username валиден
+      const kbWithSelf = buildPromptRecipientKeyboard('stars', canUseTelegramUsernameAsRecipient('ValidUser5'));
+      const cbWithSelf = kbWithSelf.reply_markup.inline_keyboard
+        .flat()
+        .map((b) => (b as { callback_data?: string }).callback_data);
+      assert.equal(cbWithSelf.includes('rcpt_self'), true);
+
+      const kbWithoutSelf = buildPromptRecipientKeyboard('stars', canUseTelegramUsernameAsRecipient(undefined));
+      const cbWithoutSelf = kbWithoutSelf.reply_markup.inline_keyboard
+        .flat()
+        .map((b) => (b as { callback_data?: string }).callback_data);
+      assert.equal(cbWithoutSelf.includes('rcpt_self'), false);
+
+      const kbShortUser = buildPromptRecipientKeyboard('premium', canUseTelegramUsernameAsRecipient('abc'));
+      const cbShortUser = kbShortUser.reply_markup.inline_keyboard
+        .flat()
+        .map((b) => (b as { callback_data?: string }).callback_data);
+      assert.equal(cbShortUser.includes('rcpt_self'), false);
+
+      // В живом боте пользователь без username не видит rcpt_self и получает отказ при прямой отправке callback rcpt_self
+      const noUsernameBuyer = { id: 888999001, first_name: 'NoHandle' };
+      const harness = createWiredBotHarness();
+      await harness.sendCallback(noUsernameBuyer, 'cat:premium');
+      await harness.sendCallback(noUsernameBuyer, 'prem:select:premium_3m');
+      assert.equal(harness.lastUiCall()?.callbacks.includes('rcpt_self'), false);
+
+      await harness.sendCallback(noUsernameBuyer, 'rcpt_self');
+      assert.ok(harness.lastAnswer()?.text?.includes('не задан корректный @username'));
+
+      return 'Правила Telegram @username (5..32 символов, без _ по краям и __) и условный показ «Купить себе» полностью подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S422-06',
+    'Fulfillment',
+    'Stage 4.2.2: Редактирование количества/получателя/тарифа, возврат Назад и чистая отмена без утечек в БД',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+
+      // 1. Ввод Stars -> получатель -> изменение количества сохраняет получателя и пересчитывает итог
+      await harness.sendCallback(buyer1, 'cat:stars');
+      await harness.sendText(buyer1, '100');
+      await harness.sendText(buyer1, '@First_User');
+      assert.ok(harness.lastUiCall()?.text.includes('$2.00'));
+      assert.ok(harness.lastUiCall()?.text.includes('@first_user'));
+
+      await harness.sendCallback(buyer1, 'checkout:edit_qty');
+      assert.ok(harness.lastUiCall()?.callbacks.includes('checkout:back_confirm'));
+      await harness.sendText(buyer1, '250');
+      assert.ok(harness.lastUiCall()?.text.includes('250 ⭐'));
+      assert.ok(harness.lastUiCall()?.text.includes('$5.00'));
+      assert.ok(harness.lastUiCall()?.text.includes('@first_user'));
+
+      // 2. Изменение получателя: Назад возвращает старого, ввод нового обновляет
+      await harness.sendCallback(buyer1, 'checkout:edit_recipient');
+      await harness.sendCallback(buyer1, 'checkout:back_confirm');
+      assert.ok(harness.lastUiCall()?.text.includes('@first_user'));
+
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'checkout:edit_recipient');
+      await harness.sendText(buyer1, '@Second_User');
+      assert.ok(harness.lastUiCall()?.text.includes('@second_user'));
+      assert.ok(harness.lastUiCall()?.text.includes('250 ⭐'));
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      // 3. Отмена до подтверждения очищает сессию и возвращает в главное меню без создания Order
+      await harness.sendCallback(buyer1, 'checkout:cancel');
+      assert.equal(getUserCheckoutSession(buyer1.id), undefined);
+      assert.equal(harness.lastUiCall()?.callbacks.length, 6);
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      // 4. Команда /start посреди сценария чисто сбрасывает сессию
+      await harness.sendCallback(buyer1, 'cat:stars');
+      assert.equal(getUserCheckoutSession(buyer1.id)?.mode, 'stars_qty');
+      await harness.sendText(buyer1, '/start');
+      assert.equal(getUserCheckoutSession(buyer1.id), undefined);
+
+      return 'Навигация редактирования (количество/получатель/назад) и чистая отмена сессии без мусорных заказов подтверждены.';
     },
   );
 

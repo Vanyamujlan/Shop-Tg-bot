@@ -1028,6 +1028,7 @@ export class BalanceService {
     quantity?: number;
     orderId?: string;
     recipientUsername?: string;
+    requireRecipient?: boolean;
   }): Promise<{
     order: Order;
     duplicate: boolean;
@@ -1071,7 +1072,9 @@ export class BalanceService {
         if (
           existingOrder.paymentStatus === 'cancelled' ||
           existingOrder.paymentStatus === 'refunded' ||
-          existingOrder.paymentStatus === 'failed'
+          existingOrder.paymentStatus === 'failed' ||
+          existingOrder.fulfillmentStatus === 'cancelled' ||
+          existingOrder.fulfillmentStatus === 'refunded'
         ) {
           throw new Error(
             `Заказ ${resolvedOrderId} находится в статусе ${existingOrder.paymentStatus} и не может быть оплачен.`,
@@ -1108,6 +1111,33 @@ export class BalanceService {
             params.quantity === undefined ? 1 : params.quantity,
           );
 
+      const resolvedDurationMonths =
+        product.category === 'premium'
+          ? (existingOrder?.durationMonths ??
+            product.durationMonths ??
+            (product.id === 'premium_3m'
+              ? 3
+              : product.id === 'premium_6m'
+                ? 6
+                : product.id === 'premium_12m'
+                  ? 12
+                  : undefined))
+          : undefined;
+
+      const existingRecipient =
+        existingOrder?.recipientUsername !== undefined
+          ? normalizeRecipientUsername(existingOrder.recipientUsername)
+          : undefined;
+      const effectiveRecipient = normalizedRecipient || existingRecipient;
+
+      if (
+        (params.requireRecipient ||
+          product.id === ProductService.BUYER_STARS_PRODUCT_ID) &&
+        !effectiveRecipient
+      ) {
+        throw new Error('Укажите @username получателя перед оплатой заказа.');
+      }
+
       const totalPriceUsdCents = assertValidUsdCents(
         calc.totalPriceUsdCents,
         'totalPriceUsdCents',
@@ -1127,11 +1157,6 @@ export class BalanceService {
       const newBalanceUsd = fromMinorUnits(newBalanceCents);
       const now = new Date().toISOString();
       const balancePaymentId = `bal_pay_${resolvedOrderId}`;
-      const existingRecipient =
-        existingOrder?.recipientUsername !== undefined
-          ? normalizeRecipientUsername(existingOrder.recipientUsername)
-          : undefined;
-      const effectiveRecipient = normalizedRecipient || existingRecipient;
 
       const updatedUser: StoreUser = userSnap
         ? {
@@ -1162,6 +1187,9 @@ export class BalanceService {
         ? {
             ...existingOrder,
             ...(effectiveRecipient ? { recipientUsername: effectiveRecipient } : {}),
+            ...(resolvedDurationMonths !== undefined
+              ? { durationMonths: resolvedDurationMonths as 3 | 6 | 12 }
+              : {}),
             unitPriceUsdCents: calc.unitPriceUsdCents,
             totalPriceUsdCents,
             totalPrice: totalPriceUsdCents,
@@ -1186,6 +1214,9 @@ export class BalanceService {
             productId: product.id,
             productName: product.name,
             category: product.category,
+            ...(resolvedDurationMonths !== undefined
+              ? { durationMonths: resolvedDurationMonths as 3 | 6 | 12 }
+              : {}),
             quantity: calc.quantity,
             unitPriceUsdCents: calc.unitPriceUsdCents,
             totalPriceUsdCents,

@@ -9,6 +9,14 @@ import {
 import { assertValidUsdCents } from './Money.ts';
 
 export class ProductService {
+  public static readonly BUYER_STARS_PRODUCT_ID = 'stars_custom';
+  public static readonly BUYER_PREMIUM_IDS = new Set([
+    'premium_3m',
+    'premium_6m',
+    'premium_12m',
+  ]);
+  public static readonly ALLOWED_PREMIUM_DURATIONS = new Set<number>([3, 6, 12]);
+
   /**
    * Resolves effective [minQuantity, maxQuantity] bounds for a product,
    * cross-checking against the canonical catalog definition if present.
@@ -55,12 +63,27 @@ export class ProductService {
 
   /**
    * Strictly validates order/Stars quantity as a positive safe integer within catalog bounds.
+   * Also guarantees Premium duration is strictly 3, 6, or 12 months with quantity === 1.
    * NEVER rounds fractional numbers (e.g., via Math.round, Math.floor, Math.ceil).
    */
   public static validateOrderQuantity(
     product: Product,
     rawQuantity: number | string = 1,
   ): number {
+    if (product.category === 'premium') {
+      const catalogDef = INITIAL_TEST_PRODUCTS.find((p) => p.id === product.id);
+      const effectiveDuration =
+        product.durationMonths ?? catalogDef?.durationMonths;
+      if (
+        effectiveDuration === undefined ||
+        !this.ALLOWED_PREMIUM_DURATIONS.has(effectiveDuration)
+      ) {
+        throw new Error(
+          'Недопустимый срок подписки Telegram Premium: доступны только 3, 6 или 12 месяцев.',
+        );
+      }
+    }
+
     const { minQuantity: minQ, maxQuantity: maxQ } =
       this.getCatalogQuantityBounds(product);
 
@@ -94,6 +117,10 @@ export class ProductService {
       throw new Error(
         `Некорректное количество для "${product.name}": укажите целое положительное число от ${minQ} до ${maxQ}.`,
       );
+    }
+
+    if (product.category === 'premium' && qty !== 1) {
+      throw new Error('Для подписки Telegram Premium количество всегда равно 1.');
     }
 
     if (qty <= 0 || qty < minQ || qty > maxQ) {
@@ -143,6 +170,32 @@ export class ProductService {
       unitPriceUsdCents: safeUnit,
       totalPriceUsdCents: total,
     };
+  }
+
+  public static isBuyerVisibleProduct(product: Product): boolean {
+    if (!product.isActive) return false;
+    return (
+      product.id === this.BUYER_STARS_PRODUCT_ID ||
+      this.BUYER_PREMIUM_IDS.has(product.id)
+    );
+  }
+
+  public static async getBuyerStarsProduct(): Promise<Product | null> {
+    const prod = await this.getProductById(this.BUYER_STARS_PRODUCT_ID);
+    if (!prod || !prod.isActive) return null;
+    return prod;
+  }
+
+  public static async getBuyerPremiumProducts(): Promise<Product[]> {
+    const allPremium = await this.getProductsByCategory('premium', false, 20);
+    return allPremium
+      .filter((p) => this.BUYER_PREMIUM_IDS.has(p.id))
+      .sort((a, b) => (a.durationMonths ?? 0) - (b.durationMonths ?? 0));
+  }
+
+  public static async getBuyerCatalogProducts(): Promise<Product[]> {
+    const all = await this.getAllProducts(false, 100);
+    return all.filter((p) => this.isBuyerVisibleProduct(p));
   }
 
   public static async getAllProducts(
@@ -233,6 +286,16 @@ export class ProductService {
     ) {
       throw new Error(
         'maxQuantity должен быть целым числом не меньше minQuantity.',
+      );
+    }
+
+    if (
+      input.category === 'premium' &&
+      input.durationMonths !== undefined &&
+      !this.ALLOWED_PREMIUM_DURATIONS.has(input.durationMonths)
+    ) {
+      throw new Error(
+        'Недопустимый срок подписки Telegram Premium: доступны только 3, 6 или 12 месяцев.',
       );
     }
 

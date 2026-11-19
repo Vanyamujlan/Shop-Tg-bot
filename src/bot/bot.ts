@@ -179,7 +179,7 @@ class TelegramBotManager {
       // 2. Register bot commands menu in Telegram
       await bot.telegram.setMyCommands([
         { command: 'start', description: 'Главное меню QuizyStars' },
-        { command: 'catalog', description: 'Каталог (Stars, Premium, Gifts)' },
+        { command: 'catalog', description: 'Каталог (Stars и Premium)' },
         { command: 'topup', description: 'Пополнить баланс (USD)' },
         { command: 'orders', description: 'Мои заказы' },
         { command: 'profile', description: 'Профиль и баланс' },

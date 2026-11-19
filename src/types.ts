@@ -219,6 +219,8 @@ export interface Order {
   productName: string;
   category: ProductCategory;
   quantity: number;
+  /** Subscription term in months for Telegram Premium orders (3, 6, or 12) */
+  durationMonths?: 3 | 6 | 12;
   /** Canonical unit and total prices in integer USD cents */
   unitPriceUsdCents?: number;
   totalPriceUsdCents: number;

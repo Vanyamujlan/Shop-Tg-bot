@@ -30,7 +30,6 @@ export function buildMainMenuKeyboard(isAdmin = false) {
   const rows = [
     [Markup.button.callback(`${oeBtn('stars')} Купить Stars`, 'cat:stars')],
     [Markup.button.callback(`${oeBtn('premium')} Купить Premium`, 'cat:premium')],
-    [Markup.button.callback(`${oeBtn('gifts')} Купить Gifts`, 'cat:gifts')],
     [
       Markup.button.callback(`${oeBtn('orders')} Мои заказы`, 'menu:orders'),
       Markup.button.callback(`${oeBtn('profile')} Мой профиль`, 'menu:profile'),
@@ -265,32 +264,57 @@ export function buildTopUpInvoiceKeyboard(topUp: BalanceTopUpRecord) {
 
 export function buildCatalogCategoriesKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('⭐ Telegram Stars', 'cat:stars')],
-    [Markup.button.callback('💎 Telegram Premium', 'cat:premium')],
-    [Markup.button.callback('🎁 Telegram Gifts', 'cat:gifts')],
-    [Markup.button.callback('⬅️ Главное меню', 'menu:home')],
+    [Markup.button.callback(`${oeBtn('stars')} Купить Stars`, 'cat:stars')],
+    [Markup.button.callback(`${oeBtn('premium')} Купить Premium`, 'cat:premium')],
+    [Markup.button.callback(`${oeBtn('home')} Главное меню`, 'menu:home')],
   ]);
 }
 
-export function buildCategoryProductsKeyboard(
-  _category: ProductCategory,
-  products: Product[],
-) {
-  const rows = products.map((product) => {
-    const cents = product.priceUsdCents ?? product.price;
-    const labelPrice =
-      product.currency === 'XTR'
-        ? `${product.price} ⭐`
-        : product.minQuantity && product.minQuantity > 1
-          ? `${formatUsdCents(product.unitPriceUsdCents ?? cents)} / 1 ⭐`
-          : formatUsdCents(cents);
+export function buildPremiumTariffsKeyboard(products: Product[]) {
+  const tariffOrder = ['premium_3m', 'premium_6m', 'premium_12m'];
+  const sorted = [...products]
+    .filter((p) => tariffOrder.includes(p.id))
+    .sort((a, b) => (a.durationMonths ?? 0) - (b.durationMonths ?? 0));
+
+  const rows = sorted.map((p) => {
+    const cents = p.priceUsdCents ?? p.price;
+    const months = p.durationMonths ?? (p.id === 'premium_3m' ? 3 : p.id === 'premium_6m' ? 6 : 12);
+    const monthWord = months === 3 ? 'месяца' : 'месяцев';
     return [
       Markup.button.callback(
-        `${product.name} — ${labelPrice}`,
-        `prod:${product.id}`,
+        `💎 ${months} ${monthWord} — ${formatUsdCents(cents)}`,
+        `prem:select:${p.id}`,
       ),
     ];
   });
+
+  rows.push([Markup.button.callback(`${oeBtn('back')} Назад`, 'menu:home')]);
+  return Markup.inlineKeyboard(rows);
+}
+
+export function buildCategoryProductsKeyboard(
+  category: ProductCategory,
+  products: Product[],
+) {
+  if (category === 'premium') {
+    return buildPremiumTariffsKeyboard(products);
+  }
+
+  const rows = products
+    .filter((p) => p.category !== 'gifts')
+    .map((product) => {
+      const cents = product.priceUsdCents ?? product.price;
+      const labelPrice =
+        product.minQuantity && product.minQuantity > 1
+          ? `${formatUsdCents(product.unitPriceUsdCents ?? cents)} / 1 ⭐`
+          : formatUsdCents(cents);
+      return [
+        Markup.button.callback(
+          `${product.name} — ${labelPrice}`,
+          `prod:${product.id}`,
+        ),
+      ];
+    });
 
   rows.push([
     Markup.button.callback('📂 Категории', 'menu:catalog'),
@@ -308,52 +332,77 @@ export function buildProductDetailKeyboard(product: Product) {
     rows.push([
       Markup.button.callback(
         '✨ Выбрать количество Stars',
-        `buy_custom:${product.id}`,
+        'cat:stars',
       ),
     ]);
-  } else {
+  } else if (product.category === 'premium') {
     rows.push([
       Markup.button.callback(
-        `💳 Купить за ${formatUsdCents(cents)}`,
-        `buy_start:${product.id}`,
+        `💳 Выбрать за ${formatUsdCents(cents)}`,
+        `prem:select:${product.id}`,
       ),
     ]);
-    if (product.category === 'gifts') {
-      rows.push([
-        Markup.button.callback(
-          `💰 Оплатить с баланса (${formatUsdCents(cents)})`,
-          `buy_bal:${product.id}`,
-        ),
-      ]);
-    }
   }
 
   rows.push([
-    Markup.button.callback(
-      `⬅️ ${CATEGORY_LABELS[product.category]}`,
-      `cat:${product.category}`,
-    ),
-    Markup.button.callback('🏠 Меню', 'menu:home'),
+    Markup.button.callback('🏠 Главное меню', 'menu:home'),
   ]);
 
   return Markup.inlineKeyboard(rows);
 }
 
+export function buildPromptStarsQuantityKeyboard(canReturnToConfirm = false) {
+  const rows = [];
+  if (canReturnToConfirm) {
+    rows.push([Markup.button.callback('⬅️ Назад', 'checkout:back_confirm')]);
+  } else {
+    rows.push([Markup.button.callback('⬅️ Назад', 'menu:home')]);
+  }
+  rows.push([Markup.button.callback('❌ Отменить', 'checkout:cancel')]);
+  return Markup.inlineKeyboard(rows);
+}
+
 export function buildPromptRecipientKeyboard(
-  productId: string,
-  selfUsername?: string,
+  category: ProductCategory | string,
+  validSelfUsername?: string | null,
+  canReturnToConfirm = false,
 ) {
   const rows = [];
-  if (selfUsername) {
+  if (validSelfUsername) {
+    const cleanSelf = validSelfUsername.replace(/^@/, '').toLowerCase();
     rows.push([
       Markup.button.callback(
-        `👤 Себе (@${selfUsername})`,
-        `rcpt_self:${productId}`,
+        `👤 Купить себе (@${cleanSelf})`,
+        'rcpt_self',
       ),
     ]);
   }
-  rows.push([Markup.button.callback('❌ Отмена', `prod:${productId}`)]);
+  const backCallback = canReturnToConfirm
+    ? 'checkout:back_confirm'
+    : category === 'stars' || category === 'stars_custom'
+      ? 'stars:edit_qty'
+      : 'cat:premium';
+  rows.push([
+    Markup.button.callback('⬅️ Назад', backCallback),
+    Markup.button.callback('❌ Отменить', 'checkout:cancel'),
+  ]);
   return Markup.inlineKeyboard(rows);
+}
+
+export function buildOrderConfirmationKeyboard(category: ProductCategory) {
+  const editButton =
+    category === 'stars'
+      ? Markup.button.callback('✏️ Изменить количество', 'checkout:edit_qty')
+      : Markup.button.callback('💎 Изменить тариф', 'cat:premium');
+
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('💳 Перейти к оплате', 'checkout:proceed')],
+    [
+      editButton,
+      Markup.button.callback('👤 Изменить получателя', 'checkout:edit_recipient'),
+    ],
+    [Markup.button.callback('❌ Отменить заказ', 'checkout:cancel')],
+  ]);
 }
 
 export function buildOrderCheckoutChooserKeyboard(
@@ -363,14 +412,14 @@ export function buildOrderCheckoutChooserKeyboard(
   const orderCents = order.totalPriceUsdCents ?? order.totalPrice;
   const canAfford = currentBalanceUsdCents >= orderCents;
   const balLabel = canAfford
-    ? `💰 Баланс (${formatUsdCents(currentBalanceUsdCents)})`
-    : `💰 Баланс (${formatUsdCents(currentBalanceUsdCents)} — пополнить)`;
+    ? `💰 Внутренний USD-баланс (${formatUsdCents(currentBalanceUsdCents)})`
+    : `💰 USD-баланс (${formatUsdCents(currentBalanceUsdCents)} — недостаточно)`;
 
   return Markup.inlineKeyboard([
     [
       Markup.button.callback(
         balLabel,
-        canAfford ? `pay_bal:${order.orderId}` : 'menu:topup',
+        canAfford ? `pay_bal:${order.orderId}` : `pay_bal_insuff:${order.orderId}`,
       ),
     ],
     [

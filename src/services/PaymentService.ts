@@ -153,6 +153,7 @@ export class PaymentService {
     customRateUsdStr?: string;
     expiresInSeconds?: number;
     forceNew?: boolean;
+    requireRecipient?: boolean;
   }): Promise<CreateOrderPaymentResult> {
     firestoreRepo.assertReadyForOrdersAndPayments();
 
@@ -168,9 +169,9 @@ export class PaymentService {
     if (order.userTelegramId !== params.callerTelegramId) {
       throw new Error('Вы не можете оплачивать чужой заказ.');
     }
-    if (order.paymentStatus !== 'pending') {
+    if (order.paymentStatus !== 'pending' || order.fulfillmentStatus !== 'pending') {
       throw new Error(
-        `Заказ #${order.orderId} уже имеет статус оплаты "${order.paymentStatus}".`,
+        `Заказ #${order.orderId} уже имеет статус оплаты "${order.paymentStatus}" и не может быть оплачен.`,
       );
     }
 
@@ -179,8 +180,16 @@ export class PaymentService {
       throw new Error('Товар снят с продажи.');
     }
     ProductService.validateOrderQuantity(product, order.quantity);
-    if (order.recipientUsername !== undefined) {
-      normalizeRecipientUsername(order.recipientUsername);
+    const normalizedRecipient =
+      order.recipientUsername !== undefined
+        ? normalizeRecipientUsername(order.recipientUsername)
+        : undefined;
+    if (
+      (params.requireRecipient ||
+        product.id === ProductService.BUYER_STARS_PRODUCT_ID) &&
+      !normalizedRecipient
+    ) {
+      throw new Error('Укажите @username получателя перед оплатой заказа.');
     }
 
     const { currency: normalizedCurr, network: normalizedNet } =
@@ -327,6 +336,7 @@ export class PaymentService {
     customRateUsdStr?: string;
     expiresInSeconds?: number;
     forceNew?: boolean;
+    requireRecipient?: boolean;
   }): Promise<CreateOrderPaymentResult> {
     return this.defaultInstance.createOrReuseOrderPayment(params);
   }
@@ -775,7 +785,10 @@ export class PaymentService {
           );
         }
 
-        if (freshOrder.paymentStatus !== 'pending') {
+        if (
+          freshOrder.paymentStatus !== 'pending' ||
+          freshOrder.fulfillmentStatus !== 'pending'
+        ) {
           throw new Error(
             `Заказ #${freshOrder.orderId} уже имеет статус оплаты "${freshOrder.paymentStatus}" и не может быть повторно оплачен другим платежом.`,
           );
@@ -786,6 +799,11 @@ export class PaymentService {
           freshOrder.totalPriceUsdCents ?? freshOrder.totalPrice,
           'totalPriceUsdCents',
         );
+        if (orderCents !== freshPayment.expectedUsdCents) {
+          throw new Error(
+            `Нарушение целостности суммы заказа #${freshOrder.orderId}: ожидалось ${freshPayment.expectedUsdCents} центов, в заказе ${orderCents} центов.`,
+          );
+        }
         const finalPaymentStatus: PaymentRecordStatus = isOverpaid
           ? 'overpaid'
           : 'paid';

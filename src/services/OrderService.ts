@@ -58,6 +58,18 @@ export function normalizeRecipientUsername(raw?: string): string | undefined {
   return withoutAt.toLowerCase();
 }
 
+/**
+ * Checks whether a user's Telegram @username can be offered as a one-tap "Купить себе" recipient.
+ */
+export function canUseTelegramUsernameAsRecipient(raw?: string): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  try {
+    return normalizeRecipientUsername(raw) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export class OrderService {
   /**
    * Creates a new pending order strictly using the product USD cents price stored in DB.
@@ -73,6 +85,7 @@ export class OrderService {
     productId: string;
     quantity?: number;
     recipientUsername?: string;
+    requireRecipient?: boolean;
   }): Promise<Order> {
     firestoreRepo.assertReadyForOrdersAndPayments();
 
@@ -92,7 +105,37 @@ export class OrderService {
         params.quantity === undefined ? 1 : params.quantity,
       );
 
+    const resolvedDurationMonths =
+      product.category === 'premium'
+        ? (product.durationMonths ??
+          (product.id === 'premium_3m'
+            ? 3
+            : product.id === 'premium_6m'
+              ? 6
+              : product.id === 'premium_12m'
+                ? 12
+                : undefined))
+        : undefined;
+
+    if (
+      product.category === 'premium' &&
+      (resolvedDurationMonths === undefined ||
+        !ProductService.ALLOWED_PREMIUM_DURATIONS.has(resolvedDurationMonths))
+    ) {
+      throw new Error(
+        'Недопустимый срок подписки Telegram Premium: доступны только 3, 6 или 12 месяцев.',
+      );
+    }
+
     const normalizedRecipient = normalizeRecipientUsername(params.recipientUsername);
+    if (
+      (params.requireRecipient ||
+        product.id === ProductService.BUYER_STARS_PRODUCT_ID) &&
+      !normalizedRecipient
+    ) {
+      throw new Error('Укажите @username получателя перед созданием заказа.');
+    }
+
     const now = new Date().toISOString();
     const orderId = sanitizeDocId(
       `ord_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -107,6 +150,9 @@ export class OrderService {
       productId: product.id,
       productName: product.name,
       category: product.category,
+      ...(resolvedDurationMonths !== undefined
+        ? { durationMonths: resolvedDurationMonths as 3 | 6 | 12 }
+        : {}),
       quantity,
       unitPriceUsdCents,
       totalPriceUsdCents,
@@ -154,8 +200,11 @@ export class OrderService {
       if (existing.userTelegramId !== callerTelegramId) {
         throw new Error('Вы не можете изменять чужой заказ.');
       }
-      if (existing.paymentStatus !== 'pending') {
-        throw new Error('Нельзя изменить получателя после оплаты заказа.');
+      if (existing.paymentStatus !== 'pending' || existing.fulfillmentStatus !== 'pending') {
+        throw new Error('Нельзя изменить получателя после оплаты или отмены заказа.');
+      }
+      if (existing.activePaymentId) {
+        throw new Error('Нельзя изменить получателя после выставления счёта на оплату.');
       }
 
       const updated: Order = {

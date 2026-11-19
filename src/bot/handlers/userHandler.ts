@@ -9,6 +9,7 @@ import { UserService } from '../../services/UserService.ts';
 import { ProductService } from '../../services/ProductService.ts';
 import {
   OrderService,
+  canUseTelegramUsernameAsRecipient,
   normalizeRecipientUsername,
 } from '../../services/OrderService.ts';
 import {
@@ -26,11 +27,12 @@ import {
 import {
   buildBackToMenuKeyboard,
   buildCatalogCategoriesKeyboard,
-  buildCategoryProductsKeyboard,
   buildMainMenuKeyboard,
   buildOrderCheckoutChooserKeyboard,
-  buildProductDetailKeyboard,
+  buildOrderConfirmationKeyboard,
+  buildPremiumTariffsKeyboard,
   buildPromptRecipientKeyboard,
+  buildPromptStarsQuantityKeyboard,
   buildTopUpInvoiceKeyboard,
   buildTopUpStep1ProviderKeyboard,
   buildTopUpStep2AmountKeyboard,
@@ -43,12 +45,13 @@ import {
   LiveCurrencyPreviewItem,
   escapeHtml,
   formatCatalogOverviewMessage,
-  formatCategoryListMessage,
   formatHelpMessage,
   formatOrderCheckoutChooserMessage,
+  formatOrderConfirmationCardMessage,
   formatOrderDetailMessage,
   formatPaySupportMessage,
-  formatProductCardMessage,
+  formatPremiumTariffsMessage,
+  formatPromptCustomQuantityMessage,
   formatPromptRecipientUsernameMessage,
   formatSupportedCryptoInfoMessage,
   formatTermsMessage,
@@ -70,9 +73,11 @@ interface UserTopUpCustomSession {
 }
 
 export interface UserCheckoutSession {
-  mode: 'custom_qty' | 'recipient_username';
+  mode: 'stars_qty' | 'recipient_username' | 'confirm_order';
   productId: string;
   quantity?: number;
+  recipientUsername?: string;
+  returnToConfirm?: boolean;
   createdAt: number;
 }
 
@@ -196,12 +201,15 @@ export function getCallbackDebounceMapSize(): number {
   return callbackDebounceMap.size;
 }
 
+const answeredCallbackQueries = new WeakSet<object>();
+
 export async function safeAnswerCbQuery(
   ctx: Context,
   text?: string,
   showAlert = false,
 ): Promise<void> {
-  if (!ctx.callbackQuery) return;
+  if (!ctx.callbackQuery || answeredCallbackQueries.has(ctx.callbackQuery)) return;
+  answeredCallbackQueries.add(ctx.callbackQuery);
   try {
     await ctx.answerCbQuery(text, { show_alert: showAlert });
   } catch {
@@ -321,6 +329,112 @@ export async function renderOrderCheckoutChooser(
     ctx,
     formatOrderCheckoutChooserMessage(order, currentBalanceUsdCents),
     buildOrderCheckoutChooserKeyboard(order, currentBalanceUsdCents),
+  );
+}
+
+export async function renderMainMenu(ctx: Context): Promise<void> {
+  if (!ctx.from) return;
+  clearAllUserInteractiveSessions(ctx.from.id);
+  const isAdmin = await UserService.isAdmin(ctx.from.id);
+  await safeRespondOrEdit(
+    ctx,
+    formatWelcomeMessage(ctx.from.first_name || 'Покупатель', isAdmin),
+    buildMainMenuKeyboard(isAdmin),
+  );
+}
+
+export async function renderCheckoutStarsQuantityPrompt(
+  ctx: Context,
+  canReturnToConfirm = false,
+): Promise<void> {
+  if (!ctx.from) return;
+  const starsProduct = await ProductService.getBuyerStarsProduct();
+  if (!starsProduct) {
+    clearUserCheckoutSession(ctx.from.id);
+    await safeAnswerCbQuery(ctx, 'Покупка Telegram Stars временно недоступна.', true);
+    await renderMainMenu(ctx);
+    return;
+  }
+
+  const prev = getUserCheckoutSession(ctx.from.id);
+  setUserCheckoutSession(ctx.from.id, {
+    mode: 'stars_qty',
+    productId: starsProduct.id,
+    ...(canReturnToConfirm && prev?.recipientUsername
+      ? { recipientUsername: prev.recipientUsername, returnToConfirm: true }
+      : {}),
+    createdAt: Date.now(),
+  });
+
+  await safeRespondOrEdit(
+    ctx,
+    formatPromptCustomQuantityMessage(starsProduct),
+    buildPromptStarsQuantityKeyboard(canReturnToConfirm),
+  );
+}
+
+export async function renderCheckoutRecipientPrompt(
+  ctx: Context,
+  session: UserCheckoutSession,
+): Promise<void> {
+  if (!ctx.from) return;
+  const product = await ProductService.getProductById(session.productId);
+  if (!product || !product.isActive || product.category === 'gifts') {
+    clearUserCheckoutSession(ctx.from.id);
+    await safeAnswerCbQuery(ctx, 'Выбранный товар сейчас недоступен.', true);
+    await renderMainMenu(ctx);
+    return;
+  }
+
+  const qty = product.category === 'premium' ? 1 : (session.quantity ?? 1);
+  const calc = ProductService.calculateOrderPriceUsdCents(product, qty);
+  const validSelfUsername = canUseTelegramUsernameAsRecipient(ctx.from.username);
+  const canReturn = Boolean(session.returnToConfirm && session.recipientUsername);
+
+  await safeRespondOrEdit(
+    ctx,
+    formatPromptRecipientUsernameMessage({
+      productName: product.name,
+      quantity: calc.quantity,
+      totalPriceUsdCents: calc.totalPriceUsdCents,
+      category: product.category,
+      durationMonths: product.durationMonths,
+    }),
+    buildPromptRecipientKeyboard(product.category, validSelfUsername, canReturn),
+  );
+}
+
+export async function renderCheckoutConfirmationCard(
+  ctx: Context,
+  session: UserCheckoutSession,
+): Promise<void> {
+  if (!ctx.from) return;
+  const product = await ProductService.getProductById(session.productId);
+  if (
+    !product ||
+    !product.isActive ||
+    product.category === 'gifts' ||
+    !session.recipientUsername
+  ) {
+    clearUserCheckoutSession(ctx.from.id);
+    await safeAnswerCbQuery(ctx, 'Сессия заказа устарела, начните оформление заново.', true);
+    await renderMainMenu(ctx);
+    return;
+  }
+
+  const qty = product.category === 'premium' ? 1 : (session.quantity ?? 1);
+  const calc = ProductService.calculateOrderPriceUsdCents(product, qty);
+
+  await safeRespondOrEdit(
+    ctx,
+    formatOrderConfirmationCardMessage({
+      product,
+      quantity: calc.quantity,
+      unitPriceUsdCents: calc.unitPriceUsdCents,
+      totalPriceUsdCents: calc.totalPriceUsdCents,
+      recipientUsername: session.recipientUsername,
+    }),
+    buildOrderConfirmationKeyboard(product.category),
   );
 }
 
@@ -847,23 +961,36 @@ export function registerUserHandlers(bot: Telegraf): void {
     await safeRespondOrEdit(ctx, formatHelpMessage(), buildBackToMenuKeyboard());
   });
 
-  // Callback: Выбор категории
+  // Callback: Выбор категории (Gifts скрыт/отключён для покупателей)
   bot.action(/^cat:(stars|premium|gifts)$/, async (ctx) => {
     const category = ctx.match[1] as ProductCategory;
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `cat:${category}`)) {
       return;
     }
-    clearAllUserInteractiveSessions(ctx.from.id);
 
-    const products = await ProductService.getProductsByCategory(category, false);
+    if (category === 'gifts') {
+      clearAllUserInteractiveSessions(ctx.from.id);
+      await safeAnswerCbQuery(ctx, 'Раздел Gifts отключён и больше не доступен.');
+      await renderMainMenu(ctx);
+      return;
+    }
+
+    if (category === 'stars') {
+      clearAllUserInteractiveSessions(ctx.from.id);
+      await renderCheckoutStarsQuantityPrompt(ctx, false);
+      return;
+    }
+
+    clearAllUserInteractiveSessions(ctx.from.id);
+    const products = await ProductService.getBuyerPremiumProducts();
     await safeRespondOrEdit(
       ctx,
-      formatCategoryListMessage(category, products),
-      buildCategoryProductsKeyboard(category, products),
+      formatPremiumTariffsMessage(products),
+      buildPremiumTariffsKeyboard(products),
     );
   });
 
-  // Callback: Карточка товара
+  // Callback: Устаревшие ссылки на карточки товаров (Gifts заблокированы, Stars/Premium ведут в новый flow)
   bot.action(/^prod:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const productId = ctx.match[1];
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `prod:${productId}`)) {
@@ -872,34 +999,38 @@ export function registerUserHandlers(bot: Telegraf): void {
     clearAllUserInteractiveSessions(ctx.from.id);
 
     const product = await ProductService.getProductById(productId);
-    if (!product || !product.isActive) {
-      await safeAnswerCbQuery(ctx, 'Товар не найден или временно отключён.', true);
-      await safeRespondOrEdit(
-        ctx,
-        formatCatalogOverviewMessage(),
-        buildCatalogCategoriesKeyboard(),
-      );
+    if (!product || !product.isActive || product.category === 'gifts') {
+      await safeAnswerCbQuery(ctx, 'Товар больше не доступен.', true);
+      await renderMainMenu(ctx);
       return;
     }
 
-    const caption = formatProductCardMessage(product);
-    const keyboard = buildProductDetailKeyboard(product);
-
-    if (product.imageUrl && product.imageUrl.startsWith('http')) {
-      try {
-        await safeAnswerCbQuery(ctx);
-        await ctx.replyWithPhoto(product.imageUrl, {
-          caption,
-          parse_mode: 'HTML',
-          ...keyboard,
-        });
-        return;
-      } catch {
-        // Fallback to standard text card if photo URL is unreachable
-      }
+    if (product.category === 'stars') {
+      await renderCheckoutStarsQuantityPrompt(ctx, false);
+      return;
     }
 
-    await safeRespondOrEdit(ctx, caption, keyboard);
+    if (
+      product.category === 'premium' &&
+      ProductService.BUYER_PREMIUM_IDS.has(product.id)
+    ) {
+      const nextSession: UserCheckoutSession = {
+        mode: 'recipient_username',
+        productId: product.id,
+        quantity: 1,
+        createdAt: Date.now(),
+      };
+      setUserCheckoutSession(ctx.from.id, nextSession);
+      await renderCheckoutRecipientPrompt(ctx, nextSession);
+      return;
+    }
+
+    const products = await ProductService.getBuyerPremiumProducts();
+    await safeRespondOrEdit(
+      ctx,
+      formatPremiumTariffsMessage(products),
+      buildPremiumTariffsKeyboard(products),
+    );
   });
 
   // Callback: Детали заказа покупателя
@@ -1001,7 +1132,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     if (checkoutSession) {
       try {
         const product = await ProductService.getProductById(checkoutSession.productId);
-        if (!product || !product.isActive) {
+        if (!product || !product.isActive || product.category === 'gifts') {
           clearUserCheckoutSession(ctx.from.id);
           await ctx.reply('❌ Товар больше недоступен для покупки.', {
             parse_mode: 'HTML',
@@ -1010,25 +1141,37 @@ export function registerUserHandlers(bot: Telegraf): void {
           return;
         }
 
-        if (checkoutSession.mode === 'custom_qty') {
+        if (checkoutSession.mode === 'stars_qty') {
+          if (product.category !== 'stars') {
+            clearUserCheckoutSession(ctx.from.id);
+            await ctx.reply('❌ Количество для этого товара фиксировано.', {
+              parse_mode: 'HTML',
+              ...buildBackToMenuKeyboard(),
+            });
+            return;
+          }
           const calc = ProductService.calculateOrderPriceUsdCents(product, text);
-          setUserCheckoutSession(ctx.from.id, {
+          if (checkoutSession.returnToConfirm && checkoutSession.recipientUsername) {
+            const nextSession: UserCheckoutSession = {
+              mode: 'confirm_order',
+              productId: product.id,
+              quantity: calc.quantity,
+              recipientUsername: checkoutSession.recipientUsername,
+              createdAt: Date.now(),
+            };
+            setUserCheckoutSession(ctx.from.id, nextSession);
+            await renderCheckoutConfirmationCard(ctx, nextSession);
+            return;
+          }
+
+          const nextSession: UserCheckoutSession = {
             mode: 'recipient_username',
             productId: product.id,
             quantity: calc.quantity,
             createdAt: Date.now(),
-          });
-          await ctx.reply(
-            formatPromptRecipientUsernameMessage({
-              productName: `${product.name} (${calc.quantity} ⭐)`,
-              quantity: calc.quantity,
-              totalPriceUsdCents: calc.totalPriceUsdCents,
-            }),
-            {
-              parse_mode: 'HTML',
-              ...buildPromptRecipientKeyboard(product.id, ctx.from.username),
-            },
-          );
+          };
+          setUserCheckoutSession(ctx.from.id, nextSession);
+          await renderCheckoutRecipientPrompt(ctx, nextSession);
           return;
         }
 
@@ -1037,20 +1180,27 @@ export function registerUserHandlers(bot: Telegraf): void {
           if (!normalized) {
             throw new Error('Укажите @username получателя.');
           }
-          const qty = checkoutSession.quantity ?? 1;
-          const order = await OrderService.createOrder({
-            telegramUser: ctx.from,
+          const qty = product.category === 'premium' ? 1 : (checkoutSession.quantity ?? 1);
+          ProductService.calculateOrderPriceUsdCents(product, qty);
+
+          const nextSession: UserCheckoutSession = {
+            mode: 'confirm_order',
             productId: product.id,
             quantity: qty,
             recipientUsername: normalized,
-          });
-          clearUserCheckoutSession(ctx.from.id);
-          const balCents = await balanceService.getBalanceUsdCents(ctx.from.id);
+            createdAt: Date.now(),
+          };
+          setUserCheckoutSession(ctx.from.id, nextSession);
+          await renderCheckoutConfirmationCard(ctx, nextSession);
+          return;
+        }
+
+        if (checkoutSession.mode === 'confirm_order') {
           await ctx.reply(
-            formatOrderCheckoutChooserMessage(order, balCents),
+            'ℹ️ Используйте кнопки под карточкой подтверждения заказа («💳 Перейти к оплате», изменение параметров или «❌ Отменить заказ»).',
             {
               parse_mode: 'HTML',
-              ...buildOrderCheckoutChooserKeyboard(order, balCents),
+              ...buildOrderConfirmationKeyboard(product.category),
             },
           );
           return;
