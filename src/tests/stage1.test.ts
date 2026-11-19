@@ -6587,61 +6587,58 @@ async function runFullAuditTestSuite(): Promise<void> {
   await runTest(
     'S424-01',
     'Payments',
-    'Улучшенный выбор Stars: быстрые кнопки, произвольное количество 50..100000, $0.02/Star, авторасчёт и защита ввода',
+    'Выбор Stars: только ручной ввод 50..100000 без быстрых пресетов, $0.02/Star, авторасчёт (750 -> $15.00) и защита ввода',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
       clearCallbackDebounceMap();
       clearAllUserInteractiveSessions(buyer1.id);
       const harness = createWiredBotHarness();
 
-      // 1. Экран выбора Stars показывает $0.02, свободный ввод 50..100000 и быстрые пресеты stars:qty:*
+      // 1. Экран выбора Stars показывает $0.02, диапазон 50..100 000 и ТОЛЬКО навигационные кнопки (без быстрых пресетов)
       await harness.sendCallback(buyer1, 'cat:stars');
       const qtyPrompt = harness.lastUiCall()!;
+      assert.ok(qtyPrompt.text.includes('Введите количество Telegram Stars'));
       assert.ok(qtyPrompt.text.includes('Введите количество Stars'));
       assert.ok(qtyPrompt.text.includes('$0.02'));
-      assert.ok(qtyPrompt.callbacks.includes('stars:qty:50'));
-      assert.ok(qtyPrompt.callbacks.includes('stars:qty:100'));
-      assert.ok(qtyPrompt.callbacks.includes('stars:qty:250'));
-      assert.ok(qtyPrompt.callbacks.includes('stars:qty:500'));
-      assert.ok(qtyPrompt.callbacks.includes('stars:qty:1000'));
-      assert.ok(qtyPrompt.callbacks.includes('stars:qty:5000'));
+      assert.ok(qtyPrompt.text.includes('50'));
+      assert.ok(qtyPrompt.text.includes('100 000'));
+      assert.equal(qtyPrompt.callbacks.some((c) => c.startsWith('stars:qty:')), false);
       assert.equal(qtyPrompt.callbacks.some((c) => c.startsWith('prod:stars_pack_')), false);
+      assert.deepEqual(qtyPrompt.callbacks, ['menu:home', 'checkout:cancel']);
 
-      // 2. Нажатие быстрого пресета stars:qty:250 сразу рассчитывает $5.00 и предлагает купить себе или другому
-      await harness.sendCallback(buyer1, 'stars:qty:250');
-      const presetRcpt = harness.lastUiCall()!;
-      assert.ok(presetRcpt.text.includes('250 ⭐'));
-      assert.ok(presetRcpt.text.includes('$0.02'));
-      assert.ok(presetRcpt.text.includes('$5.00'));
-      assert.ok(presetRcpt.callbacks.includes('rcpt_self'));
-
-      // 3. Возврат назад к вводу количества и проверка отклонения невалидных значений (включая запятую и текст с числами)
-      clearCallbackDebounceMap();
-      await harness.sendCallback(buyer1, 'stars:edit_qty');
+      // 2. Отклонение невалидных значений (включая 49, 100001, 0, -50, дроби, запятую, буквы и текст с числами)
       for (const bad of ['49', '100001', '0', '-50', '50.5', '50,5', 'abc', '100 stars']) {
         await harness.sendText(buyer1, bad);
         assert.ok(
           harness.lastUiCall()!.text.includes('Некорректное количество'),
           `Ожидался отказ для ввода ${JSON.stringify(bad)}`,
         );
+        assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
       }
 
-      // 4. Граничный и произвольный ввод: 333 Stars ($6.66) и редактирование на 100000 ($2000.00)
-      await harness.sendText(buyer1, '333');
-      assert.ok(harness.lastUiCall()!.text.includes('333 ⭐'));
-      assert.ok(harness.lastUiCall()!.text.includes('$6.66'));
+      // 3. Ручной ввод 750 Stars -> автоматический расчёт $15.00 (750 * $0.02) и выбор получателя
+      await harness.sendText(buyer1, '750');
+      const rcptPrompt = harness.lastUiCall()!;
+      assert.ok(rcptPrompt.text.includes('Покупка Telegram Stars'));
+      assert.ok(rcptPrompt.text.includes('Количество: <b>750 ⭐</b>'));
+      assert.ok(rcptPrompt.text.includes('Цена за 1 ⭐: <code>$0.02</code>'));
+      assert.ok(rcptPrompt.text.includes('$15.00'));
+      assert.ok(rcptPrompt.text.includes('Выберите получателя'));
+      assert.ok(rcptPrompt.callbacks.includes('rcpt_self'));
 
       await harness.sendText(buyer1, '@Friend_Star');
       const confirmCard = harness.lastUiCall()!;
       assert.ok(confirmCard.text.includes('Подтверждение заказа'));
-      assert.ok(confirmCard.text.includes('333 ⭐'));
+      assert.ok(confirmCard.text.includes('750 ⭐'));
       assert.ok(confirmCard.text.includes('$0.02'));
       assert.ok(confirmCard.text.includes('@friend_star'));
-      assert.ok(confirmCard.text.includes('$6.66'));
+      assert.ok(confirmCard.text.includes('$15.00'));
 
+      // 4. Граничные значения при редактировании: минимум 50 ($1.00) и максимум 100000 ($2000.00)
       clearCallbackDebounceMap();
       await harness.sendCallback(buyer1, 'checkout:edit_qty');
-      await harness.sendCallback(buyer1, 'stars:qty:50');
+      assert.deepEqual(harness.lastUiCall()!.callbacks, ['checkout:back_confirm', 'checkout:cancel']);
+      await harness.sendText(buyer1, '50');
       const confirmMin = harness.lastUiCall()!;
       assert.ok(confirmMin.text.includes('50 ⭐'));
       assert.ok(confirmMin.text.includes('$1.00'));
@@ -6654,13 +6651,12 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.ok(confirmMax.text.includes('100000 ⭐'));
       assert.ok(confirmMax.text.includes('$2000.00'));
 
-      // 5. Подменённый callback быстрого пресета (stars:qty:10) отклоняется и не создаёт заказ
+      // 5. Устаревший callback пресета stars:qty:250 больше не обрабатывается и не создаёт заказ
       clearCallbackDebounceMap();
-      await harness.sendCallback(buyer1, 'stars:qty:10');
-      assert.ok(harness.lastAnswer()?.text?.includes('Некорректное количество'));
+      await harness.sendCallback(buyer1, 'stars:qty:250');
       assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
 
-      return 'Быстрые пресеты Stars, произвольный ввод 50..100000 ($0.02/Star), отказ некорректного ввода и подтверждение до создания заказа подтверждены.';
+      return 'Удаление быстрых пресетов, ручной ввод 50..100000 ($0.02/Star), расчёт 750->$15.00 и граничные проверки подтверждены.';
     },
   );
 

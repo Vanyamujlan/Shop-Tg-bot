@@ -348,27 +348,15 @@ export function buildProductDetailKeyboard(product: Product) {
   return Markup.inlineKeyboard(rows);
 }
 
-export function buildPromptStarsQuantityKeyboard(
-  canReturnToConfirm = false,
-  unitPriceUsdCents = 2,
-) {
-  const safeUnit = Number.isInteger(unitPriceUsdCents) && unitPriceUsdCents > 0 ? unitPriceUsdCents : 2;
-  const presetButton = (qty: number) =>
-    Markup.button.callback(
-      `${qty} ⭐ (${formatUsdCents(qty * safeUnit)})`,
-      `stars:qty:${qty}`,
-    );
-
+export function buildPromptStarsQuantityKeyboard(canReturnToConfirm = false) {
   const rows = [
-    [presetButton(50), presetButton(100), presetButton(250)],
-    [presetButton(500), presetButton(1000), presetButton(5000)],
+    [
+      canReturnToConfirm
+        ? Markup.button.callback('⬅️ Назад', 'checkout:back_confirm')
+        : Markup.button.callback('⬅️ Назад', 'menu:home'),
+    ],
+    [Markup.button.callback('❌ Отменить', 'checkout:cancel')],
   ];
-  if (canReturnToConfirm) {
-    rows.push([Markup.button.callback('⬅️ Назад', 'checkout:back_confirm')]);
-  } else {
-    rows.push([Markup.button.callback('⬅️ Назад', 'menu:home')]);
-  }
-  rows.push([Markup.button.callback('❌ Отменить', 'checkout:cancel')]);
   return Markup.inlineKeyboard(rows);
 }
 

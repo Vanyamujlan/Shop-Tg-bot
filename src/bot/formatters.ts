@@ -203,11 +203,14 @@ export function formatPromptCustomQuantityMessage(product: Product): string {
   const minQ = product.minQuantity ?? 50;
   const maxQ = product.maxQuantity ?? 100000;
   const unitCents = product.unitPriceUsdCents ?? product.priceUsdCents ?? product.price;
+  const maxFormatted = maxQ.toLocaleString('en-US').replace(/,/g, ' ');
   return [
-    `${oe('stars')} <b>Купить Telegram Stars</b>`,
+    `${oe('stars')} <b>Введите количество Telegram Stars, которое хотите приобрести.</b>`,
     '',
-    `Введите количество Stars от <b>${minQ}</b> до <b>${maxQ.toLocaleString('en-US').replace(/,/g, ' ')}</b> (целое число) или выберите быстрый вариант ниже.`,
-    `Цена за 1 ⭐: <b><code>${formatUsdCents(unitCents)}</code></b> — итоговая стоимость рассчитается автоматически (например: <code>100</code> ⭐ = <code>${formatUsdCents(unitCents * 100)}</code>).`,
+    `💰 Цена: <b><code>${formatUsdCents(unitCents)}</code></b> за 1 ⭐`,
+    `📊 Доступно: от <b>${minQ}</b> до <b>${maxFormatted}</b> Stars`,
+    '',
+    'Введите количество Stars одним целым числом:',
   ].join('\n');
 }
 
@@ -219,19 +222,28 @@ export function formatPromptRecipientUsernameMessage(params: {
   category?: ProductCategory;
   durationMonths?: 3 | 6 | 12;
 }): string {
+  if (params.category === 'stars') {
+    return [
+      `${oe('stars')} <b>Покупка Telegram Stars</b>`,
+      '',
+      `Количество: <b>${params.quantity} ⭐</b>`,
+      ...(params.unitPriceUsdCents !== undefined
+        ? [`Цена за 1 ⭐: <code>${formatUsdCents(params.unitPriceUsdCents)}</code>`]
+        : []),
+      `${oe('amount')} Итого: <b><code>${formatUsdCents(params.totalPriceUsdCents)}</code></b>`,
+      '',
+      `${oe('profile')} <b>Выберите получателя.</b>`,
+      'Отправьте Telegram <code>@username</code> получателя или нажмите кнопку ниже:',
+    ].join('\n');
+  }
+
   const itemLine =
-    params.category === 'stars'
-      ? `${oe('stars')} Товар: <b>Telegram Stars</b> — <b>${params.quantity} ⭐</b>`
-      : params.category === 'premium' && params.durationMonths
-        ? `${oe('premium')} Тариф: <b>Telegram Premium — ${params.durationMonths} мес.</b>`
-        : `${oe('catalog')} Товар: <b>${escapeHtml(params.productName)}</b> (x${params.quantity})`;
+    params.category === 'premium' && params.durationMonths
+      ? `${oe('premium')} Тариф: <b>Telegram Premium — ${params.durationMonths} мес.</b>`
+      : `${oe('catalog')} Товар: <b>${escapeHtml(params.productName)}</b> (x${params.quantity})`;
 
   const detailLine =
-    params.category === 'stars' && params.unitPriceUsdCents !== undefined
-      ? `💵 Цена за 1 ⭐: <code>${formatUsdCents(params.unitPriceUsdCents)}</code>`
-      : params.category === 'premium'
-        ? `🔢 Количество: <b>${params.quantity}</b>`
-        : '';
+    params.category === 'premium' ? `🔢 Количество: <b>${params.quantity}</b>` : '';
 
   return [
     `${oe('profile')} <b>Получатель заказа</b>`,

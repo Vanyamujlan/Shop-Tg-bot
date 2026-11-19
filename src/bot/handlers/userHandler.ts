@@ -370,10 +370,6 @@ export async function renderCheckoutStarsQuantityPrompt(
   }
 
   const prev = getUserCheckoutSession(ctx.from.id);
-  const unitCents =
-    starsProduct.unitPriceUsdCents ??
-    starsProduct.priceUsdCents ??
-    starsProduct.price;
   setUserCheckoutSession(ctx.from.id, {
     mode: 'stars_qty',
     productId: starsProduct.id,
@@ -386,7 +382,7 @@ export async function renderCheckoutStarsQuantityPrompt(
   await safeRespondOrEdit(
     ctx,
     formatPromptCustomQuantityMessage(starsProduct),
-    buildPromptStarsQuantityKeyboard(canReturnToConfirm, unitCents),
+    buildPromptStarsQuantityKeyboard(canReturnToConfirm),
   );
 }
 

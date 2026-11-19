@@ -78,51 +78,6 @@ export function registerPaymentHandlers(bot: Telegraf): void {
     );
   });
 
-  // Быстрый выбор фиксированного количества Stars кнопкой (с автоматическим расчётом цены)
-  bot.action(/^stars:qty:(\d+)$/, async (ctx) => {
-    const rawQty = ctx.match[1];
-    if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `stars:qty:${rawQty}`)) {
-      return;
-    }
-
-    try {
-      const starsProduct = await ProductService.getBuyerStarsProduct();
-      if (!starsProduct) {
-        clearUserCheckoutSession(ctx.from.id);
-        await safeAnswerCbQuery(ctx, 'Покупка Telegram Stars временно недоступна.', true);
-        await renderMainMenu(ctx);
-        return;
-      }
-
-      const calc = ProductService.calculateOrderPriceUsdCents(starsProduct, rawQty);
-      const existing = getUserCheckoutSession(ctx.from.id);
-      if (existing?.returnToConfirm && existing?.recipientUsername) {
-        const nextSession: UserCheckoutSession = {
-          mode: 'confirm_order',
-          productId: starsProduct.id,
-          quantity: calc.quantity,
-          recipientUsername: existing.recipientUsername,
-          createdAt: Date.now(),
-        };
-        setUserCheckoutSession(ctx.from.id, nextSession);
-        await renderCheckoutConfirmationCard(ctx, nextSession);
-        return;
-      }
-
-      const nextSession: UserCheckoutSession = {
-        mode: 'recipient_username',
-        productId: starsProduct.id,
-        quantity: calc.quantity,
-        createdAt: Date.now(),
-      };
-      setUserCheckoutSession(ctx.from.id, nextSession);
-      await renderCheckoutRecipientPrompt(ctx, nextSession);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      await safeAnswerCbQuery(ctx, msg.slice(0, 180), true);
-    }
-  });
-
   // 1c. Устаревший callback buy_start:<productId> (Gifts заблокированы, Stars/Premium перенаправлены)
   bot.action(/^buy_start:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const productId = ctx.match[1];
