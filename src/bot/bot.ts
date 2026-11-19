@@ -156,6 +156,7 @@ class TelegramBotManager {
           config.firebasePrivateKey,
           config.cryptobotApiToken,
           config.xrocketApiKey,
+          config.mystarsApiKey,
         ]);
         console.error(
           `[TelegramBot] Ошибка при обработке обновления (${ctx.updateType}): ${safeMsg}`,
@@ -177,11 +178,11 @@ class TelegramBotManager {
 
       // 2. Register bot commands menu in Telegram
       await bot.telegram.setMyCommands([
-        { command: 'start', description: 'Главное меню магазина' },
-        { command: 'catalog', description: 'Каталог товаров (Stars, Premium, Gifts)' },
-        { command: 'topup', description: 'Пополнить внутренний баланс' },
+        { command: 'start', description: 'Главное меню QuizyStars' },
+        { command: 'catalog', description: 'Каталог (Stars, Premium, Gifts)' },
+        { command: 'topup', description: 'Пополнить баланс (USD)' },
         { command: 'orders', description: 'Мои заказы' },
-        { command: 'profile', description: 'Мой профиль' },
+        { command: 'profile', description: 'Профиль и баланс' },
         { command: 'help', description: 'Помощь и FAQ' },
         { command: 'terms', description: 'Правила магазина' },
         { command: 'paysupport', description: 'Поддержка по платежам' },
@@ -236,6 +237,7 @@ class TelegramBotManager {
               config.webhookSecret,
               config.cryptobotApiToken,
               config.xrocketApiKey,
+              config.mystarsApiKey,
             ]);
             console.error(`[TelegramBot] Ошибка фонового polling: ${safeMsg}`);
             this.pollingStarted = false;
@@ -268,6 +270,7 @@ class TelegramBotManager {
         config.firebasePrivateKey,
         config.cryptobotApiToken,
         config.xrocketApiKey,
+        config.mystarsApiKey,
       ]);
       this.pollingStarted = false;
       this.status = {

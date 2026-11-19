@@ -1,17 +1,26 @@
 import { Context, Markup, Telegraf } from 'telegraf';
-import { BalanceTopUpProvider, ProductCategory } from '../../types.ts';
+import {
+  BalanceTopUpProvider,
+  Order,
+  ProductCategory,
+} from '../../types.ts';
 import { StorageUnavailableError } from '../../db/firestore.ts';
 import { UserService } from '../../services/UserService.ts';
 import { ProductService } from '../../services/ProductService.ts';
-import { OrderService } from '../../services/OrderService.ts';
+import {
+  OrderService,
+  normalizeRecipientUsername,
+} from '../../services/OrderService.ts';
 import {
   balanceService,
   validateTopUpAmountUsd,
 } from '../../services/BalanceService.ts';
 import { formatUsd } from '../../config/env.ts';
+import { formatUsdCents, usdInputToCents } from '../../services/Money.ts';
 import { oe, oeBtn } from '../outlineEmoji.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
+  XROCKET_SUPPORTED_ASSETS,
   paymentProviderGateway,
 } from '../../services/PaymentProviders.ts';
 import {
@@ -19,7 +28,9 @@ import {
   buildCatalogCategoriesKeyboard,
   buildCategoryProductsKeyboard,
   buildMainMenuKeyboard,
+  buildOrderCheckoutChooserKeyboard,
   buildProductDetailKeyboard,
+  buildPromptRecipientKeyboard,
   buildTopUpInvoiceKeyboard,
   buildTopUpStep1ProviderKeyboard,
   buildTopUpStep2AmountKeyboard,
@@ -29,13 +40,16 @@ import {
   buildUserProfileKeyboard,
 } from '../keyboards.ts';
 import {
+  LiveCurrencyPreviewItem,
   escapeHtml,
   formatCatalogOverviewMessage,
   formatCategoryListMessage,
   formatHelpMessage,
+  formatOrderCheckoutChooserMessage,
   formatOrderDetailMessage,
   formatPaySupportMessage,
   formatProductCardMessage,
+  formatPromptRecipientUsernameMessage,
   formatSupportedCryptoInfoMessage,
   formatTermsMessage,
   formatTopUpInvoiceCardMessage,
@@ -55,25 +69,40 @@ interface UserTopUpCustomSession {
   createdAt: number;
 }
 
+export interface UserCheckoutSession {
+  mode: 'custom_qty' | 'recipient_username';
+  productId: string;
+  quantity?: number;
+  createdAt: number;
+}
+
 const userTopUpSessions = new Map<number, UserTopUpCustomSession>();
+const userCheckoutSessions = new Map<number, UserCheckoutSession>();
 const USER_SESSION_TTL_MS = 10 * 60 * 1000;
 const MAX_USER_SESSIONS = 1000;
+
+function pruneMapByTtl<T extends { createdAt: number }>(
+  map: Map<number, T>,
+): void {
+  const now = Date.now();
+  for (const [k, v] of map.entries()) {
+    if (now - v.createdAt > USER_SESSION_TTL_MS) {
+      map.delete(k);
+    }
+  }
+  while (map.size >= MAX_USER_SESSIONS) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
 
 function setUserTopUpSession(
   telegramId: number,
   session: UserTopUpCustomSession,
 ): void {
-  const now = Date.now();
-  for (const [k, v] of userTopUpSessions.entries()) {
-    if (now - v.createdAt > USER_SESSION_TTL_MS) {
-      userTopUpSessions.delete(k);
-    }
-  }
-  while (userTopUpSessions.size >= MAX_USER_SESSIONS) {
-    const oldest = userTopUpSessions.keys().next().value;
-    if (oldest === undefined) break;
-    userTopUpSessions.delete(oldest);
-  }
+  userCheckoutSessions.delete(telegramId);
+  pruneMapByTtl(userTopUpSessions);
   userTopUpSessions.set(telegramId, session);
 }
 
@@ -91,6 +120,36 @@ function getUserTopUpSession(
 
 export function clearUserTopUpSession(telegramId: number): void {
   userTopUpSessions.delete(telegramId);
+}
+
+export function setUserCheckoutSession(
+  telegramId: number,
+  session: UserCheckoutSession,
+): void {
+  userTopUpSessions.delete(telegramId);
+  pruneMapByTtl(userCheckoutSessions);
+  userCheckoutSessions.set(telegramId, session);
+}
+
+export function getUserCheckoutSession(
+  telegramId: number,
+): UserCheckoutSession | undefined {
+  const s = userCheckoutSessions.get(telegramId);
+  if (!s) return undefined;
+  if (Date.now() - s.createdAt > USER_SESSION_TTL_MS) {
+    userCheckoutSessions.delete(telegramId);
+    return undefined;
+  }
+  return s;
+}
+
+export function clearUserCheckoutSession(telegramId: number): void {
+  userCheckoutSessions.delete(telegramId);
+}
+
+export function clearAllUserInteractiveSessions(telegramId: number): void {
+  userTopUpSessions.delete(telegramId);
+  userCheckoutSessions.delete(telegramId);
 }
 
 const callbackDebounceMap = new Map<string, number>();
@@ -179,9 +238,95 @@ export async function safeRespondOrEdit(
   });
 }
 
+export async function fetchLiveCurrencyPreviews(
+  provider: BalanceTopUpProvider,
+  amountUsdCents: number,
+): Promise<LiveCurrencyPreviewItem[]> {
+  let candidateList: Array<{ code: string; networks: string[] }> = [];
+
+  try {
+    const supported = await paymentProviderGateway.getSupportedCurrencies(provider);
+    if (provider === 'xrocket') {
+      const supportedMap = new Map(supported.map((s) => [s.code, s.networks]));
+      candidateList = XROCKET_SUPPORTED_ASSETS.map((asset) => ({
+        code: asset.code,
+        networks:
+          supportedMap.get(asset.code)?.length
+            ? supportedMap.get(asset.code)!
+            : asset.networks,
+      }));
+    } else {
+      const preferredOrder = ['USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC'];
+      const supportedMap = new Map(supported.map((s) => [s.code, s.networks]));
+      candidateList = preferredOrder
+        .filter((code) => supportedMap.has(code) || PAYMENT_PROVIDER_CATALOG[provider].supportedCurrencies.includes(code))
+        .map((code) => ({
+          code,
+          networks: supportedMap.get(code) ?? [],
+        }));
+    }
+  } catch {
+    if (provider === 'xrocket') {
+      candidateList = XROCKET_SUPPORTED_ASSETS.map((a) => ({
+        code: a.code,
+        networks: a.networks,
+      }));
+    } else {
+      candidateList = ['USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC'].map((code) => ({
+        code,
+        networks: [],
+      }));
+    }
+  }
+
+  const settled = await Promise.allSettled(
+    candidateList.map((item) =>
+      paymentProviderGateway.getLiveUsdConversion({
+        provider,
+        amountUsdCents,
+        targetCurrency: item.code,
+        network: item.networks[0],
+      }),
+    ),
+  );
+
+  return candidateList.map((item, idx) => {
+    const outcome = settled[idx];
+    if (outcome.status === 'fulfilled') {
+      return {
+        code: item.code,
+        networks: item.networks,
+        conversion: outcome.value,
+      };
+    }
+    const reason =
+      outcome.reason instanceof Error
+        ? outcome.reason.message
+        : 'курс временно недоступен';
+    return {
+      code: item.code,
+      networks: item.networks,
+      error: reason,
+    };
+  });
+}
+
+export async function renderOrderCheckoutChooser(
+  ctx: Context,
+  order: Order,
+): Promise<void> {
+  if (!ctx.from) return;
+  const currentBalanceUsdCents = await balanceService.getBalanceUsdCents(ctx.from.id);
+  await safeRespondOrEdit(
+    ctx,
+    formatOrderCheckoutChooserMessage(order, currentBalanceUsdCents),
+    buildOrderCheckoutChooserKeyboard(order, currentBalanceUsdCents),
+  );
+}
+
 async function renderTopUpStep1(ctx: Context): Promise<void> {
   if (!ctx.from) return;
-  clearUserTopUpSession(ctx.from.id);
+  clearAllUserInteractiveSessions(ctx.from.id);
   const currentBalance = await balanceService.getBalance(ctx.from.id);
   await safeRespondOrEdit(
     ctx,
@@ -204,7 +349,6 @@ async function renderTopUpStep2(
       : meta.defaultCurrency;
   const providerConfigured = paymentProviderGateway.isProviderConfigured(provider);
 
-  // Allow user to type custom USD amount directly in chat on Step 2
   setUserTopUpSession(ctx.from.id, {
     provider,
     currency: resolvedCurrency,
@@ -229,11 +373,18 @@ async function renderTopUpStep3XRocketCurrency(
   amountPaid: number,
 ): Promise<void> {
   if (!ctx.from) return;
-  clearUserTopUpSession(ctx.from.id);
+  clearAllUserInteractiveSessions(ctx.from.id);
+  let livePreviews: LiveCurrencyPreviewItem[] = [];
+  try {
+    const amountCents = usdInputToCents(amountPaid);
+    livePreviews = await fetchLiveCurrencyPreviews('xrocket', amountCents);
+  } catch {
+    livePreviews = [];
+  }
   await safeRespondOrEdit(
     ctx,
-    formatTopUpStep3XRocketCurrencyMessage(amountPaid),
-    buildTopUpStep3XRocketCurrencyKeyboard(amountPaid),
+    formatTopUpStep3XRocketCurrencyMessage(amountPaid, livePreviews),
+    buildTopUpStep3XRocketCurrencyKeyboard(amountPaid, livePreviews),
   );
 }
 
@@ -248,7 +399,7 @@ export function registerUserHandlers(bot: Telegraf): void {
           if (ctx.callbackQuery) {
             await safeAnswerCbQuery(
               ctx,
-              'Ваш доступ к магазину ограничен.',
+              'Ваш доступ к QuizyStars ограничен.',
               true,
             );
           } else if (ctx.message) {
@@ -271,7 +422,7 @@ export function registerUserHandlers(bot: Telegraf): void {
           );
         } else if (ctx.message) {
           await ctx.reply(
-            '⚠️ <b>Магазин временно находится в защитном режиме (база данных недоступна).</b>\nОформление новых заказов приостановлено для сохранности ваших средств. Попробуйте позже или обратитесь в /paysupport.',
+            '⚠️ <b>Магазин временно находится в защитном режиме (база данных недоступна).</b>\nОформление новых заказов приостановлено. Попробуйте позже или обратитесь в /paysupport.',
             { parse_mode: 'HTML' },
           );
         }
@@ -281,8 +432,9 @@ export function registerUserHandlers(bot: Telegraf): void {
     }
   });
 
-  // /start — Главное меню
+  // /start — Главное меню QuizyStars
   bot.start(async (ctx) => {
+    if (ctx.from) clearAllUserInteractiveSessions(ctx.from.id);
     const firstName = ctx.from?.first_name || 'Покупатель';
     const isAdmin = await UserService.isAdmin(ctx.from?.id);
     await safeRespondOrEdit(
@@ -294,6 +446,7 @@ export function registerUserHandlers(bot: Telegraf): void {
 
   // /catalog — Каталог товаров
   bot.command('catalog', async (ctx) => {
+    if (ctx.from) clearAllUserInteractiveSessions(ctx.from.id);
     await safeRespondOrEdit(
       ctx,
       formatCatalogOverviewMessage(),
@@ -304,6 +457,7 @@ export function registerUserHandlers(bot: Telegraf): void {
   // /orders — История заказов
   bot.command('orders', async (ctx) => {
     if (!ctx.from) return;
+    clearAllUserInteractiveSessions(ctx.from.id);
     const orders = await OrderService.getUserOrders(ctx.from.id);
     await safeRespondOrEdit(
       ctx,
@@ -312,10 +466,10 @@ export function registerUserHandlers(bot: Telegraf): void {
     );
   });
 
-  // /profile — Профиль пользователя (с кнопкой «💳 Пополнить баланс»)
+  // /profile — Профиль пользователя
   bot.command('profile', async (ctx) => {
     if (!ctx.from) return;
-    clearUserTopUpSession(ctx.from.id);
+    clearAllUserInteractiveSessions(ctx.from.id);
     const user = await UserService.upsertFromTelegram(ctx.from);
     const isAdmin = await UserService.isAdmin(ctx.from.id);
     await safeRespondOrEdit(
@@ -352,7 +506,7 @@ export function registerUserHandlers(bot: Telegraf): void {
   // Callback: Главное меню
   bot.action('menu:home', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:home')) return;
-    clearUserTopUpSession(ctx.from.id);
+    clearAllUserInteractiveSessions(ctx.from.id);
     const isAdmin = await UserService.isAdmin(ctx.from.id);
     await safeRespondOrEdit(
       ctx,
@@ -364,7 +518,7 @@ export function registerUserHandlers(bot: Telegraf): void {
   // Callback: Каталог
   bot.action('menu:catalog', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:catalog')) return;
-    clearUserTopUpSession(ctx.from.id);
+    clearAllUserInteractiveSessions(ctx.from.id);
     await safeRespondOrEdit(
       ctx,
       formatCatalogOverviewMessage(),
@@ -375,7 +529,7 @@ export function registerUserHandlers(bot: Telegraf): void {
   // Callback: Мои заказы
   bot.action('menu:orders', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:orders')) return;
-    clearUserTopUpSession(ctx.from.id);
+    clearAllUserInteractiveSessions(ctx.from.id);
     const orders = await OrderService.getUserOrders(ctx.from.id);
     await safeRespondOrEdit(
       ctx,
@@ -387,7 +541,7 @@ export function registerUserHandlers(bot: Telegraf): void {
   // Callback: Профиль
   bot.action('menu:profile', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:profile')) return;
-    clearUserTopUpSession(ctx.from.id);
+    clearAllUserInteractiveSessions(ctx.from.id);
     const user = await UserService.upsertFromTelegram(ctx.from);
     const isAdmin = await UserService.isAdmin(ctx.from.id);
     await safeRespondOrEdit(
@@ -397,13 +551,13 @@ export function registerUserHandlers(bot: Telegraf): void {
     );
   });
 
-  // Callback: Меню пополнения баланса («💳 Пополнить баланс» -> Шаг 1/3)
+  // Callback: Пополнение баланса
   bot.action('menu:topup', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:topup')) return;
     await renderTopUpStep1(ctx);
   });
 
-  // Callback: Шаг 1/3 -> Шаг 2/3 Выбор способа пополнения (topup:prov:<provider>)
+  // Callback: Шаг 1/3 -> Шаг 2/3 Выбор провайдера пополнения
   bot.action(/^topup:prov:(cryptobot|xrocket)$/, async (ctx) => {
     const provider = ctx.match[1] as BalanceTopUpProvider;
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `topup:prov:${provider}`)) {
@@ -419,7 +573,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     );
   });
 
-  // Callback: Выбор валюты пополнения (topup:curr:<provider>:<currency>)
+  // Callback: Выбор валюты пополнения
   bot.action(
     /^topup:curr:(cryptobot|xrocket):([A-Z0-9]+)$/,
     async (ctx) => {
@@ -441,7 +595,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     },
   );
 
-  // Callback: Пересчёт введённой суммы пополнения при смене провайдера на Шаге 2/3 (topup:amt:<provider>:<currency>:<amount>)
+  // Callback: Пересчёт суммы на Шаге 2/3
   bot.action(
     /^topup:amt:(cryptobot|xrocket):([A-Z0-9]+):([0-9.]+)$/,
     async (ctx) => {
@@ -461,7 +615,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     },
   );
 
-  // Callback: Шаг 3/3 (для xRocket) — экран выбора монеты и сети (topup:xr_curr:<amountUsd>)
+  // Callback: Шаг 3/3 (для xRocket) — экран выбора монеты и сети с живыми курсами
   bot.action(/^topup:xr_curr:([0-9.]+)$/, async (ctx) => {
     const amountPaid = Number(ctx.match[1]);
     if (
@@ -473,7 +627,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     await renderTopUpStep3XRocketCurrency(ctx, amountPaid);
   });
 
-  // Callback: Шаг 3/3 (для xRocket) — создание счёта по выбранной монете и сети (topup:xr_pay:<currency>:<network>:<amountUsd>)
+  // Callback: Шаг 3/3 (для xRocket) — создание счёта по выбранной монете и сети
   bot.action(
     /^topup:xr_pay:([A-Z0-9]+):([^:]+):([0-9.]+)$/,
     async (ctx) => {
@@ -492,7 +646,7 @@ export function registerUserHandlers(bot: Telegraf): void {
       }
 
       try {
-        clearUserTopUpSession(ctx.from.id);
+        clearAllUserInteractiveSessions(ctx.from.id);
         const topUp = await balanceService.createTopUp({
           telegramId: ctx.from.id,
           username: ctx.from.username,
@@ -517,7 +671,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     },
   );
 
-  // Callback: Сброс и повторный свободный ввод суммы в USD (topup:custom:<provider>:<currency>)
+  // Callback: Сброс и повторный свободный ввод суммы в USD
   bot.action(
     /^topup:custom:(cryptobot|xrocket):([A-Z0-9]+)$/,
     async (ctx) => {
@@ -529,7 +683,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     },
   );
 
-  // Callback: Создание счёта у провайдера (topup:create:<provider>:<currency>:<amountUsd>)
+  // Callback: Создание счёта у провайдера
   bot.action(
     /^topup:create:(cryptobot|xrocket):([A-Z0-9]+):([0-9.]+)$/,
     async (ctx) => {
@@ -548,7 +702,7 @@ export function registerUserHandlers(bot: Telegraf): void {
       }
 
       try {
-        clearUserTopUpSession(ctx.from.id);
+        clearAllUserInteractiveSessions(ctx.from.id);
         const topUp = await balanceService.createTopUp({
           telegramId: ctx.from.id,
           username: ctx.from.username,
@@ -572,7 +726,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     },
   );
 
-  // Callback: Серверная проверка статуса счёта через API провайдера (topup:check:<paymentId>)
+  // Callback: Серверная проверка статуса счёта через API провайдера
   bot.action(/^topup:check:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const paymentId = ctx.match[1];
     if (
@@ -590,12 +744,16 @@ export function registerUserHandlers(bot: Telegraf): void {
       }
 
       const verifyRes = await balanceService.verifyAndProcessTopUp(paymentId);
-      if (verifyRes.status === 'paid') {
+      if (verifyRes.status === 'paid' || verifyRes.status === 'overpaid') {
+        const creditedText = formatUsdCents(
+          verifyRes.topUp.amountCreditedUsdCents ??
+            Math.round(verifyRes.topUp.amountCredited * 100),
+        );
         await safeAnswerCbQuery(
           ctx,
           verifyRes.duplicate
             ? 'Этот счёт уже был оплачен и зачислен ранее.'
-            : `Оплата подтверждена! На баланс зачислено +${formatUsd(verifyRes.topUp.amountCredited)}.`,
+            : `Оплата подтверждена! Зачислено +${creditedText}.`,
           true,
         );
       } else if (verifyRes.status === 'pending') {
@@ -623,7 +781,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     }
   });
 
-  // Callback: Отмена неоплаченного счёта пополнения (topup:cancel:<paymentId>)
+  // Callback: Отмена неоплаченного счёта пополнения
   bot.action(/^topup:cancel:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const paymentId = ctx.match[1];
     if (
@@ -650,7 +808,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     }
   });
 
-  // Callback: Справка по поддерживаемым криптовалютам и сетям
+  // Callback: Справка по поддерживаемым криптовалютам
   bot.action('topup:crypto_info', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'topup:crypto_info')) {
       return;
@@ -689,12 +847,13 @@ export function registerUserHandlers(bot: Telegraf): void {
     await safeRespondOrEdit(ctx, formatHelpMessage(), buildBackToMenuKeyboard());
   });
 
-  // Callback: Выбор категории (cat:stars, cat:premium, cat:gifts)
+  // Callback: Выбор категории
   bot.action(/^cat:(stars|premium|gifts)$/, async (ctx) => {
     const category = ctx.match[1] as ProductCategory;
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `cat:${category}`)) {
       return;
     }
+    clearAllUserInteractiveSessions(ctx.from.id);
 
     const products = await ProductService.getProductsByCategory(category, false);
     await safeRespondOrEdit(
@@ -704,12 +863,13 @@ export function registerUserHandlers(bot: Telegraf): void {
     );
   });
 
-  // Callback: Карточка товара (prod:<id>)
+  // Callback: Карточка товара
   bot.action(/^prod:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const productId = ctx.match[1];
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `prod:${productId}`)) {
       return;
     }
+    clearAllUserInteractiveSessions(ctx.from.id);
 
     const product = await ProductService.getProductById(productId);
     if (!product || !product.isActive) {
@@ -742,7 +902,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     await safeRespondOrEdit(ctx, caption, keyboard);
   });
 
-  // Callback: Детали заказа покупателя (uord:<orderId>)
+  // Callback: Детали заказа покупателя
   bot.action(/^uord:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const orderId = ctx.match[1];
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `uord:${orderId}`)) {
@@ -766,7 +926,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     );
   });
 
-  // Callback: Отмена неоплаченного заказа покупателем (ucancel:<orderId>)
+  // Callback: Отмена неоплаченного заказа покупателем
   bot.action(/^ucancel:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     const orderId = ctx.match[1];
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `ucancel:${orderId}`)) {
@@ -805,11 +965,14 @@ export function registerUserHandlers(bot: Telegraf): void {
       });
 
       if (updated) {
+        const orderCents = updated.totalPriceUsdCents ?? updated.totalPrice;
         await OrderService.logTransaction({
           orderId: updated.orderId,
           userId: updated.userId,
           type: 'order_cancelled',
-          amount: updated.totalPrice,
+          amount: orderCents,
+          amountUsdCents: orderCents,
+          currency: 'USD',
           details: 'Заказ отменён пользователем до оплаты.',
         });
         await safeRespondOrEdit(
@@ -824,17 +987,91 @@ export function registerUserHandlers(bot: Telegraf): void {
     }
   });
 
-  // Обработка свободного текстового ввода пользовательской суммы пополнения в USD ($) на Шаге 2/3
+  // Текстовый ввод для пользовательских сценариев: количество Stars, @username получателя, сумма пополнения USD
   bot.on('text', async (ctx, next) => {
     if (!ctx.from) return next();
-    const session = getUserTopUpSession(ctx.from.id);
-    if (!session) return next();
 
     const text = ctx.message.text.trim();
     if (text.startsWith('/')) {
-      clearUserTopUpSession(ctx.from.id);
+      clearAllUserInteractiveSessions(ctx.from.id);
       return next();
     }
+
+    const checkoutSession = getUserCheckoutSession(ctx.from.id);
+    if (checkoutSession) {
+      try {
+        const product = await ProductService.getProductById(checkoutSession.productId);
+        if (!product || !product.isActive) {
+          clearUserCheckoutSession(ctx.from.id);
+          await ctx.reply('❌ Товар больше недоступен для покупки.', {
+            parse_mode: 'HTML',
+            ...buildBackToMenuKeyboard(),
+          });
+          return;
+        }
+
+        if (checkoutSession.mode === 'custom_qty') {
+          if (!/^\d+$/.test(text)) {
+            throw new Error(
+              `Введите целое число (от ${product.minQuantity ?? 50} до ${product.maxQuantity ?? 100000}).`,
+            );
+          }
+          const qty = Number(text);
+          const calc = ProductService.calculateOrderPriceUsdCents(product, qty);
+          setUserCheckoutSession(ctx.from.id, {
+            mode: 'recipient_username',
+            productId: product.id,
+            quantity: calc.quantity,
+            createdAt: Date.now(),
+          });
+          await ctx.reply(
+            formatPromptRecipientUsernameMessage({
+              productName: `${product.name} (${calc.quantity} ⭐)`,
+              quantity: calc.quantity,
+              totalPriceUsdCents: calc.totalPriceUsdCents,
+            }),
+            {
+              parse_mode: 'HTML',
+              ...buildPromptRecipientKeyboard(product.id, ctx.from.username),
+            },
+          );
+          return;
+        }
+
+        if (checkoutSession.mode === 'recipient_username') {
+          const normalized = normalizeRecipientUsername(text);
+          if (!normalized) {
+            throw new Error('Укажите @username получателя.');
+          }
+          const qty = checkoutSession.quantity ?? 1;
+          const order = await OrderService.createOrder({
+            telegramUser: ctx.from,
+            productId: product.id,
+            quantity: qty,
+            recipientUsername: normalized,
+          });
+          clearUserCheckoutSession(ctx.from.id);
+          const balCents = await balanceService.getBalanceUsdCents(ctx.from.id);
+          await ctx.reply(
+            formatOrderCheckoutChooserMessage(order, balCents),
+            {
+              parse_mode: 'HTML',
+              ...buildOrderCheckoutChooserKeyboard(order, balCents),
+            },
+          );
+          return;
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        await ctx.reply(`${oe('warning')} ${escapeHtml(msg)}`, {
+          parse_mode: 'HTML',
+        });
+        return;
+      }
+    }
+
+    const session = getUserTopUpSession(ctx.from.id);
+    if (!session) return next();
 
     try {
       const validatedAmountUsd = validateTopUpAmountUsd(text);

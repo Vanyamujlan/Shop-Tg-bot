@@ -59,6 +59,7 @@ export interface AppConfig {
   port: number;
   nodeEnv: 'development' | 'production' | 'test';
   allowLocalFallback: boolean;
+  storeName: string;
   telegramBotToken: string;
   botMode: 'polling' | 'webhook';
   webhookUrl: string;
@@ -75,6 +76,10 @@ export interface AppConfig {
   cryptobotApiUrl: string;
   xrocketApiKey: string;
   xrocketApiUrl: string;
+  mystarsPaymentCurrency: 'usdt_ton';
+  mystarsApiBaseUrl: string;
+  mystarsApiKey: string;
+  tonWalletAddress: string;
 }
 
 function parseAdminIds(raw: string | undefined): number[] {
@@ -150,7 +155,9 @@ export function getEnvConfig(): AppConfig {
     'STORE_SUPPORT_USERNAME',
     process.env.STORE_SUPPORT_USERNAME,
   );
-  const storeSupportUsername = (supportCleaned || 'support').replace(/^@/, '');
+  const storeSupportUsername = (supportCleaned || 'quizystars_support').replace(/^@/, '');
+  const storeName =
+    cleanEnvValue('STORE_NAME', process.env.STORE_NAME) || 'QuizyStars';
 
   const firebaseClientEmail = cleanEnvValue(
     'FIREBASE_CLIENT_EMAIL',
@@ -181,6 +188,7 @@ export function getEnvConfig(): AppConfig {
     port: Number(process.env.PORT || 3000),
     nodeEnv,
     allowLocalFallback,
+    storeName,
     telegramBotToken: cleanEnvValue(
       'TELEGRAM_BOT_TOKEN',
       process.env.TELEGRAM_BOT_TOKEN,
@@ -207,6 +215,15 @@ export function getEnvConfig(): AppConfig {
     xrocketApiUrl:
       cleanEnvValue('XROCKET_API_URL', process.env.XROCKET_API_URL) ||
       'https://pay.api.xrocket.exchange',
+    mystarsPaymentCurrency: 'usdt_ton',
+    mystarsApiBaseUrl:
+      cleanEnvValue('MYSTARS_API_BASE_URL', process.env.MYSTARS_API_BASE_URL) ||
+      'https://api.mystars.tg',
+    mystarsApiKey: cleanEnvValue('MYSTARS_API_KEY', process.env.MYSTARS_API_KEY),
+    tonWalletAddress: cleanEnvValue(
+      'TON_WALLET_ADDRESS',
+      process.env.TON_WALLET_ADDRESS,
+    ),
   };
 }
 
@@ -231,37 +248,32 @@ export function isOwnerTelegramId(telegramId: number | undefined): boolean {
   return config.ownerTelegramId === telegramId;
 }
 
+export {
+  MIN_TOPUP_AMOUNT_USD_CENTS,
+  MAX_TOPUP_AMOUNT_USD_CENTS,
+  centsToUsdString,
+  formatUsdCents,
+  usdInputToCents,
+} from '../services/Money.ts';
+
 /**
  * Server-side limits for free-form balance top-ups in US Dollars (USD).
+ * Derived from integer cent bounds ($0.50 – $50,000.00).
  */
 export const MIN_TOPUP_AMOUNT_USD = 0.5;
 export const MAX_TOPUP_AMOUNT_USD = 50000.0;
 
 /**
- * Reference USD exchange rates for supported payment currencies (1 unit in USD).
- * Used when a user enters a top-up amount in USD ($) and chooses a non-USD crypto asset.
- * The rate and net credited USD amount are locked in Firestore at invoice creation time.
+ * Formats a numeric USD dollar value using exact integer cent rounding.
  */
-export const CRYPTO_USD_RATES: Readonly<Record<string, number>> = Object.freeze({
-  USD: 1.0,
-  USDT: 1.0,
-  USDC: 1.0,
-  TON: 5.5,
-  TONCOIN: 5.5,
-  TRX: 0.25,
-  BNB: 600.0,
-  ETH: 3000.0,
-  BTC: 90000.0,
-  LTC: 100.0,
-});
-
-/**
- * Formats a numeric USD amount consistently as `$10.00`, `$19.99`, `$100.00`.
- */
-export function formatUsd(amount: number): string {
-  const num = Number.isFinite(amount) ? amount : 0;
+export function formatUsd(amountUsd: number): string {
+  const num = Number.isFinite(amountUsd) ? amountUsd : 0;
   const sign = num < 0 ? '-' : '';
-  return `${sign}$${Math.abs(num).toFixed(2)}`;
+  const absCents = Math.round(Math.abs(num) * 100);
+  const dollars = Math.trunc(absCents / 100);
+  const rem = absCents % 100;
+  return `${sign}$${dollars}.${String(rem).padStart(2, '0')}`;
 }
+
 
 

@@ -307,10 +307,10 @@
   </head>
   <body>
     <main class="app-shell">
-      <!-- Stars Shop Brand Header (Logo/Name preserved without emoji replacement) -->
+      <!-- QuizyStars Brand Header -->
       <header class="top-bar">
         <div>
-          <div class="brand-title">STARS SHOP</div>
+          <div class="brand-title">QUIZYSTARS</div>
           <div class="brand-sub">Пополнение внутреннего баланса (USD)</div>
         </div>
         <div class="balance-badge" title="Текущий баланс пользователя в USD">
@@ -406,7 +406,7 @@
       <section class="section-card">
         <div class="section-title">
           <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
-          <span>Разделы Stars Shop • OutlineEmoji</span>
+          <span>Разделы QuizyStars • OutlineEmoji</span>
         </div>
         <div class="sections-preview">
           <div class="nav-chip">
@@ -521,14 +521,16 @@
             sumCredited.textContent = `+${data.amountCreditedFormatted}`;
             submitBtnText.textContent = `Создать счёт (${data.amountUsdFormatted} → +${data.amountCreditedFormatted})`;
 
-            if (data.currency !== 'USD' && data.currency !== 'USDT' && data.currency !== 'USDC') {
+            if (data.requiresConversionNotice) {
               conversionNotice.style.display = 'block';
-              conversionNotice.innerHTML = `Конвертация из USD по фиксированному курсу счёта (<b>1 ${data.currency} = $${Number(data.exchangeRateUsd).toFixed(2)}</b>): к оплате <b>${data.amountToPayInCurrency} ${data.currency}</b>. Итоговая сумма зачисления (<b>+${data.amountCreditedFormatted}</b>) фиксируется при создании счёта.`;
+              conversionNotice.innerHTML = `Конвертация из USD по актуальному курсу (<b>1 ${data.currency} = $${data.exchangeRateUsdStr}</b>): к оплате <b>${data.amountToPayInCurrencyStr} ${data.currency}</b>. Итоговая сумма зачисления (<b>+${data.amountCreditedFormatted}</b>) фиксируется при создании счёта.`;
             } else {
               conversionNotice.style.display = 'none';
             }
           } catch (e) {
-            // Fallback client calculation if offline
+            errorBanner.style.display = 'block';
+            errorBanner.textContent = 'Сервер расчёта временно недоступен.';
+            submitBtn.disabled = true;
           }
         }
 

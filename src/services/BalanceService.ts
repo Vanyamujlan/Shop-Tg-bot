@@ -1,29 +1,45 @@
 import crypto from 'crypto';
 import {
-  MAX_TOPUP_AMOUNT_USD,
-  MIN_TOPUP_AMOUNT_USD,
-  formatUsd,
+  formatUsdCents,
+  getEnvConfig,
 } from '../config/env.ts';
-import { firestoreRepo } from '../db/firestore.ts';
+import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import {
   BalanceTopUpProvider,
   BalanceTopUpRecord,
   BalanceTopUpStatus,
   Order,
+  PaymentLockRecord,
+  PaymentRecord,
   Product,
   StoreTransaction,
   StoreUser,
 } from '../types.ts';
 import {
+  MAX_TOPUP_AMOUNT_USD_CENTS,
+  MIN_TOPUP_AMOUNT_USD_CENTS,
+  assertValidUsdCents,
+  bpsFeeAndNetCents,
+  centsToUsdString,
+  compareScaledDecimal,
+  usdInputToCents,
+} from './Money.ts';
+import { normalizeRecipientUsername } from './OrderService.ts';
+import {
   PAYMENT_PROVIDER_CATALOG,
   PaymentProviderGateway,
-  convertUsdToPaymentCurrency,
   normalizeCurrencyCode,
+  normalizeNetworkCode,
   paymentProviderGateway,
   redactSecretsFromText,
 } from './PaymentProviders.ts';
+import { ProductService } from './ProductService.ts';
 
 export interface CommissionCalculationResult {
+  amountUsdCents: number;
+  feeUsdCents: number;
+  amountCreditedUsdCents: number;
+  feeBps: number;
   amountPaid: number;
   feePercent: number;
   feeAmount: number;
@@ -31,98 +47,94 @@ export interface CommissionCalculationResult {
 }
 
 /**
- * Converts a monetary amount to integer minor units (cents, x100)
- * and validates that there are no fractional sub-cent digits.
+ * Exact integer USD cents conversion from dollar amount (for legacy callers).
  */
 export function toMinorUnits(amount: number): number {
   if (!Number.isFinite(amount)) {
     throw new Error('Сумма должна быть конечным числом.');
   }
-  const scaled = amount * 100;
-  const rounded = Math.round(scaled);
-  if (Math.abs(scaled - rounded) > 1e-6) {
-    throw new Error('Сумма не может содержать более 2 знаков после запятой.');
-  }
-  return rounded;
+  if (amount === 0) return 0;
+  return usdInputToCents(amount);
 }
 
-export function fromMinorUnits(minorUnits: number): number {
-  return Number((Math.round(minorUnits) / 100).toFixed(2));
+export function fromMinorUnits(cents: number): number {
+  const safe = Math.round(cents);
+  return Number(centsToUsdString(safe));
 }
 
 /**
- * Validates a free-form user top-up amount in US Dollars (USD, `$`).
- * Enforces server-side limits: $0.50 minimum to $50,000.00 maximum, max 2 decimal places.
+ * Validates a free-form user top-up amount strictly in integer USD cents.
+ * Enforces server-side limits: 50 cents ($0.50) to 5,000,000 cents ($50,000.00).
  */
+export function validateTopUpAmountUsdCents(rawInput: string | number): number {
+  const cents = usdInputToCents(rawInput);
+  if (cents < MIN_TOPUP_AMOUNT_USD_CENTS) {
+    throw new Error(
+      `Минимальная сумма пополнения: ${formatUsdCents(MIN_TOPUP_AMOUNT_USD_CENTS)}.`,
+    );
+  }
+  if (cents > MAX_TOPUP_AMOUNT_USD_CENTS) {
+    throw new Error(
+      `Максимальная сумма пополнения за одну операцию: ${formatUsdCents(MAX_TOPUP_AMOUNT_USD_CENTS)}.`,
+    );
+  }
+  return cents;
+}
+
 export function validateTopUpAmountUsd(rawInput: string | number): number {
-  let num: number;
-  if (typeof rawInput === 'string') {
-    const cleaned = rawInput.trim().replace(/^\$/, '').trim().replace(',', '.');
-    if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) {
-      throw new Error(
-        `Введите корректную сумму в USD (например: 10, 19.99, 100.00). Допустимый диапазон: от ${formatUsd(MIN_TOPUP_AMOUNT_USD)} до ${formatUsd(MAX_TOPUP_AMOUNT_USD)}.`,
-      );
-    }
-    num = Number(cleaned);
-  } else {
-    num = rawInput;
-  }
-
-  if (!Number.isFinite(num) || num <= 0) {
-    throw new Error('Сумма пополнения должна быть положительным числом.');
-  }
-
-  const minor = toMinorUnits(num);
-  const normalized = fromMinorUnits(minor);
-
-  if (normalized < MIN_TOPUP_AMOUNT_USD) {
-    throw new Error(
-      `Минимальная сумма пополнения: ${formatUsd(MIN_TOPUP_AMOUNT_USD)}.`,
-    );
-  }
-  if (normalized > MAX_TOPUP_AMOUNT_USD) {
-    throw new Error(
-      `Максимальная сумма пополнения за одну операцию: ${formatUsd(MAX_TOPUP_AMOUNT_USD)}.`,
-    );
-  }
-  return normalized;
+  const cents = validateTopUpAmountUsdCents(rawInput);
+  return fromMinorUnits(cents);
 }
 
 /**
- * Calculates store commission and credited amount in USD using integer minor-unit math.
- * Commission is deducted from the entered amount (never added on top):
- * Formula: amountCredited = amountPaid * (1 - feePercent / 100)
- * Examples:
- * - CryptoBot (3%): $100.00 -> $97.00 (fee $3.00)
- * - xRocket (2%): $100.00 -> $98.00 (fee $2.00)
+ * Calculates store commission and net credited USD cents using exact BigInt BPS math.
+ * Commission is deducted from the entered amount:
+ * - CryptoBot (300 bps / 3%): $10.00 (1000) -> net $9.70 (970), fee $0.30 (30)
+ * - xRocket (200 bps / 2%): $10.00 (1000) -> net $9.80 (980), fee $0.20 (20)
  */
-export function calculateTopUpCommission(
-  amountPaid: number,
+export function calculateTopUpCommissionCents(
+  amountUsdCents: number,
   provider: BalanceTopUpProvider,
 ): CommissionCalculationResult {
   const providerMeta = PAYMENT_PROVIDER_CATALOG[provider];
   if (!providerMeta) {
     throw new Error(`Неизвестный платёжный провайдер: ${String(provider)}`);
   }
-  const paidMinor = toMinorUnits(amountPaid);
-  if (paidMinor <= 0) {
-    throw new Error('Сумма пополнения должна быть больше нуля.');
-  }
-
-  const feePercent = providerMeta.feePercent;
-  const feeMinor = Math.round((paidMinor * feePercent) / 100);
-  const creditedMinor = paidMinor - feeMinor;
-
-  if (creditedMinor <= 0) {
-    throw new Error('Сумма зачисления после комиссии должна быть больше нуля.');
+  const safeCents = assertValidUsdCents(amountUsdCents, 'amountUsdCents');
+  const breakdown = bpsFeeAndNetCents(safeCents, providerMeta.feeBps);
+  if (breakdown.netCents <= 0) {
+    throw new Error('Сумма зачисления после комиссии должна быть больше 0.');
   }
 
   return Object.freeze({
-    amountPaid: fromMinorUnits(paidMinor),
-    feePercent,
-    feeAmount: fromMinorUnits(feeMinor),
-    amountCredited: fromMinorUnits(creditedMinor),
+    amountUsdCents: breakdown.grossCents,
+    feeUsdCents: breakdown.feeCents,
+    amountCreditedUsdCents: breakdown.netCents,
+    feeBps: breakdown.feeBps,
+    amountPaid: fromMinorUnits(breakdown.grossCents),
+    feePercent: breakdown.feePercent,
+    feeAmount: fromMinorUnits(breakdown.feeCents),
+    amountCredited: fromMinorUnits(breakdown.netCents),
   });
+}
+
+export function calculateTopUpCommission(
+  amountPaidUsd: number,
+  provider: BalanceTopUpProvider,
+): CommissionCalculationResult {
+  const cents = usdInputToCents(amountPaidUsd);
+  return calculateTopUpCommissionCents(cents, provider);
+}
+
+function getUserBalanceCentsFromDoc(user: StoreUser | null | undefined): number {
+  if (!user) return 0;
+  if (typeof user.balanceUsdCents === 'number' && Number.isInteger(user.balanceUsdCents)) {
+    return user.balanceUsdCents;
+  }
+  if (typeof user.balance === 'number' && Number.isFinite(user.balance)) {
+    return Math.round(user.balance * 100);
+  }
+  return 0;
 }
 
 export class BalanceService {
@@ -136,10 +148,18 @@ export class BalanceService {
     return this.gateway;
   }
 
-  public async getBalanceByUserId(userId: string): Promise<number> {
+  public async getBalanceUsdCentsByUserId(userId: string): Promise<number> {
     const user = await firestoreRepo.getDoc<StoreUser>('users', userId);
-    if (!user) return 0;
-    return fromMinorUnits(toMinorUnits(user.balance ?? 0));
+    return getUserBalanceCentsFromDoc(user);
+  }
+
+  public async getBalanceUsdCents(telegramId: number): Promise<number> {
+    return this.getBalanceUsdCentsByUserId(`tg_${telegramId}`);
+  }
+
+  public async getBalanceByUserId(userId: string): Promise<number> {
+    const cents = await this.getBalanceUsdCentsByUserId(userId);
+    return fromMinorUnits(cents);
   }
 
   public async getBalance(telegramId: number): Promise<number> {
@@ -180,20 +200,22 @@ export class BalanceService {
   }
 
   /**
-   * Creates a new balance top-up invoice with a provider and stores a pending record in Firestore.
-   * Locks USD amount, commission, net credited USD amount, original payment currency, and exchange rate.
+   * Creates or reuses an active pending balance top-up invoice with live provider exchange rates.
    */
   public async createTopUp(params: {
     telegramId: number;
     username?: string;
     firstName?: string;
     provider: BalanceTopUpProvider;
-    amountPaid: number;
+    amountUsdCents?: number;
+    amountPaid?: number;
     currency?: string;
     network?: string;
     convertFromUsd?: boolean;
     customExchangeRateUsd?: number;
+    customExchangeRateUsdStr?: string;
     expiresInSeconds?: number;
+    forceNew?: boolean;
   }): Promise<BalanceTopUpRecord> {
     firestoreRepo.assertReadyForOrdersAndPayments();
 
@@ -202,36 +224,32 @@ export class BalanceService {
       throw new Error(`Неподдерживаемый способ пополнения: ${String(params.provider)}`);
     }
 
-    if (!Number.isFinite(params.amountPaid) || params.amountPaid <= 0) {
-      throw new Error('Сумма пополнения должна быть положительным числом.');
-    }
+    const rawCents =
+      params.amountUsdCents !== undefined
+        ? assertValidUsdCents(params.amountUsdCents, 'amountUsdCents')
+        : params.amountPaid !== undefined
+          ? validateTopUpAmountUsdCents(params.amountPaid)
+          : (() => {
+              throw new Error('Укажите сумму пополнения в USD.');
+            })();
 
-    // Validate cent precision & server-side min/max limits ($0.50 to $50,000.00)
-    const validatedAmountUsd = fromMinorUnits(toMinorUnits(params.amountPaid));
-
-    if (validatedAmountUsd < providerMeta.minAmount) {
+    if (rawCents < providerMeta.minAmountUsdCents) {
       throw new Error(
-        `Минимальная сумма пополнения через ${providerMeta.shortTitle}: ${formatUsd(providerMeta.minAmount)}.`,
+        `Минимальная сумма пополнения через ${providerMeta.shortTitle}: ${formatUsdCents(providerMeta.minAmountUsdCents)}.`,
+      );
+    }
+    if (rawCents > providerMeta.maxAmountUsdCents) {
+      throw new Error(
+        `Максимальная сумма пополнения за одну операцию: ${formatUsdCents(providerMeta.maxAmountUsdCents)}.`,
       );
     }
 
-    if (validatedAmountUsd > providerMeta.maxAmount) {
-      throw new Error(
-        `Максимальная сумма пополнения за одну операцию: ${formatUsd(providerMeta.maxAmount)}.`,
+    const { currency: normalizedCurr, network: normalizedNet } =
+      await this.gateway.validateCurrencyAndNetwork(
+        params.provider,
+        params.currency || providerMeta.defaultCurrency,
+        params.network,
       );
-    }
-
-    const requestedCurrency = (
-      params.currency || providerMeta.defaultCurrency
-    )
-      .trim()
-      .toUpperCase();
-
-    if (!providerMeta.supportedCurrencies.includes(requestedCurrency)) {
-      throw new Error(
-        `Валюта ${requestedCurrency} не поддерживается провайдером ${providerMeta.shortTitle}. Доступные валюты: ${providerMeta.supportedCurrencies.join(', ')}.`,
-      );
-    }
 
     const userId = `tg_${params.telegramId}`;
     const existingUser = await firestoreRepo.getDoc<StoreUser>('users', userId);
@@ -239,36 +257,78 @@ export class BalanceService {
       throw new Error('Ваш аккаунт заблокирован. Пополнение баланса недоступно.');
     }
 
-    // Calculate commission in USD from the entered USD amount
-    const calc = calculateTopUpCommission(validatedAmountUsd, params.provider);
-    const normalizedCurr = normalizeCurrencyCode(requestedCurrency);
+    // Reuse an active pending invoice for same (user, provider, amountUsdCents, currency, network)
+    if (!params.forceNew) {
+      const existingTopUps = await firestoreRepo.queryDocs<BalanceTopUpRecord>(
+        'balance_topups',
+        {
+          where: [{ field: 'userId', op: '==', value: userId }],
+          limit: 20,
+        },
+      );
+      const nowMs = Date.now();
+      const reusable = existingTopUps.find(
+        (t) =>
+          t.paymentStatus === 'pending' &&
+          t.provider === params.provider &&
+          t.amountUsdCents === rawCents &&
+          normalizeCurrencyCode(t.currency) === normalizedCurr &&
+          (t.network || undefined) === normalizedNet &&
+          Boolean(t.payUrl) &&
+          (!t.expiresAt || Date.parse(t.expiresAt) > nowMs + 15_000),
+      );
+      if (reusable) {
+        return reusable;
+      }
+    }
 
-    // If convertFromUsd is enabled for a non-USD crypto asset (e.g. TON, BTC), convert at locked rate
-    const conversion = params.convertFromUsd
-      ? convertUsdToPaymentCurrency(
-          calc.amountPaid,
-          normalizedCurr,
-          params.customExchangeRateUsd,
-        )
-      : {
-          amountUsd: calc.amountPaid,
+    const calc = calculateTopUpCommissionCents(rawCents, params.provider);
+
+    const customRateStr =
+      params.customExchangeRateUsdStr ??
+      (params.customExchangeRateUsd !== undefined && params.customExchangeRateUsd > 0
+        ? String(params.customExchangeRateUsd)
+        : undefined);
+
+    const shouldConvert =
+      normalizedCurr === 'USD'
+        ? false
+        : params.convertFromUsd !== undefined
+          ? params.convertFromUsd
+          : true;
+
+    const conversion = shouldConvert
+      ? await this.gateway.getLiveUsdConversion({
+          provider: params.provider,
+          amountUsdCents: calc.amountUsdCents,
           targetCurrency: normalizedCurr,
-          exchangeRateUsd: 1.0,
-          convertedAmount: calc.amountPaid,
+          network: normalizedNet,
+          customRateUsdStr: customRateStr,
+        })
+      : {
+          provider: params.provider,
+          amountUsdCents: calc.amountUsdCents,
+          targetCurrency: normalizedCurr,
+          ...(normalizedNet ? { network: normalizedNet } : {}),
+          exchangeRateUsdStr: '1.00',
+          convertedAmountStr: centsToUsdString(calc.amountUsdCents),
+          convertedAmount: fromMinorUnits(calc.amountUsdCents),
+          scaled1e18: 0n,
           requiresConversionNotice: false,
         };
 
-    const invoiceAmountToPay = conversion.convertedAmount;
     const paymentId = `topup_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-    const networkTag = params.network ? ` [${params.network}]` : '';
-    const description = `Пополнение баланса Stars Shop (${paymentId}) — сумма ${formatUsd(calc.amountPaid)}, к зачислению ${formatUsd(calc.amountCredited)}${networkTag}`;
+    const networkTag = normalizedNet ? ` [${normalizedNet}]` : '';
+    const storeName = getEnvConfig().storeName || 'QuizyStars';
+    const description = `Пополнение баланса ${storeName} (${paymentId}) — сумма ${formatUsdCents(calc.amountUsdCents)}, к зачислению ${formatUsdCents(calc.amountCreditedUsdCents)}${networkTag}`;
 
     const createdInvoice = await this.gateway.createInvoice({
       paymentId,
       provider: params.provider,
-      amountPaid: invoiceAmountToPay,
-      currency: requestedCurrency,
-      network: params.network,
+      amountStr: conversion.convertedAmountStr,
+      amountPaid: conversion.convertedAmount,
+      currency: normalizedCurr,
+      network: normalizedNet,
       description,
       expiresInSeconds: params.expiresInSeconds ?? 1800,
     });
@@ -280,19 +340,25 @@ export class BalanceService {
       userTelegramId: params.telegramId,
       username: params.username || existingUser?.username,
       provider: params.provider,
-      externalInvoiceId: createdInvoice.externalInvoiceId,
-      payUrl: createdInvoice.payUrl,
-      amountUsd: calc.amountPaid,
-      amountPaid: invoiceAmountToPay,
+      amountUsdCents: calc.amountUsdCents,
+      feeUsdCents: calc.feeUsdCents,
+      amountCreditedUsdCents: calc.amountCreditedUsdCents,
+      feeBps: calc.feeBps,
       feePercent: calc.feePercent,
+      expectedAmountStr: conversion.convertedAmountStr,
+      amountUsd: calc.amountPaid,
+      amountPaid: conversion.convertedAmount,
       feeAmount: calc.feeAmount,
       amountCredited: calc.amountCredited,
       currency: normalizedCurr,
       originalCurrency: normalizedCurr,
-      originalAmountPaid: invoiceAmountToPay,
-      exchangeRateUsd: conversion.exchangeRateUsd,
-      ...(params.network ? { network: params.network } : {}),
+      originalAmountPaid: conversion.convertedAmount,
+      exchangeRateUsdStr: conversion.exchangeRateUsdStr,
+      exchangeRateUsd: Number(conversion.exchangeRateUsdStr),
+      ...(normalizedNet ? { network: normalizedNet } : {}),
       paymentStatus: 'pending',
+      externalInvoiceId: createdInvoice.externalInvoiceId,
+      payUrl: createdInvoice.payUrl,
       recipientMerchantId: createdInvoice.recipientMerchantId,
       expiresAt: createdInvoice.expiresAt,
       createdAt: now,
@@ -312,6 +378,8 @@ export class BalanceService {
           firstName: params.firstName || 'Пользователь',
           isBlocked: false,
           totalOrders: 0,
+          balanceUsdCents: 0,
+          totalSpentUsdCents: 0,
           totalSpentStars: 0,
           balance: 0,
           createdAt: now,
@@ -327,9 +395,10 @@ export class BalanceService {
         orderId: paymentId,
         userId,
         type: 'balance_topup_created',
-        amount: calc.amountPaid,
+        amount: calc.amountUsdCents,
+        amountUsdCents: calc.amountUsdCents,
         currency: 'USD',
-        details: `Создан счёт пополнения ${paymentId} через ${providerMeta.shortTitle}: сумма=${formatUsd(calc.amountPaid)} (${invoiceAmountToPay} ${topUpRecord.currency}, курс=${conversion.exchangeRateUsd}), комиссия=${calc.feePercent}% (${formatUsd(calc.feeAmount)}), к зачислению=${formatUsd(calc.amountCredited)}`,
+        details: `Создан счёт пополнения ${paymentId} через ${providerMeta.shortTitle}: сумма=${formatUsdCents(calc.amountUsdCents)} (${conversion.convertedAmountStr} ${normalizedCurr}${normalizedNet ? `/${normalizedNet}` : ''}, курс=${conversion.exchangeRateUsdStr}), комиссия=${calc.feePercent}% (${formatUsdCents(calc.feeUsdCents)}), к зачислению=${formatUsdCents(calc.amountCreditedUsdCents)}`,
         createdAt: now,
       });
     });
@@ -337,9 +406,6 @@ export class BalanceService {
     return topUpRecord;
   }
 
-  /**
-   * Cancels a pending top-up request on user request if it has not been paid yet.
-   */
   public async cancelPendingTopUp(
     paymentId: string,
     callerTelegramId: number,
@@ -352,7 +418,7 @@ export class BalanceService {
       if (topUp.userTelegramId !== callerTelegramId) {
         throw new Error('Вы не можете отменить чужой счёт.');
       }
-      if (topUp.paymentStatus === 'paid') {
+      if (topUp.paymentStatus === 'paid' || topUp.paymentStatus === 'overpaid') {
         throw new Error('Этот счёт уже оплачен и зачислен на баланс.');
       }
       if (topUp.paymentStatus !== 'pending') {
@@ -372,9 +438,9 @@ export class BalanceService {
 
   /**
    * Processes an incoming provider webhook:
-   * 1. Verifies cryptographic signature / secret header.
-   * 2. Locates the top-up record by paymentId or externalInvoiceId.
-   * 3. Calls authoritative server-side provider API (`verifyAndProcessTopUp`) before crediting.
+   * 1. Verifies HMAC-SHA256 signature BEFORE any outbound HTTP call.
+   * 2. Locates top-up record by paymentId or externalInvoiceId.
+   * 3. Calls authoritative provider verification before crediting.
    */
   public async processWebhook(params: {
     provider: BalanceTopUpProvider;
@@ -387,6 +453,7 @@ export class BalanceService {
     status: BalanceTopUpStatus;
     topUp?: BalanceTopUpRecord;
     newBalance?: number;
+    newBalanceUsdCents?: number;
     reason?: string;
   }> {
     firestoreRepo.assertReadyForOrdersAndPayments();
@@ -452,8 +519,7 @@ export class BalanceService {
           limit: 5,
         },
       );
-      topUp =
-        candidates.find((c) => c.provider === params.provider) || null;
+      topUp = candidates.find((c) => c.provider === params.provider) || null;
     }
 
     if (!topUp) {
@@ -478,15 +544,16 @@ export class BalanceService {
   }
 
   /**
-   * Authoritatively verifies top-up payment status via the provider's server-side API,
-   * validates amount, currency, invoice ID, payment ID, merchant ID, and expiration,
-   * and credits user balance inside an atomic Firestore transaction.
+   * Authoritatively verifies top-up payment status via provider API, detects underpaid / overpaid /
+   * expired / currency-network mismatch, enforces atomic `payment_locks`, and credits integer USD cents.
    */
   public async verifyAndProcessTopUp(
     paymentId: string,
     webhookHint?: {
+      amountPaidStr?: string;
       amountPaid?: number;
       currency?: string;
+      network?: string;
       externalInvoiceId?: string;
       paymentId?: string;
       recipientMerchantId?: string;
@@ -497,6 +564,7 @@ export class BalanceService {
     status: BalanceTopUpStatus;
     topUp: BalanceTopUpRecord;
     newBalance?: number;
+    newBalanceUsdCents?: number;
     reason?: string;
   }> {
     firestoreRepo.assertReadyForOrdersAndPayments();
@@ -509,22 +577,26 @@ export class BalanceService {
       throw new Error(`Счёт пополнения ${paymentId} не найден.`);
     }
 
-    // Fast idempotent return if already paid
-    if (existingTopUp.paymentStatus === 'paid') {
-      const currentBal = await this.getBalanceByUserId(existingTopUp.userId);
+    if (
+      existingTopUp.paymentStatus === 'paid' ||
+      existingTopUp.paymentStatus === 'overpaid'
+    ) {
+      const balCents = await this.getBalanceUsdCentsByUserId(existingTopUp.userId);
       return {
         ok: true,
         duplicate: true,
-        status: 'paid',
+        status: existingTopUp.paymentStatus,
         topUp: existingTopUp,
-        newBalance: currentBal,
+        newBalance: fromMinorUnits(balCents),
+        newBalanceUsdCents: balCents,
       };
     }
 
     if (
       existingTopUp.paymentStatus === 'cancelled' ||
       existingTopUp.paymentStatus === 'expired' ||
-      existingTopUp.paymentStatus === 'failed'
+      existingTopUp.paymentStatus === 'failed' ||
+      existingTopUp.paymentStatus === 'underpaid'
     ) {
       return {
         ok: false,
@@ -535,7 +607,6 @@ export class BalanceService {
       };
     }
 
-    // Check local expiration timestamp before or alongside provider check
     const isLocallyExpired =
       Boolean(existingTopUp.expiresAt) &&
       new Date(existingTopUp.expiresAt!).getTime() <= Date.now();
@@ -546,7 +617,6 @@ export class BalanceService {
       paymentId: existingTopUp.paymentId,
     });
 
-    // If invoice has expired (either reported by provider or local expiration reached)
     if (verified.status === 'expired' || isLocallyExpired) {
       const expiredTopUp = await this.markTopUpTerminalFailure(
         paymentId,
@@ -577,6 +647,22 @@ export class BalanceService {
       };
     }
 
+    if (verified.status === 'underpaid') {
+      const underpaidTopUp = await this.markTopUpTerminalFailure(
+        paymentId,
+        'underpaid',
+        `Частичная оплата счёта: получено ${verified.amountPaidStr} ${verified.currency}, ожидалось ${existingTopUp.expectedAmountStr} ${existingTopUp.currency}.`,
+        verified.amountPaidStr,
+      );
+      return {
+        ok: false,
+        duplicate: false,
+        status: 'underpaid',
+        topUp: underpaidTopUp,
+        reason: 'UNDERPAID',
+      };
+    }
+
     if (verified.status !== 'paid') {
       return {
         ok: false,
@@ -587,7 +673,6 @@ export class BalanceService {
       };
     }
 
-    // Strict security verification of paid invoice parameters:
     // 1. External Invoice ID match
     if (
       String(verified.externalInvoiceId) !== String(existingTopUp.externalInvoiceId) ||
@@ -627,7 +712,7 @@ export class BalanceService {
       };
     }
 
-    // 3. Recipient / Merchant ID match (when applicable)
+    // 3. Recipient / Merchant ID match
     if (
       existingTopUp.recipientMerchantId &&
       ((verified.recipientMerchantId &&
@@ -651,7 +736,7 @@ export class BalanceService {
       };
     }
 
-    // 4. Currency match (check both webhookHint if present and authoritative API response)
+    // 4. Currency & network match
     const expectedCurr = normalizeCurrencyCode(existingTopUp.currency);
     const verifiedCurr = normalizeCurrencyCode(verified.currency);
     const hintCurr = webhookHint?.currency
@@ -673,52 +758,96 @@ export class BalanceService {
       };
     }
 
-    // 5. Amount match (strict integer minor-unit equality)
-    const expectedAmountMinor = toMinorUnits(existingTopUp.amountPaid);
-    const verifiedAmountMinor = toMinorUnits(verified.amountPaid);
-    const hintAmountMinor =
-      webhookHint?.amountPaid !== undefined
-        ? toMinorUnits(webhookHint.amountPaid)
-        : expectedAmountMinor;
-
-    if (
-      verifiedAmountMinor !== expectedAmountMinor ||
-      hintAmountMinor !== expectedAmountMinor
-    ) {
+    const expectedNet = normalizeNetworkCode(existingTopUp.network);
+    const verifiedNet = normalizeNetworkCode(verified.network);
+    if (expectedNet && verifiedNet && expectedNet !== verifiedNet) {
       const failedTopUp = await this.markTopUpTerminalFailure(
         paymentId,
         'failed',
-        `Несовпадение суммы платежа: ожидалась ${existingTopUp.amountPaid}, получена ${verified.amountPaid} (hint: ${webhookHint?.amountPaid ?? 'n/a'})`,
+        `Несовпадение сети платежа: ожидалась ${expectedNet}, получена ${verifiedNet}`,
       );
       return {
         ok: false,
         duplicate: false,
         status: 'failed',
         topUp: failedTopUp,
-        reason: 'INVALID_AMOUNT',
+        reason: 'INVALID_NETWORK',
       };
     }
 
-    // 6. Atomic Firestore transaction to credit balance and prevent duplicate crediting
-    return firestoreRepo.runTransaction(async (tx) => {
-      const freshTopUp = await tx.get<BalanceTopUpRecord>(
-        'balance_topups',
+    // 5. Exact scaled 10^18 amount check: underpaid / exact / overpaid
+    const expectedStr =
+      existingTopUp.expectedAmountStr || String(existingTopUp.amountPaid);
+    const verifiedStr = verified.amountPaidStr;
+    const hintStr =
+      webhookHint?.amountPaidStr ??
+      (webhookHint?.amountPaid !== undefined ? String(webhookHint.amountPaid) : undefined);
+
+    if (hintStr !== undefined && compareScaledDecimal(hintStr, verifiedStr) !== 0) {
+      // If webhook hint doesn't match authoritative API amount, reject suspicious tampering
+      if (compareScaledDecimal(hintStr, expectedStr) < 0 && compareScaledDecimal(verifiedStr, expectedStr) < 0) {
+        const underpaidTopUp = await this.markTopUpTerminalFailure(
+          paymentId,
+          'underpaid',
+          `Недостаточная сумма оплаты: получено ${verifiedStr}, ожидалось ${expectedStr}.`,
+          verifiedStr,
+        );
+        return {
+          ok: false,
+          duplicate: false,
+          status: 'underpaid',
+          topUp: underpaidTopUp,
+          reason: 'UNDERPAID',
+        };
+      }
+    }
+
+    const cmpVerifiedVsExpected = compareScaledDecimal(verifiedStr, expectedStr);
+    if (cmpVerifiedVsExpected < 0) {
+      const underpaidTopUp = await this.markTopUpTerminalFailure(
         paymentId,
+        'underpaid',
+        `Недоплата счёта: получено ${verifiedStr} ${expectedCurr}, ожидалось ${expectedStr} ${expectedCurr}.`,
+        verifiedStr,
       );
+      return {
+        ok: false,
+        duplicate: false,
+        status: 'underpaid',
+        topUp: underpaidTopUp,
+        reason: 'UNDERPAID',
+      };
+    }
+
+    const isOverpaid = cmpVerifiedVsExpected > 0;
+    const lockId = sanitizeDocId(
+      `ext_${existingTopUp.provider}_${existingTopUp.externalInvoiceId}`,
+    );
+
+    // 6. Atomic Firestore transaction with payment_locks claim and integer USD cents crediting
+    return firestoreRepo.runTransaction(async (tx) => {
+      const [freshTopUp, userSnap, existingLock] = await Promise.all([
+        tx.get<BalanceTopUpRecord>('balance_topups', paymentId),
+        tx.get<StoreUser>('users', existingTopUp.userId),
+        tx.get<PaymentLockRecord>('payment_locks', lockId),
+      ]);
+
       if (!freshTopUp) {
         throw new Error(`Счёт пополнения ${paymentId} не найден в транзакции.`);
       }
 
-      const userSnap = await tx.get<StoreUser>('users', freshTopUp.userId);
-
-      // Idempotency guard inside transaction
-      if (freshTopUp.paymentStatus === 'paid') {
+      if (
+        freshTopUp.paymentStatus === 'paid' ||
+        freshTopUp.paymentStatus === 'overpaid'
+      ) {
+        const balCents = getUserBalanceCentsFromDoc(userSnap);
         return {
           ok: true,
           duplicate: true,
-          status: 'paid' as const,
+          status: freshTopUp.paymentStatus,
           topUp: freshTopUp,
-          newBalance: fromMinorUnits(toMinorUnits(userSnap?.balance ?? 0)),
+          newBalance: fromMinorUnits(balCents),
+          newBalanceUsdCents: balCents,
         };
       }
 
@@ -732,18 +861,25 @@ export class BalanceService {
         };
       }
 
-      // Guard against tampering with amountCredited after invoice creation
-      const lockedUsdBase = freshTopUp.amountUsd ?? freshTopUp.amountPaid;
-      const expectedCalc = calculateTopUpCommission(
-        lockedUsdBase,
+      if (
+        existingLock &&
+        (existingLock.targetType !== 'topup' ||
+          existingLock.targetId !== freshTopUp.paymentId)
+      ) {
+        throw new Error(
+          `PAYMENT_LOCK_CONFLICT: внешний инвойс ${freshTopUp.externalInvoiceId} уже использован для ${existingLock.targetType}:${existingLock.targetId}.`,
+        );
+      }
+
+      // Tamper guard in exact integer USD cents
+      const expectedCalc = calculateTopUpCommissionCents(
+        freshTopUp.amountUsdCents,
         freshTopUp.provider,
       );
       if (
-        toMinorUnits(freshTopUp.amountCredited) !==
-          toMinorUnits(expectedCalc.amountCredited) ||
-        toMinorUnits(freshTopUp.feeAmount) !==
-          toMinorUnits(expectedCalc.feeAmount) ||
-        freshTopUp.feePercent !== expectedCalc.feePercent
+        freshTopUp.amountCreditedUsdCents !== expectedCalc.amountCreditedUsdCents ||
+        freshTopUp.feeUsdCents !== expectedCalc.feeUsdCents ||
+        freshTopUp.feeBps !== expectedCalc.feeBps
       ) {
         throw new Error(
           `Обнаружено нарушение целостности расчёта комиссии для счёта ${paymentId}. Зачисление заблокировано.`,
@@ -751,14 +887,16 @@ export class BalanceService {
       }
 
       const now = new Date().toISOString();
-      const currentBalanceMinor = toMinorUnits(userSnap?.balance ?? 0);
-      const creditMinor = toMinorUnits(freshTopUp.amountCredited);
-      const newBalance = fromMinorUnits(currentBalanceMinor + creditMinor);
+      const currentBalanceCents = getUserBalanceCentsFromDoc(userSnap);
+      const newBalanceCents = currentBalanceCents + freshTopUp.amountCreditedUsdCents;
+      const newBalanceUsd = fromMinorUnits(newBalanceCents);
+      const terminalPaidStatus: BalanceTopUpStatus = isOverpaid ? 'overpaid' : 'paid';
 
       const updatedUser: StoreUser = userSnap
         ? {
             ...userSnap,
-            balance: newBalance,
+            balanceUsdCents: newBalanceCents,
+            balance: newBalanceUsd,
             updatedAt: now,
           }
         : {
@@ -768,31 +906,53 @@ export class BalanceService {
             firstName: 'Пользователь',
             isBlocked: false,
             totalOrders: 0,
+            balanceUsdCents: newBalanceCents,
+            totalSpentUsdCents: 0,
             totalSpentStars: 0,
-            balance: newBalance,
+            balance: newBalanceUsd,
             createdAt: now,
             updatedAt: now,
           };
 
       const paidTopUp: BalanceTopUpRecord = {
         ...freshTopUp,
-        paymentStatus: 'paid',
+        paymentStatus: terminalPaidStatus,
+        actualAmountStr: verifiedStr,
+        statusReason: isOverpaid
+          ? `Переплата (${verifiedStr} > ${expectedStr}); на баланс зачислена строго сумма по тарифу ${formatUsdCents(freshTopUp.amountCreditedUsdCents)}.`
+          : undefined,
         paidAt: verified.paidAt || now,
+        confirmedAt: now,
         updatedAt: now,
       };
 
+      const lockRecord: PaymentLockRecord = {
+        lockId,
+        provider: freshTopUp.provider,
+        providerPaymentId: String(freshTopUp.externalInvoiceId),
+        targetType: 'topup',
+        targetId: freshTopUp.paymentId,
+        paymentId: freshTopUp.paymentId,
+        userId: freshTopUp.userId,
+        amountUsdCents: freshTopUp.amountUsdCents,
+        claimedAt: now,
+      };
+
       const txId = `tx_topup_paid_${paymentId}`;
+      const txType = isOverpaid ? 'balance_topup_overpaid' : 'balance_topup_paid';
       const txRecord: StoreTransaction = {
         transactionId: txId,
         orderId: paymentId,
         userId: freshTopUp.userId,
-        type: 'balance_topup_paid',
-        amount: freshTopUp.amountCredited,
-        currency: freshTopUp.currency,
-        details: `Баланс пополнен через ${PAYMENT_PROVIDER_CATALOG[freshTopUp.provider].shortTitle} (invoice=${freshTopUp.externalInvoiceId}): внесено=${freshTopUp.amountPaid} ${freshTopUp.currency}, комиссия=${freshTopUp.feePercent}% (${freshTopUp.feeAmount}), зачислено=${freshTopUp.amountCredited}, новый баланс=${newBalance}`,
+        type: txType,
+        amount: freshTopUp.amountCreditedUsdCents,
+        amountUsdCents: freshTopUp.amountCreditedUsdCents,
+        currency: 'USD',
+        details: `Баланс пополнен через ${PAYMENT_PROVIDER_CATALOG[freshTopUp.provider].shortTitle} (invoice=${freshTopUp.externalInvoiceId}): получено=${verifiedStr} ${freshTopUp.currency}, комиссия=${freshTopUp.feePercent}% (${formatUsdCents(freshTopUp.feeUsdCents)}), зачислено=${formatUsdCents(freshTopUp.amountCreditedUsdCents)}, новый баланс=${formatUsdCents(newBalanceCents)}`,
         createdAt: now,
       };
 
+      tx.set<PaymentLockRecord>('payment_locks', lockId, lockRecord);
       tx.set<StoreUser>('users', freshTopUp.userId, updatedUser);
       tx.set<BalanceTopUpRecord>('balance_topups', paymentId, paidTopUp);
       tx.set<StoreTransaction>('transactions', txId, txRecord);
@@ -800,17 +960,19 @@ export class BalanceService {
       return {
         ok: true,
         duplicate: false,
-        status: 'paid' as const,
+        status: terminalPaidStatus,
         topUp: paidTopUp,
-        newBalance,
+        newBalance: newBalanceUsd,
+        newBalanceUsdCents: newBalanceCents,
       };
     });
   }
 
   private async markTopUpTerminalFailure(
     paymentId: string,
-    terminalStatus: 'failed' | 'expired' | 'cancelled',
+    terminalStatus: 'failed' | 'expired' | 'cancelled' | 'underpaid',
     failureReason: string,
+    actualAmountStr?: string,
   ): Promise<BalanceTopUpRecord> {
     const cleanReason = redactSecretsFromText(failureReason).slice(0, 450);
     return firestoreRepo.runTransaction(async (tx) => {
@@ -818,13 +980,15 @@ export class BalanceService {
       if (!fresh) {
         throw new Error(`Счёт пополнения ${paymentId} не найден.`);
       }
-      if (fresh.paymentStatus === 'paid') {
+      if (fresh.paymentStatus === 'paid' || fresh.paymentStatus === 'overpaid') {
         return fresh;
       }
       const now = new Date().toISOString();
       const updated: BalanceTopUpRecord = {
         ...fresh,
         paymentStatus: terminalStatus,
+        ...(actualAmountStr !== undefined ? { actualAmountStr } : {}),
+        statusReason: cleanReason,
         failureReason: cleanReason,
         updatedAt: now,
       };
@@ -833,15 +997,18 @@ export class BalanceService {
       const txType =
         terminalStatus === 'expired'
           ? 'balance_topup_expired'
-          : 'balance_topup_failed';
+          : terminalStatus === 'underpaid'
+            ? 'balance_topup_underpaid'
+            : 'balance_topup_failed';
       const txId = `tx_topup_${terminalStatus}_${paymentId}`;
       tx.set<StoreTransaction>('transactions', txId, {
         transactionId: txId,
         orderId: paymentId,
         userId: fresh.userId,
         type: txType,
-        amount: fresh.amountPaid,
-        currency: fresh.currency,
+        amount: fresh.amountUsdCents,
+        amountUsdCents: fresh.amountUsdCents,
+        currency: 'USD',
         details: cleanReason,
         createdAt: now,
       });
@@ -851,12 +1018,7 @@ export class BalanceService {
   }
 
   /**
-   * Pays for a store product or existing pending order using the user's internal balance.
-   * - Atomic balance deduction via Firestore transaction
-   * - Balance can never become negative
-   * - Prevents double deduction on repeated callback clicks / concurrent requests via deterministic orderId / idempotencyKey
-   * - Logs deduction in `transactions`
-   * - Never mixes internal balance with Telegram Stars (`totalSpentStars` is untouched)
+   * Pays for a store product or existing pending order using internal USD balance (integer cents).
    */
   public async purchaseWithInternalBalance(params: {
     telegramId: number;
@@ -865,42 +1027,40 @@ export class BalanceService {
     productId: string;
     quantity?: number;
     orderId?: string;
+    recipientUsername?: string;
   }): Promise<{
     order: Order;
     duplicate: boolean;
     newBalance: number;
+    newBalanceUsdCents: number;
   }> {
     firestoreRepo.assertReadyForOrdersAndPayments();
 
-    const quantity = params.quantity ?? 1;
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10) {
-      throw new Error('Некорректное количество товара (допустимо от 1 до 10).');
-    }
-
+    const normalizedRecipient = normalizeRecipientUsername(params.recipientUsername);
     const userId = `tg_${params.telegramId}`;
     const resolvedOrderId =
       params.orderId ||
       `ord_bal_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
 
     return firestoreRepo.runTransaction(async (tx) => {
-      // ALL READS FIRST
       const [existingOrder, product, userSnap] = await Promise.all([
         tx.get<Order>('orders', resolvedOrderId),
         tx.get<Product>('products', params.productId),
         tx.get<StoreUser>('users', userId),
       ]);
 
-      // Idempotency guard: if this order was already paid/processed/completed, do NOT deduct again!
       if (
         existingOrder &&
         (existingOrder.paymentStatus === 'paid' ||
           existingOrder.paymentStatus === 'processing' ||
           existingOrder.paymentStatus === 'completed')
       ) {
+        const balCents = getUserBalanceCentsFromDoc(userSnap);
         return {
           order: existingOrder,
           duplicate: true,
-          newBalance: fromMinorUnits(toMinorUnits(userSnap?.balance ?? 0)),
+          newBalance: fromMinorUnits(balCents),
+          newBalanceUsdCents: balCents,
         };
       }
 
@@ -927,32 +1087,50 @@ export class BalanceService {
         throw new Error('Ваш аккаунт заблокирован администратором.');
       }
 
-      const totalPrice = existingOrder
-        ? existingOrder.totalPrice
-        : product.price * quantity;
-      const totalPriceMinor = toMinorUnits(totalPrice);
-      const currentBalanceMinor = toMinorUnits(userSnap?.balance ?? 0);
+      const calc = existingOrder
+        ? {
+            quantity: existingOrder.quantity,
+            unitPriceUsdCents:
+              existingOrder.unitPriceUsdCents ??
+              Math.round(
+                (existingOrder.totalPriceUsdCents ?? existingOrder.totalPrice) /
+                  Math.max(1, existingOrder.quantity),
+              ),
+            totalPriceUsdCents:
+              existingOrder.totalPriceUsdCents ?? existingOrder.totalPrice,
+          }
+        : ProductService.calculateOrderPriceUsdCents(product, params.quantity ?? 1);
 
-      if (currentBalanceMinor < totalPriceMinor) {
-        const currentBalFormatted = fromMinorUnits(currentBalanceMinor);
+      const totalPriceUsdCents = assertValidUsdCents(
+        calc.totalPriceUsdCents,
+        'totalPriceUsdCents',
+      );
+      const currentBalanceCents = getUserBalanceCentsFromDoc(userSnap);
+
+      if (currentBalanceCents < totalPriceUsdCents) {
         throw new Error(
-          `Недостаточно средств на внутреннем балансе. Требуется: ${totalPrice}, доступно: ${currentBalFormatted}.`,
+          `Недостаточно средств на внутреннем балансе. Требуется: ${formatUsdCents(totalPriceUsdCents)}, доступно: ${formatUsdCents(currentBalanceCents)}.`,
         );
       }
 
-      const newBalanceMinor = currentBalanceMinor - totalPriceMinor;
-      if (newBalanceMinor < 0) {
+      const newBalanceCents = currentBalanceCents - totalPriceUsdCents;
+      if (newBalanceCents < 0) {
         throw new Error('Баланс не может уйти в минус.');
       }
-      const newBalance = fromMinorUnits(newBalanceMinor);
+      const newBalanceUsd = fromMinorUnits(newBalanceCents);
       const now = new Date().toISOString();
       const balancePaymentId = `bal_pay_${resolvedOrderId}`;
+      const effectiveRecipient =
+        normalizedRecipient || existingOrder?.recipientUsername;
 
       const updatedUser: StoreUser = userSnap
         ? {
             ...userSnap,
-            balance: newBalance,
+            balanceUsdCents: newBalanceCents,
+            balance: newBalanceUsd,
             totalOrders: (userSnap.totalOrders || 0) + 1,
+            totalSpentUsdCents:
+              (userSnap.totalSpentUsdCents || 0) + totalPriceUsdCents,
             updatedAt: now,
           }
         : {
@@ -962,8 +1140,10 @@ export class BalanceService {
             firstName: params.firstName || 'Покупатель',
             isBlocked: false,
             totalOrders: 1,
+            balanceUsdCents: newBalanceCents,
+            totalSpentUsdCents: totalPriceUsdCents,
             totalSpentStars: 0,
-            balance: newBalance,
+            balance: newBalanceUsd,
             createdAt: now,
             updatedAt: now,
           };
@@ -971,8 +1151,17 @@ export class BalanceService {
       const paidOrder: Order = existingOrder
         ? {
             ...existingOrder,
+            ...(effectiveRecipient ? { recipientUsername: effectiveRecipient } : {}),
+            unitPriceUsdCents: calc.unitPriceUsdCents,
+            totalPriceUsdCents,
+            totalPrice: totalPriceUsdCents,
+            currency: 'USD',
             paymentMethod: 'balance',
             balancePaymentId,
+            activePaymentId: balancePaymentId,
+            grossRevenueUsdCents: totalPriceUsdCents,
+            providerFeeUsdCents: 0,
+            mystarsCurrency: 'usdt_ton',
             paymentStatus: 'paid',
             fulfillmentStatus: 'paid',
             paidAt: now,
@@ -983,14 +1172,21 @@ export class BalanceService {
             userId,
             userTelegramId: params.telegramId,
             username: params.username || userSnap?.username,
+            ...(effectiveRecipient ? { recipientUsername: effectiveRecipient } : {}),
             productId: product.id,
             productName: product.name,
             category: product.category,
-            quantity,
-            totalPrice,
-            currency: product.currency,
+            quantity: calc.quantity,
+            unitPriceUsdCents: calc.unitPriceUsdCents,
+            totalPriceUsdCents,
+            totalPrice: totalPriceUsdCents,
+            currency: 'USD',
             paymentMethod: 'balance',
             balancePaymentId,
+            activePaymentId: balancePaymentId,
+            grossRevenueUsdCents: totalPriceUsdCents,
+            providerFeeUsdCents: 0,
+            mystarsCurrency: 'usdt_ton',
             paymentStatus: 'paid',
             fulfillmentStatus: 'paid',
             fulfillmentIdempotencyKey: `fulfill_${resolvedOrderId}`,
@@ -1000,34 +1196,58 @@ export class BalanceService {
             updatedAt: now,
           };
 
+      const paymentRecord: PaymentRecord = {
+        paymentId: balancePaymentId,
+        kind: 'order',
+        provider: 'balance',
+        providerPaymentId: balancePaymentId,
+        orderId: resolvedOrderId,
+        userId,
+        userTelegramId: params.telegramId,
+        totalAmount: totalPriceUsdCents,
+        expectedUsdCents: totalPriceUsdCents,
+        feeUsdCents: 0,
+        netUsdCents: totalPriceUsdCents,
+        expectedAmountStr: centsToUsdString(totalPriceUsdCents),
+        actualAmountStr: centsToUsdString(totalPriceUsdCents),
+        currency: 'USD',
+        invoicePayload: resolvedOrderId,
+        status: 'paid',
+        paidAt: now,
+        confirmedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      };
+
       const txId = `tx_bal_deduct_${resolvedOrderId}`;
       const txRecord: StoreTransaction = {
         transactionId: txId,
         orderId: resolvedOrderId,
         userId,
         type: 'balance_deducted',
-        amount: totalPrice,
-        currency: 'BAL',
-        details: `Оплата заказа ${resolvedOrderId} (${product.name}) с внутреннего баланса: списано=${totalPrice}, остаток баланса=${newBalance}`,
+        amount: totalPriceUsdCents,
+        amountUsdCents: totalPriceUsdCents,
+        currency: 'USD',
+        details: `Оплата заказа ${resolvedOrderId} (${product.name}) с внутреннего баланса: списано=${formatUsdCents(totalPriceUsdCents)}, остаток=${formatUsdCents(newBalanceCents)}`,
         createdAt: now,
       };
 
-      // ALL WRITES AFTER READS
       tx.set<StoreUser>('users', userId, updatedUser);
       tx.set<Order>('orders', resolvedOrderId, paidOrder);
+      tx.set<PaymentRecord>('payments', balancePaymentId, paymentRecord);
       tx.set<StoreTransaction>('transactions', txId, txRecord);
 
       return {
         order: paidOrder,
         duplicate: false,
-        newBalance,
+        newBalance: newBalanceUsd,
+        newBalanceUsdCents: newBalanceCents,
       };
     });
   }
 
   /**
-   * Safely refunds an order paid with internal balance back to the buyer's internal balance.
-   * Atomic Firestore transaction guarantees idempotency (cannot double-refund).
+   * Safely refunds an order paid with internal balance back to internal balance in integer USD cents.
    */
   public async refundOrderToInternalBalance(params: {
     orderId: string;
@@ -1038,32 +1258,41 @@ export class BalanceService {
     alreadyRefunded: boolean;
     order: Order;
     newBalance: number;
+    newBalanceUsdCents: number;
     message: string;
   }> {
     firestoreRepo.assertReadyForOrdersAndPayments();
 
     return firestoreRepo.runTransaction(async (tx) => {
-      // ALL READS FIRST
       const order = await tx.get<Order>('orders', params.orderId);
       if (!order) {
         throw new Error(`Заказ ${params.orderId} не найден.`);
       }
 
-      if (order.paymentMethod !== 'balance') {
+      if (
+        order.paymentMethod !== 'balance' &&
+        order.paymentMethod !== 'internal_balance'
+      ) {
         throw new Error(
-          `Заказ ${params.orderId} был оплачен через Telegram Stars, а не с внутреннего баланса. Используйте возврат Telegram Stars.`,
+          `Заказ ${params.orderId} был оплачен через внешний шлюз (${order.paymentMethod || 'неизвестно'}), а не с внутреннего баланса. Автоматический возврат криптовалютных платежей не поддерживается.`,
         );
       }
 
-      const userSnap = await tx.get<StoreUser>('users', order.userId);
+      const [userSnap, existingPayment] = await Promise.all([
+        tx.get<StoreUser>('users', order.userId),
+        order.balancePaymentId
+          ? tx.get<PaymentRecord>('payments', order.balancePaymentId)
+          : Promise.resolve(null),
+      ]);
 
-      // Idempotent guard if already refunded
       if (order.paymentStatus === 'refunded' || order.balanceRefunded === true) {
+        const balCents = getUserBalanceCentsFromDoc(userSnap);
         return {
           refunded: true,
           alreadyRefunded: true,
           order,
-          newBalance: fromMinorUnits(toMinorUnits(userSnap?.balance ?? 0)),
+          newBalance: fromMinorUnits(balCents),
+          newBalanceUsdCents: balCents,
           message: `Возврат средств на внутренний баланс по заказу ${params.orderId} уже был выполнен ранее.`,
         };
       }
@@ -1076,18 +1305,26 @@ export class BalanceService {
       }
 
       const now = new Date().toISOString();
-      const currentBalanceMinor = toMinorUnits(userSnap?.balance ?? 0);
-      const refundMinor = toMinorUnits(order.totalPrice);
-      const newBalance = fromMinorUnits(currentBalanceMinor + refundMinor);
+      const refundCents = assertValidUsdCents(
+        order.totalPriceUsdCents ?? order.totalPrice,
+        'totalPriceUsdCents',
+      );
+      const currentBalanceCents = getUserBalanceCentsFromDoc(userSnap);
+      const newBalanceCents = currentBalanceCents + refundCents;
+      const newBalanceUsd = fromMinorUnits(newBalanceCents);
       const shouldAdjustStats = !order.refundStatsAdjusted;
 
       const updatedUser: StoreUser = userSnap
         ? {
             ...userSnap,
-            balance: newBalance,
+            balanceUsdCents: newBalanceCents,
+            balance: newBalanceUsd,
             totalOrders: shouldAdjustStats
               ? Math.max(0, (userSnap.totalOrders || 0) - 1)
               : userSnap.totalOrders,
+            totalSpentUsdCents: shouldAdjustStats
+              ? Math.max(0, (userSnap.totalSpentUsdCents || 0) - refundCents)
+              : userSnap.totalSpentUsdCents,
             updatedAt: now,
           }
         : {
@@ -1097,8 +1334,10 @@ export class BalanceService {
             firstName: 'Покупатель',
             isBlocked: false,
             totalOrders: 0,
+            balanceUsdCents: newBalanceCents,
+            totalSpentUsdCents: 0,
             totalSpentStars: 0,
-            balance: newBalance,
+            balance: newBalanceUsd,
             createdAt: now,
             updatedAt: now,
           };
@@ -1124,13 +1363,21 @@ export class BalanceService {
         orderId: order.orderId,
         userId: order.userId,
         type: 'balance_refunded',
-        amount: order.totalPrice,
-        currency: 'BAL',
-        details: `Возврат заказа ${order.orderId} на внутренний баланс${adminTag}: +${order.totalPrice}, новый баланс=${newBalance}. Причина: ${params.reason}`,
+        amount: refundCents,
+        amountUsdCents: refundCents,
+        currency: 'USD',
+        details: `Возврат заказа ${order.orderId} на внутренний баланс${adminTag}: +${formatUsdCents(refundCents)}, новый баланс=${formatUsdCents(newBalanceCents)}. Причина: ${params.reason}`,
         createdAt: now,
       };
 
-      // ALL WRITES AFTER READS
+      if (existingPayment) {
+        tx.set<PaymentRecord>('payments', existingPayment.paymentId, {
+          ...existingPayment,
+          status: 'refunded',
+          refundedAt: existingPayment.refundedAt || now,
+          updatedAt: now,
+        });
+      }
       tx.set<StoreUser>('users', order.userId, updatedUser);
       tx.set<Order>('orders', order.orderId, refundedOrder);
       tx.set<StoreTransaction>('transactions', txId, txRecord);
@@ -1139,8 +1386,9 @@ export class BalanceService {
         refunded: true,
         alreadyRefunded: false,
         order: refundedOrder,
-        newBalance,
-        message: `Заказ ${order.orderId} успешно возвращён на внутренний баланс (+${order.totalPrice}, новый баланс: ${newBalance}).`,
+        newBalance: newBalanceUsd,
+        newBalanceUsdCents: newBalanceCents,
+        message: `Заказ ${order.orderId} успешно возвращён на внутренний баланс (+${formatUsdCents(refundCents)}, новый баланс: ${formatUsdCents(newBalanceCents)}).`,
       };
     });
   }

@@ -7,14 +7,30 @@ import {
   StoreUser,
   TransactionType,
 } from '../types.ts';
+import { formatUsdCents } from './Money.ts';
 import { ProductService } from './ProductService.ts';
 import { UserService } from './UserService.ts';
 
+/**
+ * Validates and normalizes a Telegram recipient @username (stores without leading @, lowercased).
+ * Telegram rules: 5..32 chars total (letter first, then letters/digits/underscores).
+ */
+export function normalizeRecipientUsername(raw?: string): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const trimmed = raw.trim().replace(/^@+/, '');
+  if (!trimmed) return undefined;
+  if (!/^[a-zA-Z][a-zA-Z0-9_]{3,31}$/.test(trimmed)) {
+    throw new Error(
+      'Некорректный @username получателя. Укажите от 4 до 32 символов латиницы, цифр или "_" (начинается с буквы).',
+    );
+  }
+  return trimmed.toLowerCase();
+}
+
 export class OrderService {
   /**
-   * Creates a new pending order strictly using the product price stored in the database.
+   * Creates a new pending order strictly using the product USD cents price stored in DB.
    * Never trusts price sent from client callbacks.
-   * Fails safely if production storage is unavailable.
    */
   public static async createOrder(params: {
     telegramUser: {
@@ -25,6 +41,7 @@ export class OrderService {
     };
     productId: string;
     quantity?: number;
+    recipientUsername?: string;
   }): Promise<Order> {
     firestoreRepo.assertReadyForOrdersAndPayments();
 
@@ -38,8 +55,10 @@ export class OrderService {
       throw new Error('Товар временно недоступен или снят с продажи.');
     }
 
-    const quantity = Math.max(1, Math.min(10, Math.round(params.quantity || 1)));
-    const totalPrice = product.price * quantity;
+    const { quantity, unitPriceUsdCents, totalPriceUsdCents } =
+      ProductService.calculateOrderPriceUsdCents(product, params.quantity ?? 1);
+
+    const normalizedRecipient = normalizeRecipientUsername(params.recipientUsername);
     const now = new Date().toISOString();
     const orderId = sanitizeDocId(
       `ord_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -50,14 +69,19 @@ export class OrderService {
       userId: user.userId,
       userTelegramId: user.telegramId,
       username: user.username,
+      ...(normalizedRecipient ? { recipientUsername: normalizedRecipient } : {}),
       productId: product.id,
       productName: product.name,
       category: product.category,
       quantity,
-      totalPrice,
-      currency: 'XTR',
+      unitPriceUsdCents,
+      totalPriceUsdCents,
+      totalPrice: totalPriceUsdCents,
+      currency: 'USD',
       paymentStatus: 'pending',
       fulfillmentStatus: 'pending',
+      grossRevenueUsdCents: totalPriceUsdCents,
+      mystarsCurrency: 'usdt_ton',
       fulfillmentAttempts: 0,
       fulfillmentIdempotencyKey: `fulfill_${orderId}`,
       createdAt: now,
@@ -69,20 +93,51 @@ export class OrderService {
       orderId: order.orderId,
       userId: order.userId,
       type: 'invoice_created',
-      amount: order.totalPrice,
-      details: `Создан заказ на "${order.productName}" (${order.totalPrice} XTR)`,
+      amount: order.totalPriceUsdCents,
+      amountUsdCents: order.totalPriceUsdCents,
+      currency: 'USD',
+      details: `Создан заказ #${order.orderId} на «${order.productName}» x${order.quantity} (${formatUsdCents(order.totalPriceUsdCents)})${normalizedRecipient ? ` для @${normalizedRecipient}` : ''}`,
     });
 
     return order;
+  }
+
+  public static async setOrderRecipientUsername(
+    orderId: string,
+    callerTelegramId: number,
+    rawRecipientUsername: string,
+  ): Promise<Order> {
+    const normalizedRecipient = normalizeRecipientUsername(rawRecipientUsername);
+    if (!normalizedRecipient) {
+      throw new Error('Укажите @username получателя.');
+    }
+
+    return firestoreRepo.runTransaction(async (tx) => {
+      const existing = await tx.get<Order>('orders', orderId);
+      if (!existing) {
+        throw new Error(`Заказ ${orderId} не найден.`);
+      }
+      if (existing.userTelegramId !== callerTelegramId) {
+        throw new Error('Вы не можете изменять чужой заказ.');
+      }
+      if (existing.paymentStatus !== 'pending') {
+        throw new Error('Нельзя изменить получателя после оплаты заказа.');
+      }
+
+      const updated: Order = {
+        ...existing,
+        recipientUsername: normalizedRecipient,
+        updatedAt: new Date().toISOString(),
+      };
+      tx.set<Order>('orders', orderId, updated);
+      return updated;
+    });
   }
 
   public static async getOrderById(orderId: string): Promise<Order | null> {
     return firestoreRepo.getDoc<Order>('orders', orderId);
   }
 
-  /**
-   * Server-side filtered and cursor-paginated user orders query.
-   */
   public static async getUserOrders(
     telegramId: number,
     limit = 20,
@@ -99,10 +154,6 @@ export class OrderService {
     });
   }
 
-  /**
-   * Server-side filtered and cursor-paginated orders query for admin views.
-   * Uses `fulfillmentStatus` (which tracks pending -> paid -> processing -> completed / failed / cancelled / refunded).
-   */
   public static async getAllOrders(
     statusFilter?: OrderStatus,
     limit = 50,
@@ -134,24 +185,35 @@ export class OrderService {
    */
   public static async markOrderPaid(params: {
     orderId: string;
-    telegramPaymentChargeId: string;
+    paymentId?: string;
+    telegramPaymentChargeId?: string;
     providerPaymentChargeId?: string;
   }): Promise<Order> {
     firestoreRepo.assertReadyForOrdersAndPayments();
-    if (!params.telegramPaymentChargeId) {
+    const resolvedPaymentDocId = params.paymentId
+      ? sanitizeDocId(params.paymentId)
+      : params.telegramPaymentChargeId
+        ? sanitizeDocId(`pay_${params.telegramPaymentChargeId}`)
+        : '';
+
+    if (!resolvedPaymentDocId) {
       throw new Error(
-        'Запрещено переводить заказ в статус paid без подтверждённого telegram_payment_charge_id.',
+        'Запрещено переводить заказ в статус paid без подтверждённого paymentId.',
       );
     }
 
-    const paymentDocId = sanitizeDocId(`pay_${params.telegramPaymentChargeId}`);
-
     return firestoreRepo.runTransaction(async (tx) => {
-      // All reads before writes
-      const verifiedPayment = await tx.get<PaymentRecord>('payments', paymentDocId);
-      if (!verifiedPayment || verifiedPayment.orderId !== params.orderId) {
+      const verifiedPayment = await tx.get<PaymentRecord>(
+        'payments',
+        resolvedPaymentDocId,
+      );
+      if (
+        !verifiedPayment ||
+        verifiedPayment.orderId !== params.orderId ||
+        (verifiedPayment.status !== 'paid' && verifiedPayment.status !== 'overpaid')
+      ) {
         throw new Error(
-          `Запрещено отмечать заказ #${params.orderId} оплаченным без подтверждённого успешного платежа (PaymentRecord не найден).`,
+          `Запрещено отмечать заказ #${params.orderId} оплаченным без подтверждённого успешного платежа (PaymentRecord не найден или не оплачен).`,
         );
       }
 
@@ -160,16 +222,26 @@ export class OrderService {
         throw new Error(`Заказ ${params.orderId} не найден.`);
       }
 
+      if (existing.paymentStatus === 'paid' || existing.paymentStatus === 'completed') {
+        return existing;
+      }
+
       const existingUser = await tx.get<StoreUser>('users', existing.userId);
       const now = new Date().toISOString();
+      const orderCents = existing.totalPriceUsdCents ?? existing.totalPrice;
 
       const updated: Order = {
         ...existing,
         paymentStatus: 'paid',
         fulfillmentStatus:
           existing.fulfillmentStatus === 'pending' ? 'paid' : existing.fulfillmentStatus,
-        telegramPaymentChargeId: params.telegramPaymentChargeId,
-        providerPaymentChargeId: params.providerPaymentChargeId || '',
+        activePaymentId: verifiedPayment.paymentId,
+        ...(params.telegramPaymentChargeId
+          ? { telegramPaymentChargeId: params.telegramPaymentChargeId }
+          : {}),
+        ...(params.providerPaymentChargeId
+          ? { providerPaymentChargeId: params.providerPaymentChargeId }
+          : {}),
         paidAt: now,
         updatedAt: now,
       };
@@ -179,8 +251,8 @@ export class OrderService {
       if (existingUser) {
         tx.set<StoreUser>('users', existingUser.userId, {
           ...existingUser,
-          totalOrders: existingUser.totalOrders + 1,
-          totalSpentStars: existingUser.totalSpentStars + existing.totalPrice,
+          totalOrders: (existingUser.totalOrders || 0) + 1,
+          totalSpentUsdCents: (existingUser.totalSpentUsdCents || 0) + orderCents,
           updatedAt: now,
         });
       }
@@ -193,9 +265,10 @@ export class OrderService {
         orderId: updated.orderId,
         userId: updated.userId,
         type: 'payment_received',
-        amount: updated.totalPrice,
-        currency: 'XTR',
-        details: `Оплата подтверждена (charge_id: ${params.telegramPaymentChargeId})`.slice(
+        amount: orderCents,
+        amountUsdCents: orderCents,
+        currency: updated.currency || 'USD',
+        details: `Оплата подтверждена (paymentId: ${verifiedPayment.paymentId})`.slice(
           0,
           500,
         ),
@@ -214,7 +287,7 @@ export class OrderService {
   }): Promise<Order | null> {
     if (params.paymentStatus === 'paid' || params.fulfillmentStatus === 'paid') {
       throw new Error(
-        'Перевод заказа в статус paid разрешён только через PaymentService.processSuccessfulPayment.',
+        'Перевод заказа в статус paid разрешён только через подтверждённый платёжный сервис (PaymentService / BalanceService).',
       );
     }
 
@@ -223,7 +296,7 @@ export class OrderService {
       params.fulfillmentStatus === 'refunded'
     ) {
       throw new Error(
-        'Перевод заказа в статус refunded разрешён только через PaymentService.markPaymentRefunded.',
+        'Перевод заказа в статус refunded разрешён только через сервис возврата (PaymentService / BalanceService).',
       );
     }
 
@@ -235,7 +308,6 @@ export class OrderService {
       const nextFulfillment = params.fulfillmentStatus ?? existing.fulfillmentStatus;
       const nextPayment = params.paymentStatus ?? existing.paymentStatus;
 
-      // AUD-004: Запрет отмены уже оплаченного, выданного или возвращённого заказа
       if (nextPayment === 'cancelled' || nextFulfillment === 'cancelled') {
         if (
           existing.paymentStatus !== 'pending' &&
@@ -255,7 +327,6 @@ export class OrderService {
         }
       }
 
-      // AUD-005: Запрет перевода неоплаченного, отменённого или возвращённого заказа в обработку или выдачу
       if (nextFulfillment === 'processing' || nextFulfillment === 'completed') {
         const hasConfirmedPayment =
           existing.paymentStatus === 'paid' ||
@@ -303,6 +374,8 @@ export class OrderService {
     userId: string;
     type: TransactionType;
     amount: number;
+    amountUsdCents?: number;
+    currency?: string;
     details: string;
   }): Promise<StoreTransaction> {
     const now = new Date().toISOString();
@@ -316,7 +389,10 @@ export class OrderService {
       userId: params.userId,
       type: params.type,
       amount: params.amount,
-      currency: 'XTR',
+      ...(params.amountUsdCents !== undefined
+        ? { amountUsdCents: params.amountUsdCents }
+        : {}),
+      currency: params.currency || 'USD',
       details: params.details.slice(0, 500),
       createdAt: now,
     };
@@ -325,9 +401,6 @@ export class OrderService {
     return tx;
   }
 
-  /**
-   * Server-side ordered and cursor-paginated recent transactions query.
-   */
   public static async getRecentTransactions(
     limit = 15,
     startAfterCursor?: unknown,

@@ -3,6 +3,7 @@ import {
   BalanceTopUpRecord,
   DigitalKeyRecord,
   Order,
+  PaymentRecord,
   Product,
   ProductCategory,
   StoreTransaction,
@@ -16,13 +17,24 @@ import {
   getEnvConfig,
 } from '../config/env.ts';
 import {
+  formatUsdCents,
+  usdInputToCents,
+} from '../services/Money.ts';
+import {
+  LiveUsdConversionResult,
   PAYMENT_PROVIDER_CATALOG,
   XROCKET_SUPPORTED_ASSETS,
-  convertUsdToPaymentCurrency,
 } from '../services/PaymentProviders.ts';
 import { calculateTopUpCommission } from '../services/BalanceService.ts';
 import { ProductKeyStockSummary } from '../services/DigitalKeyService.ts';
 import { oe } from './outlineEmoji.ts';
+
+export interface LiveCurrencyPreviewItem {
+  code: string;
+  networks: string[];
+  conversion?: LiveUsdConversionResult;
+  error?: string;
+}
 
 export function escapeHtml(text: string | undefined | null): string {
   if (!text) return '';
@@ -49,21 +61,54 @@ export function formatDateRu(iso: string | undefined): string {
   }
 }
 
+export function formatProductPriceLabel(product: Product): string {
+  const cents = product.priceUsdCents ?? product.price;
+  if (product.currency === 'XTR') {
+    return `${product.price} ⭐ (XTR)`;
+  }
+  if (product.minQuantity && product.minQuantity > 1) {
+    return `${formatUsdCents(product.unitPriceUsdCents ?? cents)} / шт. (от ${product.minQuantity})`;
+  }
+  return formatUsdCents(cents);
+}
+
+export function formatOrderAmountLabel(order: Order): string {
+  if (order.currency === 'XTR') {
+    return `${order.totalPrice} ⭐ (XTR)`;
+  }
+  return formatUsdCents(order.totalPriceUsdCents ?? order.totalPrice);
+}
+
+export function formatOrderPaymentMethodLabel(order: Order): string {
+  switch (order.paymentMethod) {
+    case 'balance':
+    case 'internal_balance':
+      return `${oe('wallet')} Баланс QuizyStars (USD)`;
+    case 'cryptobot':
+      return `${oe('cryptobot')} CryptoBot`;
+    case 'xrocket':
+      return `${oe('xrocket')} xRocket`;
+    case 'stars':
+    case 'telegram_stars':
+      return `${oe('stars')} Telegram Stars (архив)`;
+    default:
+      return `${oe('topup')} Ожидает выбора способа оплаты`;
+  }
+}
+
 export function formatWelcomeMessage(firstName: string, isAdmin: boolean): string {
   return [
-    `${oe('brand')} <b>Stars Shop — добро пожаловать, ${escapeHtml(firstName)}!</b>`,
+    `${oe('brand')} <b>QuizyStars — привет, ${escapeHtml(firstName)}!</b>`,
     '',
-    'Здесь вы можете приобрести цифровые товары Telegram прямо внутри чата:',
-    `• ${oe('stars')} <b>Telegram Stars</b> — пополнение баланса звёзд`,
-    `• ${oe('premium')} <b>Telegram Premium</b> — подписка на 3, 6 и 12 месяцев`,
-    `• ${oe('gifts')} <b>Telegram Gifts</b> — редкие и коллекционные подарки`,
+    'Минималистичный магазин цифровых сервисов Telegram:',
+    `• ${oe('stars')} <b>Telegram Stars</b> — пакеты и любое количество от 50 ⭐`,
+    `• ${oe('premium')} <b>Telegram Premium</b> — подписка на 3, 6 и 12 мес.`,
+    `• ${oe('gifts')} <b>Telegram Gifts</b> — цифровые подарочные наборы`,
     '',
-    `${oe('lock')} <b>Официальная оплата:</b> покупки можно оплачивать через <b>Telegram Stars (XTR)</b> или с <b>внутреннего баланса магазина в USD ($)</b> (пополнение через CryptoBot и xRocket).`,
+    `${oe('lock')} <b>Оплата:</b> CryptoBot, xRocket или внутренний баланс (USD).`,
     isAdmin
-      ? `\n${oe('admin')} <i>Вам доступен режим администратора магазина (/admin).</i>`
+      ? `\n${oe('admin')} <i>Панель администратора: /admin</i>`
       : '',
-    '',
-    'Выберите нужный раздел в меню ниже:',
   ]
     .filter(Boolean)
     .join('\n');
@@ -71,12 +116,12 @@ export function formatWelcomeMessage(firstName: string, isAdmin: boolean): strin
 
 export function formatCatalogOverviewMessage(): string {
   return [
-    `${oe('catalog')} <b>Каталог цифровых товаров Stars Shop</b>`,
+    `${oe('catalog')} <b>Каталог QuizyStars</b>`,
     '',
-    'Выберите интересующую вас категорию:',
-    `• ${oe('stars')} <b>Telegram Stars</b> — пакеты звёзд для сервисов и подарков`,
-    `• ${oe('premium')} <b>Telegram Premium</b> — премиум-подписки`,
-    `• ${oe('gifts')} <b>Telegram Gifts</b> — цифровые подарки для профиля`,
+    'Выберите категорию:',
+    `• ${oe('stars')} <b>Telegram Stars</b> — от $0.90 / $0.02 за 1 ⭐`,
+    `• ${oe('premium')} <b>Telegram Premium</b> — 3 / 6 / 12 месяцев`,
+    `• ${oe('gifts')} <b>Telegram Gifts</b> — цифровые подарки`,
   ].join('\n');
 }
 
@@ -89,90 +134,215 @@ export function formatCategoryListMessage(
     return [
       `${oe('catalog')} <b>${title}</b>`,
       '',
-      'В данной категории сейчас нет активных товаров. Пожалуйста, загляните позже или выберите другую категорию.',
+      'В этой категории пока нет активных товаров.',
     ].join('\n');
   }
 
   const lines = products.map(
     (p, idx) =>
-      `${idx + 1}. <b>${escapeHtml(p.name)}</b> — <code>${formatUsd(p.price)}</code> / <code>${p.price} ⭐ (XTR)</code>`,
+      `${idx + 1}. <b>${escapeHtml(p.name)}</b> — <code>${formatProductPriceLabel(p)}</code>`,
   );
 
   return [
-    `${oe('catalog')} <b>Категория: ${title}</b>`,
+    `${oe('catalog')} <b>${title}</b>`,
     '',
     ...lines,
     '',
-    'Нажмите на товар ниже, чтобы посмотреть подробное описание и перейти к покупке:',
+    'Выберите товар ниже:',
   ].join('\n');
 }
 
 export function formatProductCardMessage(product: Product): string {
+  const recipientHint =
+    product.category === 'stars' || product.category === 'premium'
+      ? `\n${oe('profile')} <b>Получатель:</b> указывается Telegram <code>@username</code> при оформлении.`
+      : '';
+
   return [
     `${oe('catalog')} <b>${escapeHtml(product.name)}</b>`,
     `${oe('info')} Категория: <b>${CATEGORY_LABELS[product.category]}</b>`,
     '',
-    `${oe('edit')} <b>Описание:</b>\n${escapeHtml(product.description)}`,
+    `${escapeHtml(product.description)}`,
     '',
-    `${oe('amount')} <b>Стоимость:</b> <code>${formatUsd(product.price)}</code> с внутреннего баланса или <code>${product.price} ⭐ (XTR)</code>`,
-    `${oe('orders')} <b>Способ выдачи:</b> ${
-      product.keyGeneratorAlgorithm
-        ? 'Мгновенная автоматическая выдача цифрового ключа после оплаты'
-        : product.fulfillmentType === 'manual'
-          ? 'Проверенная выдача после оплаты'
-          : 'Автоматический адаптер поставщика'
-    }`,
-    '',
-    'Выберите удобный способ оплаты ниже:',
+    `${oe('amount')} <b>Цена:</b> <code>${formatProductPriceLabel(product)}</code>${recipientHint}`,
   ].join('\n');
 }
 
-export function formatUserProfileMessage(user: StoreUser, isAdmin: boolean): string {
-  const currentBalance = Number((user.balance ?? 0).toFixed(2));
+export function formatPromptCustomQuantityMessage(product: Product): string {
+  const minQ = product.minQuantity ?? 50;
+  const maxQ = product.maxQuantity ?? 100000;
+  const unitCents = product.unitPriceUsdCents ?? product.priceUsdCents ?? product.price;
   return [
-    `${oe('profile')} <b>Ваш профиль покупателя — Stars Shop</b>`,
+    `${oe('stars')} <b>${escapeHtml(product.name)}</b>`,
     '',
-    `${oe('id')} <b>Telegram ID:</b> <code>${user.telegramId}</code>`,
-    `${oe('profile')} <b>Имя:</b> ${escapeHtml(user.firstName)} ${escapeHtml(user.lastName)}`,
-    user.username ? `🔗 <b>Username:</b> @${escapeHtml(user.username)}` : '',
-    `${oe('wallet')} <b>Внутренний баланс:</b> <code>${formatUsd(currentBalance)}</code>`,
-    `${oe('orders')} <b>Оплаченных заказов:</b> ${user.totalOrders}`,
-    `${oe('stars')} <b>Сумма покупок в Stars:</b> ${user.totalSpentStars} XTR`,
-    `📅 <b>Дата регистрации:</b> ${formatDateRu(user.createdAt)}`,
-    `${oe('lock')} <b>Статус аккаунта:</b> ${
+    `Введите количество Telegram Stars целым числом от <b>${minQ}</b> до <b>${maxQ}</b>.`,
+    `Цена за 1 ⭐: <code>${formatUsdCents(unitCents)}</code> (пример: <code>100</code> → <code>${formatUsdCents(unitCents * 100)}</code>).`,
+  ].join('\n');
+}
+
+export function formatPromptRecipientUsernameMessage(params: {
+  productName: string;
+  quantity: number;
+  totalPriceUsdCents: number;
+}): string {
+  return [
+    `${oe('profile')} <b>Укажите получателя</b>`,
+    '',
+    `Товар: <b>${escapeHtml(params.productName)}</b> (x${params.quantity})`,
+    `Сумма: <code>${formatUsdCents(params.totalPriceUsdCents)}</code>`,
+    '',
+    'Отправьте в чат Telegram <code>@username</code> получателя (например: <code>@username</code>) или нажмите кнопку ниже:',
+  ].join('\n');
+}
+
+export function formatOrderCheckoutChooserMessage(
+  order: Order,
+  currentBalanceUsdCents: number,
+): string {
+  const orderCents = order.totalPriceUsdCents ?? order.totalPrice;
+  return [
+    `${oe('orderDetail')} <b>Оформление заказа #${escapeHtml(order.orderId)}</b>`,
+    '',
+    `${oe('catalog')} Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
+    order.recipientUsername
+      ? `${oe('profile')} Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
+      : '',
+    `${oe('amount')} К оплате: <b><code>${formatUsdCents(orderCents)}</code></b>`,
+    `${oe('wallet')} Ваш баланс: <code>${formatUsdCents(currentBalanceUsdCents)}</code>`,
+    '',
+    'Выберите способ оплаты:',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function formatOrderCryptoCurrencyMessage(
+  order: Order,
+  provider: BalanceTopUpProvider,
+  currencies: LiveCurrencyPreviewItem[],
+): string {
+  const meta = PAYMENT_PROVIDER_CATALOG[provider];
+  const orderCents = order.totalPriceUsdCents ?? order.totalPrice;
+  const rateLines = currencies.map((item) => {
+    if (!item.conversion) {
+      return `• <b>${escapeHtml(item.code)}</b>: <i>${escapeHtml(item.error || 'курс временно недоступен')}</i>`;
+    }
+    if (!item.conversion.requiresConversionNotice) {
+      return `• <b>${escapeHtml(item.code)}</b>: <code>${item.conversion.convertedAmountStr} ${escapeHtml(item.code)}</code> (1:1 USD)`;
+    }
+    return `• <b>${escapeHtml(item.code)}</b>: <code>${item.conversion.convertedAmountStr} ${escapeHtml(item.code)}</code> (1 ${escapeHtml(item.code)} = $${escapeHtml(item.conversion.exchangeRateUsdStr)})`;
+  });
+
+  return [
+    `${oe('currency')} <b>Оплата заказа #${escapeHtml(order.orderId)} — ${escapeHtml(meta.shortTitle)}</b>`,
+    `${oe('amount')} Сумма: <b><code>${formatUsdCents(orderCents)}</code></b>`,
+    order.recipientUsername
+      ? `${oe('profile')} Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
+      : '',
+    '',
+    `${oe('info')} <b>Актуальные курсы провайдера:</b>`,
+    ...(rateLines.length > 0
+      ? rateLines
+      : ['• Не удалось загрузить курсы валют провайдера.']),
+    '',
+    'Выберите валюту оплаты ниже:',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function formatOrderPaymentInvoiceMessage(
+  order: Order,
+  payment: PaymentRecord,
+): string {
+  const providerTitle =
+    payment.provider === 'cryptobot' || payment.provider === 'xrocket'
+      ? PAYMENT_PROVIDER_CATALOG[payment.provider].shortTitle
+      : payment.provider;
+  const currencyLabel = payment.network
+    ? `${payment.currency} (${payment.network})`
+    : payment.currency;
+
+  const statusLabels: Record<string, string> = {
+    pending: `${oe('pending')} Ожидает оплаты`,
+    paid: `${oe('check')} Оплачен`,
+    overpaid: `${oe('check')} Оплачен (переплата зафиксирована)`,
+    underpaid: `${oe('warning')} Недоплата — заказ не активирован`,
+    expired: `${oe('warning')} Срок действия истёк`,
+    cancelled: `${oe('error')} Отменён`,
+    failed: `${oe('error')} Ошибка оплаты`,
+  };
+
+  return [
+    `${oe('orderDetail')} <b>Счёт на оплату заказа #${escapeHtml(order.orderId)}</b>`,
+    '',
+    `${oe('catalog')} Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
+    order.recipientUsername
+      ? `${oe('profile')} Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
+      : '',
+    `${oe('topup')} Провайдер: <b>${escapeHtml(providerTitle)}</b>`,
+    `${oe('amount')} Сумма заказа: <code>${formatUsdCents(payment.expectedUsdCents)}</code>`,
+    `${oe('currency')} К оплате: <b><code>${escapeHtml(payment.expectedAmountStr)} ${escapeHtml(currencyLabel)}</code></b>`,
+    payment.exchangeRateUsdStr && payment.currency !== 'USD'
+      ? `${oe('refresh')} Зафиксированный курс: <code>1 ${escapeHtml(payment.currency)} = $${escapeHtml(payment.exchangeRateUsdStr)}</code>`
+      : '',
+    `📌 Статус счёта: ${statusLabels[payment.status] || escapeHtml(payment.status)}`,
+    payment.statusReason
+      ? `${oe('warning')} Примечание: ${escapeHtml(payment.statusReason)}`
+      : '',
+    payment.expiresAt && payment.status === 'pending'
+      ? `⏳ Действителен до: ${formatDateRu(payment.expiresAt)}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function formatUserProfileMessage(user: StoreUser, isAdmin: boolean): string {
+  const balanceCents =
+    typeof user.balanceUsdCents === 'number' && Number.isInteger(user.balanceUsdCents)
+      ? user.balanceUsdCents
+      : Math.round((user.balance ?? 0) * 100);
+  const spentCents =
+    typeof user.totalSpentUsdCents === 'number' && Number.isInteger(user.totalSpentUsdCents)
+      ? user.totalSpentUsdCents
+      : 0;
+
+  return [
+    `${oe('profile')} <b>Профиль — QuizyStars</b>`,
+    '',
+    `${oe('id')} Telegram ID: <code>${user.telegramId}</code>`,
+    `${oe('profile')} Имя: ${escapeHtml(user.firstName)} ${escapeHtml(user.lastName)}`,
+    user.username ? `🔗 Username: @${escapeHtml(user.username)}` : '',
+    `${oe('wallet')} Внутренний баланс: <b><code>${formatUsdCents(balanceCents)}</code></b>`,
+    `${oe('orders')} Оплаченных заказов: ${user.totalOrders}`,
+    `${oe('amount')} Потрачено: <code>${formatUsdCents(spentCents)}</code>`,
+    `📅 Регистрация: ${formatDateRu(user.createdAt)}`,
+    `${oe('lock')} Статус: ${
       user.isBlocked
         ? `${oe('error')} Ограничен`
         : isAdmin
           ? `${oe('owner')} Администратор`
           : `${oe('check')} Активен`
     }`,
-    '',
-    `${oe('info')} Нажмите <b>«Пополнить баланс»</b>, чтобы внести произвольную сумму в USD ($) через CryptoBot или xRocket.`,
   ]
     .filter(Boolean)
     .join('\n');
 }
 
-/**
- * Шаг 1/3: Минималистичный экран выбора способа оплаты в USD ($).
- */
-export function formatTopUpStep1ProviderMessage(currentBalance: number): string {
+export function formatTopUpStep1ProviderMessage(currentBalanceUsdOrCents: number): string {
+  const balUsd = currentBalanceUsdOrCents;
   return [
-    `${oe('wallet')} <b>ПОПОЛНЕНИЕ БАЛАНСА (USD)</b>`,
-    '<i>Шаг 1/3 — Выбор способа оплаты</i>',
+    `${oe('wallet')} <b>Пополнение баланса (USD)</b>`,
+    '<i>Шаг 1/3 — Выбор провайдера</i>',
     '',
-    `${oe('amount')} Текущий баланс: <code>${formatUsd(currentBalance)}</code>`,
+    `${oe('amount')} Текущий баланс: <code>${formatUsd(balUsd)}</code>`,
     '',
-    `${oe('topup')} <b>Выберите способ оплаты:</b>`,
-    `• ${oe('cryptobot')} <b>CryptoBot</b> — комиссия <code>3%</code> ($100.00 → $97.00 к зачислению)`,
-    `• ${oe('xrocket')} <b>xRocket</b> — комиссия <code>2%</code> ($100.00 → $98.00 к зачислению)`,
+    `• ${oe('cryptobot')} <b>CryptoBot</b> — комиссия <code>3%</code> ($100.00 → +$97.00)`,
+    `• ${oe('xrocket')} <b>xRocket</b> — комиссия <code>2%</code> ($100.00 → +$98.00)`,
   ].join('\n');
 }
 
-/**
- * Шаг 2/3: Экран свободного ввода суммы в USD ($) по референсу https://ibb.co/KpxHvx5V
- * без фиксированных кнопок сумм, с мгновенным расчётом комиссии и суммы к зачислению.
- */
 export function formatTopUpStep2AmountMessage(params: {
   provider: BalanceTopUpProvider;
   amountPaid?: number;
@@ -190,76 +360,69 @@ export function formatTopUpStep2AmountMessage(params: {
     params.amountPaid <= meta.maxAmount;
 
   const lines: string[] = [
-    `${oe('amount')} <b>ВВОД СУММЫ ПОПОЛНЕНИЯ (USD)</b>`,
-    '<i>Шаг 2/3 — Свободный ввод суммы</i>',
+    `${oe('amount')} <b>Ввод суммы пополнения (USD)</b>`,
+    '<i>Шаг 2/3</i>',
     '',
-    `${providerIcon} Способ оплаты: <b>${escapeHtml(meta.shortTitle)}</b> [комиссия <code>${meta.feePercent}%</code>]${
+    `${providerIcon} Способ: <b>${escapeHtml(meta.shortTitle)}</b> (комиссия <code>${meta.feePercent}%</code>)${
       params.providerConfigured ? '' : ` ${oe('warning')} <i>(API не настроен)</i>`
     }`,
-    `• Допустимый диапазон: от <code>${formatUsd(MIN_TOPUP_AMOUNT_USD)}</code> до <code>${formatUsd(MAX_TOPUP_AMOUNT_USD)}</code>`,
+    `• Диапазон: от <code>${formatUsd(MIN_TOPUP_AMOUNT_USD)}</code> до <code>${formatUsd(MAX_TOPUP_AMOUNT_USD)}</code>`,
     '',
   ];
 
   if (hasValidAmount) {
     const calc = calculateTopUpCommission(params.amountPaid!, params.provider);
     lines.push(
-      '┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓',
-      `   ${oe('amount')} Введённая сумма: <b><code>${formatUsd(calc.amountPaid)}</code></b>`,
-      `   ${oe('fee')} Комиссия ${escapeHtml(meta.shortTitle)} (${calc.feePercent}%): <code>-${formatUsd(calc.feeAmount)}</code>`,
-      `   ${oe('credited')} <b>К зачислению на баланс:</b> <b><code>+${formatUsd(calc.amountCredited)}</code></b>`,
-      '┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛',
+      `${oe('amount')} Внесено: <b><code>${formatUsdCents(calc.amountUsdCents)}</code></b>`,
+      `${oe('fee')} Комиссия (${calc.feePercent}%): <code>−${formatUsdCents(calc.feeUsdCents)}</code>`,
+      `${oe('credited')} К зачислению: <b><code>+${formatUsdCents(calc.amountCreditedUsdCents)}</code></b>`,
       '',
-      `${oe('edit')} <i>Вы можете отправить другую сумму в USD числом в чат (например: <code>10</code>, <code>19.99</code>, <code>100.00</code>) или переключить способ оплаты ниже.</i>`,
+      `${oe('edit')} <i>Отправьте другую сумму в чат (например: <code>10.00</code>, <code>19.99</code>) или продолжите ниже.</i>`,
     );
   } else {
-    const sample100 = calculateTopUpCommission(100, params.provider);
+    const sample = calculateTopUpCommission(100, params.provider);
     lines.push(
-      '┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓',
-      `   ${oe('edit')} <b>Введите сумму пополнения в USD ($)</b>`,
-      '   Отправьте любое число в чат:',
-      '   например <code>10.00</code>, <code>19.99</code> или <code>100.00</code>',
-      '┗━━━━━━━━━━━━━━━━━━━━━━━━━━┛',
-      '',
-      `${oe('stats')} <b>Формула расчёта (${escapeHtml(meta.shortTitle)} — ${meta.feePercent}%):</b>`,
-      `• Комиссия удерживается из введённой суммы (<code>сумма × ${(1 - meta.feePercent / 100).toFixed(2)}</code>)`,
-      `• Пример: при вводе <code>${formatUsd(100)}</code> → комиссия <code>-${formatUsd(sample100.feeAmount)}</code> → к зачислению <b><code>+${formatUsd(sample100.amountCredited)}</code></b>`,
+      `${oe('edit')} Отправьте в чат сумму в USD (например: <code>10</code>, <code>19.99</code>, <code>100.00</code>).`,
+      `${oe('stats')} Пример (${escapeHtml(meta.shortTitle)}): <code>$100.00</code> → комиссия <code>−${formatUsdCents(sample.feeUsdCents)}</code> → <b><code>+${formatUsdCents(sample.amountCreditedUsdCents)}</code></b>`,
     );
   }
 
   return lines.join('\n');
 }
 
-/**
- * Шаг 3/3 (для xRocket): Экран выбора криптовалюты и сети с прозрачной конвертацией из USD ($).
- */
-export function formatTopUpStep3XRocketCurrencyMessage(amountUsd: number): string {
+export function formatTopUpStep3XRocketCurrencyMessage(
+  amountUsd: number,
+  livePreviews?: LiveCurrencyPreviewItem[],
+): string {
   const calc = calculateTopUpCommission(amountUsd, 'xrocket');
-  const conversionLines = XROCKET_SUPPORTED_ASSETS.map((asset) => {
-    const conv = convertUsdToPaymentCurrency(calc.amountPaid, asset.code);
-    if (!conv.requiresConversionNotice) {
-      return `• <b>${asset.code}</b>: <code>${conv.convertedAmount.toFixed(2)} ${asset.code}</code> (1 ${asset.code} = $1.00)`;
-    }
-    return `• <b>${asset.code}</b>: <code>~${conv.convertedAmount} ${asset.code}</code> (курс фиксации: 1 ${asset.code} = ${formatUsd(conv.exchangeRateUsd)})`;
-  });
+  const conversionLines =
+    livePreviews && livePreviews.length > 0
+      ? livePreviews.map((item) => {
+          if (!item.conversion) {
+            return `• <b>${escapeHtml(item.code)}</b>: <i>${escapeHtml(item.error || 'курс временно недоступен')}</i>`;
+          }
+          if (!item.conversion.requiresConversionNotice) {
+            return `• <b>${escapeHtml(item.code)}</b>: <code>${item.conversion.convertedAmountStr} ${escapeHtml(item.code)}</code>`;
+          }
+          return `• <b>${escapeHtml(item.code)}</b>: <code>~${item.conversion.convertedAmountStr} ${escapeHtml(item.code)}</code> (1 ${escapeHtml(item.code)} = $${escapeHtml(item.conversion.exchangeRateUsdStr)})`;
+        })
+      : XROCKET_SUPPORTED_ASSETS.map(
+          (asset) => `• <b>${asset.code}</b>: расчёт по живому курсу при создании счёта`,
+        );
 
   return [
-    `${oe('currency')} <b>ВЫБОР ВАЛЮТЫ И СЕТИ ОПЛАТЫ</b>`,
+    `${oe('currency')} <b>Выбор монеты и сети</b>`,
     '<i>Шаг 3/3 — xRocket Pay</i>',
     '',
-    `${oe('amount')} Сумма пополнения (USD): <b><code>${formatUsd(calc.amountPaid)}</code></b>`,
-    `${oe('fee')} Комиссия xRocket (${calc.feePercent}%): <code>-${formatUsd(calc.feeAmount)}</code>`,
-    `${oe('credited')} <b>Фиксированная сумма зачисления:</b> <b><code>+${formatUsd(calc.amountCredited)}</code></b>`,
+    `${oe('amount')} Сумма: <b><code>${formatUsdCents(calc.amountUsdCents)}</code></b>`,
+    `${oe('fee')} Комиссия xRocket (${calc.feePercent}%): <code>−${formatUsdCents(calc.feeUsdCents)}</code>`,
+    `${oe('credited')} К зачислению: <b><code>+${formatUsdCents(calc.amountCreditedUsdCents)}</code></b>`,
     '',
-    `${oe('info')} <b>Доступные валюты и курсы конвертации:</b>`,
+    `${oe('info')} <b>Валюты и актуальные курсы:</b>`,
     ...conversionLines,
-    '',
-    '<i>Сумма зачисления в USD фиксируется при создании счёта и не меняется после оплаты.</i>',
   ].join('\n');
 }
 
-/**
- * Совместимый форматтер меню пополнения баланса в USD ($).
- */
 export function formatTopUpMenuMessage(params: {
   currentBalance: number;
   provider: BalanceTopUpProvider;
@@ -275,9 +438,6 @@ export function formatTopUpMenuMessage(params: {
   });
 }
 
-/**
- * Шаг 3/3: Карточка созданного счёта в USD ($) с указанием исходной валюты оплаты и зафиксированного курса.
- */
 export function formatTopUpInvoiceCardMessage(
   topUp: BalanceTopUpRecord,
   newBalance?: number,
@@ -285,45 +445,53 @@ export function formatTopUpInvoiceCardMessage(
   const meta = PAYMENT_PROVIDER_CATALOG[topUp.provider];
   const statusLabels: Record<string, string> = {
     pending: `${oe('pending')} Ожидает оплаты`,
-    paid: `${oe('check')} Оплачен и зачислен на баланс`,
+    paid: `${oe('check')} Оплачен и зачислен`,
+    overpaid: `${oe('check')} Оплачен (переплата зафиксирована)`,
+    underpaid: `${oe('warning')} Недоплата — баланс НЕ зачислен`,
     cancelled: `${oe('error')} Отменён`,
     expired: `${oe('warning')} Срок действия истёк`,
     failed: `${oe('warning')} Ошибка проверки платежа`,
   };
 
-  const baseUsd = topUp.amountUsd ?? topUp.amountPaid;
-  const origCurr = topUp.originalCurrency || topUp.currency;
-  const origAmt = topUp.originalAmountPaid ?? topUp.amountPaid;
-  const currencyLabel = topUp.network
-    ? `${origCurr} (${topUp.network})`
-    : origCurr;
+  const grossCents =
+    typeof topUp.amountUsdCents === 'number'
+      ? topUp.amountUsdCents
+      : usdInputToCents(topUp.amountUsd ?? topUp.amountPaid);
+  const feeCents =
+    typeof topUp.feeUsdCents === 'number'
+      ? topUp.feeUsdCents
+      : Math.round(topUp.feeAmount * 100);
+  const creditedCents =
+    typeof topUp.amountCreditedUsdCents === 'number'
+      ? topUp.amountCreditedUsdCents
+      : Math.round(topUp.amountCredited * 100);
 
-  const isConvertedCrypto =
-    origCurr !== 'USD' &&
-    origCurr !== 'USDT' &&
-    origCurr !== 'USDC' &&
-    topUp.exchangeRateUsd &&
-    topUp.exchangeRateUsd !== 1;
+  const origCurr = topUp.originalCurrency || topUp.currency;
+  const origAmtStr =
+    topUp.expectedAmountStr || String(topUp.originalAmountPaid ?? topUp.amountPaid);
+  const currencyLabel = topUp.network ? `${origCurr} (${topUp.network})` : origCurr;
 
   return [
-    `${oe('orderDetail')} <b>СЧЁТ НА ПОПОЛНЕНИЕ СОЗДАН</b>`,
-    '<i>Шаг 3/3 — Оплата счёта</i>',
+    `${oe('orderDetail')} <b>Счёт на пополнение #${escapeHtml(topUp.paymentId)}</b>`,
     '',
-    `${oe('id')} Счёт: <code>#${escapeHtml(topUp.paymentId)}</code>`,
-    `${oe('topup')} Способ оплаты: <b>${escapeHtml(meta?.shortTitle || topUp.provider)}</b>`,
-    `${oe('currency')} Валюта счёта: <code>${escapeHtml(currencyLabel)}</code>`,
-    `${oe('amount')} Введённая сумма (USD): <b><code>${formatUsd(baseUsd)}</code></b>`,
-    isConvertedCrypto
-      ? `${oe('refresh')} Сумма к оплате по курсу (1 ${escapeHtml(origCurr)} = ${formatUsd(topUp.exchangeRateUsd!)}): <b><code>${origAmt} ${escapeHtml(origCurr)}</code></b>`
-      : `${oe('amount')} К оплате: <code>${formatUsd(baseUsd)} (${origAmt.toFixed(2)} ${escapeHtml(origCurr)})</code>`,
-    `${oe('fee')} Комиссия (${topUp.feePercent}%): <code>-${formatUsd(topUp.feeAmount)}</code>`,
-    `${oe('credited')} <b>Итоговая сумма зачисления:</b> <b><code>+${formatUsd(topUp.amountCredited)}</code></b>`,
+    `${oe('topup')} Провайдер: <b>${escapeHtml(meta?.shortTitle || topUp.provider)}</b>`,
+    `${oe('currency')} Валюта: <code>${escapeHtml(currencyLabel)}</code>`,
+    `${oe('amount')} Сумма пополнения: <b><code>${formatUsdCents(grossCents)}</code></b>`,
+    origCurr !== 'USD'
+      ? `${oe('refresh')} К оплате: <b><code>${escapeHtml(origAmtStr)} ${escapeHtml(origCurr)}</code></b>${
+          topUp.exchangeRateUsdStr
+            ? ` (1 ${escapeHtml(origCurr)} = $${escapeHtml(topUp.exchangeRateUsdStr)})`
+            : ''
+        }`
+      : '',
+    `${oe('fee')} Комиссия (${topUp.feePercent}%): <code>−${formatUsdCents(feeCents)}</code>`,
+    `${oe('credited')} К зачислению: <b><code>+${formatUsdCents(creditedCents)}</code></b>`,
     `📌 Статус: ${statusLabels[topUp.paymentStatus] || topUp.paymentStatus}`,
-    topUp.failureReason
-      ? `${oe('warning')} Причина: ${escapeHtml(topUp.failureReason)}`
+    topUp.failureReason || topUp.statusReason
+      ? `${oe('warning')} Детали: ${escapeHtml(topUp.failureReason || topUp.statusReason)}`
       : '',
     newBalance !== undefined
-      ? `${oe('wallet')} Обновлённый баланс: <b><code>${formatUsd(newBalance)}</code></b>`
+      ? `${oe('wallet')} Баланс: <b><code>${formatUsd(newBalance)}</code></b>`
       : '',
   ]
     .filter(Boolean)
@@ -332,15 +500,14 @@ export function formatTopUpInvoiceCardMessage(
 
 export function formatSupportedCryptoInfoMessage(): string {
   return [
-    `${oe('currency')} <b>Оплата в USD ($) и криптовалюте через поддерживаемых провайдеров</b>`,
+    `${oe('currency')} <b>Поддерживаемые платёжные провайдеры (USD / Crypto)</b>`,
     '',
-    `1️⃣ ${oe('xrocket')} <b>xRocket Pay (@xrocket) — комиссия 2%</b>`,
-    `• <b>Валюты:</b> ${PAYMENT_PROVIDER_CATALOG.xrocket.supportedCurrencies.join(', ')}`,
-    `• <b>Сети:</b> ${PAYMENT_PROVIDER_CATALOG.xrocket.supportedNetworks.join(', ')}`,
+    `1️⃣ ${oe('cryptobot')} <b>CryptoBot — комиссия 3%</b> (пополнение баланса)`,
+    `• Валюты: ${PAYMENT_PROVIDER_CATALOG.cryptobot.supportedCurrencies.join(', ')}`,
     '',
-    `2️⃣ ${oe('cryptobot')} <b>CryptoBot (@CryptoBot) — комиссия 3%</b>`,
-    `• <b>Валюты:</b> ${PAYMENT_PROVIDER_CATALOG.cryptobot.supportedCurrencies.join(', ')}`,
-    `• <b>Сети:</b> ${PAYMENT_PROVIDER_CATALOG.cryptobot.supportedNetworks.join(', ')}`,
+    `2️⃣ ${oe('xrocket')} <b>xRocket Pay — комиссия 2%</b> (пополнение баланса)`,
+    `• Валюты: ${PAYMENT_PROVIDER_CATALOG.xrocket.supportedCurrencies.join(', ')}`,
+    `• Сети: ${PAYMENT_PROVIDER_CATALOG.xrocket.supportedNetworks.join(', ')}`,
   ].join('\n');
 }
 
@@ -350,28 +517,39 @@ export function formatUserTopUpHistoryMessage(
 ): string {
   if (topUps.length === 0) {
     return [
-      `${oe('history')} <b>История пополнений баланса</b>`,
-      `${oe('wallet')} <b>Текущий баланс:</b> <code>${formatUsd(currentBalance)}</code>`,
+      `${oe('history')} <b>История пополнений</b>`,
+      `${oe('wallet')} Баланс: <code>${formatUsd(currentBalance)}</code>`,
       '',
-      'У вас пока нет созданных счетов на пополнение баланса.',
+      'У вас пока нет счетов на пополнение.',
     ].join('\n');
   }
 
   const lines = topUps.slice(0, 10).map((t, idx) => {
     const prov = PAYMENT_PROVIDER_CATALOG[t.provider]?.shortTitle || t.provider;
-    const baseUsd = t.amountUsd ?? t.amountPaid;
-    const origCurr = t.originalCurrency || t.currency;
-    const origAmt = t.originalAmountPaid ?? t.amountPaid;
-    const origTag =
+    const grossCents =
+      typeof t.amountUsdCents === 'number'
+        ? t.amountUsdCents
+        : usdInputToCents(t.amountUsd ?? t.amountPaid);
+    const creditedCents =
+      typeof t.amountCreditedUsdCents === 'number'
+        ? t.amountCreditedUsdCents
+        : Math.round(t.amountCredited * 100);
+    const origCurr = t.originalCurrency || t.currency || 'USD';
+    const cryptoAmtStr =
+      t.expectedAmountStr ||
+      (t.originalAmountPaid !== undefined ? String(t.originalAmountPaid) : '');
+    const cryptoNote =
       origCurr !== 'USD'
-        ? ` [${origAmt} ${escapeHtml(origCurr)}]`
-        : ' [USD]';
-    return `${idx + 1}. <b>#${escapeHtml(t.paymentId.slice(-8))}</b> [${escapeHtml(prov)}] — внесено <code>${formatUsd(baseUsd)}</code>${origTag} (комиссия ${t.feePercent}%: <code>-${formatUsd(t.feeAmount)}</code>) → к зачислению <code>+${formatUsd(t.amountCredited)}</code> | Статус: <b>${t.paymentStatus}</b>`;
+        ? cryptoAmtStr
+          ? ` (${escapeHtml(cryptoAmtStr)} ${escapeHtml(origCurr)})`
+          : ` (${escapeHtml(origCurr)})`
+        : '';
+    return `${idx + 1}. <b>#${escapeHtml(t.paymentId.slice(-8))}</b> [${escapeHtml(prov)}] — ${formatUsdCents(grossCents)}${cryptoNote} → <code>+${formatUsdCents(creditedCents)}</code> | <b>${t.paymentStatus}</b>`;
   });
 
   return [
-    `${oe('history')} <b>История пополнений баланса (показано: ${Math.min(topUps.length, 10)})</b>`,
-    `${oe('wallet')} <b>Текущий баланс:</b> <code>${formatUsd(currentBalance)}</code>`,
+    `${oe('history')} <b>История пополнений (показано: ${Math.min(topUps.length, 10)})</b>`,
+    `${oe('wallet')} Баланс: <code>${formatUsd(currentBalance)}</code>`,
     '',
     ...lines,
   ].join('\n');
@@ -379,27 +557,40 @@ export function formatUserTopUpHistoryMessage(
 
 export function formatAdminTopUpCard(topUp: BalanceTopUpRecord): string {
   const prov = PAYMENT_PROVIDER_CATALOG[topUp.provider]?.title || topUp.provider;
-  const baseUsd = topUp.amountUsd ?? topUp.amountPaid;
-  const origCurr = topUp.originalCurrency || topUp.currency;
-  const origAmt = topUp.originalAmountPaid ?? topUp.amountPaid;
+  const grossCents =
+    typeof topUp.amountUsdCents === 'number'
+      ? topUp.amountUsdCents
+      : usdInputToCents(topUp.amountUsd ?? topUp.amountPaid);
+  const feeCents =
+    typeof topUp.feeUsdCents === 'number'
+      ? topUp.feeUsdCents
+      : Math.round(topUp.feeAmount * 100);
+  const creditedCents =
+    typeof topUp.amountCreditedUsdCents === 'number'
+      ? topUp.amountCreditedUsdCents
+      : Math.round(topUp.amountCredited * 100);
 
   return [
-    `${oe('topup')} <b>Пополнение баланса #${escapeHtml(topUp.paymentId)}</b>`,
-    `${oe('profile')} <b>Пользователь:</b> <code>${topUp.userTelegramId}</code> (${escapeHtml(topUp.userId)})${topUp.username ? ` @${escapeHtml(topUp.username)}` : ''}`,
-    `🔌 <b>Провайдер:</b> ${escapeHtml(prov)}`,
-    `${oe('id')} <b>External Invoice ID:</b> <code>${escapeHtml(topUp.externalInvoiceId)}</code>`,
-    topUp.network ? `🌐 <b>Сеть:</b> <code>${escapeHtml(topUp.network)}</code>` : '',
-    `${oe('amount')} <b>Сумма в USD:</b> <code>${formatUsd(baseUsd)}</code>`,
-    `${oe('currency')} <b>Исходная валюта оплаты:</b> <code>${origAmt} ${escapeHtml(origCurr)}</code>${topUp.exchangeRateUsd ? ` (курс: ${formatUsd(topUp.exchangeRateUsd)})` : ''}`,
-    `${oe('fee')} <b>Комиссия магазина (${topUp.feePercent}%):</b> <code>-${formatUsd(topUp.feeAmount)}</code>`,
-    `${oe('credited')} <b>Фактическая сумма зачисления:</b> <code>+${formatUsd(topUp.amountCredited)}</code>`,
-    `📌 <b>Статус:</b> <b>${escapeHtml(topUp.paymentStatus.toUpperCase())}</b>`,
-    topUp.failureReason
-      ? `${oe('warning')} <b>Ошибка / Причина:</b> ${escapeHtml(topUp.failureReason)}`
+    `${oe('topup')} <b>Пополнение #${escapeHtml(topUp.paymentId)}</b>`,
+    `${oe('profile')} Пользователь: <code>${topUp.userTelegramId}</code>${topUp.username ? ` (@${escapeHtml(topUp.username)})` : ''}`,
+    `🔌 Провайдер: ${escapeHtml(prov)}`,
+    `${oe('id')} External ID: <code>${escapeHtml(topUp.externalInvoiceId)}</code>`,
+    topUp.network ? `🌐 Сеть: <code>${escapeHtml(topUp.network)}</code>` : '',
+    `${oe('amount')} Сумма USD: <code>${formatUsdCents(grossCents)}</code>`,
+    `${oe('currency')} Счёт: <code>${escapeHtml(topUp.expectedAmountStr || String(topUp.amountPaid))} ${escapeHtml(topUp.currency)}</code>${
+      topUp.exchangeRateUsdStr ? ` (курс $${escapeHtml(topUp.exchangeRateUsdStr)})` : ''
+    }`,
+    topUp.actualAmountStr
+      ? `📥 Получено: <code>${escapeHtml(topUp.actualAmountStr)} ${escapeHtml(topUp.currency)}</code>`
       : '',
-    `🕒 <b>Создан:</b> ${formatDateRu(topUp.createdAt)}`,
-    topUp.expiresAt ? `${oe('pending')} <b>Истекает:</b> ${formatDateRu(topUp.expiresAt)}` : '',
-    topUp.paidAt ? `${oe('check')} <b>Оплачен:</b> ${formatDateRu(topUp.paidAt)}` : '',
+    `${oe('fee')} Комиссия (${topUp.feePercent}%): <code>−${formatUsdCents(feeCents)}</code>`,
+    `${oe('credited')} К зачислению: <code>+${formatUsdCents(creditedCents)}</code>`,
+    `📌 Статус: <b>${escapeHtml(topUp.paymentStatus.toUpperCase())}</b>`,
+    topUp.failureReason || topUp.statusReason
+      ? `${oe('warning')} Причина: ${escapeHtml(topUp.failureReason || topUp.statusReason)}`
+      : '',
+    `🕒 Создан: ${formatDateRu(topUp.createdAt)}`,
+    topUp.paidAt ? `${oe('check')} Оплачен: ${formatDateRu(topUp.paidAt)}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -410,70 +601,53 @@ export function formatUserOrdersListMessage(orders: Order[]): string {
     return [
       `${oe('orders')} <b>Мои заказы</b>`,
       '',
-      'У вас пока нет оформленных заказов. Перейдите в /catalog, чтобы выбрать цифровой товар!',
+      'Заказов пока нет. Откройте /catalog.',
     ].join('\n');
   }
 
   const recent = orders.slice(0, 8).map(
     (o, i) =>
-      `${i + 1}. <b>#${escapeHtml(o.orderId.slice(-8))}</b> — ${escapeHtml(
-        o.productName,
-      )} (<code>${o.paymentMethod === 'balance' ? formatUsd(o.totalPrice) : `${o.totalPrice} ⭐`}</code>)\n   Статус: ${
-        ORDER_STATUS_LABELS[o.fulfillmentStatus]
-      }`,
+      `${i + 1}. <b>#${escapeHtml(o.orderId.slice(-8))}</b> — ${escapeHtml(o.productName)} (<code>${formatOrderAmountLabel(o)}</code>)\n   ${ORDER_STATUS_LABELS[o.fulfillmentStatus]}`,
   );
 
   return [
-    `${oe('orders')} <b>История ваших заказов (всего: ${orders.length})</b>`,
+    `${oe('orders')} <b>Мои заказы (всего: ${orders.length})</b>`,
     '',
     ...recent,
-    '',
-    'Нажмите на заказ ниже для просмотра деталей:',
   ].join('\n');
 }
 
 export function formatOrderDetailMessage(order: Order): string {
-  const paymentMethodLabel =
-    order.paymentMethod === 'balance'
-      ? `${oe('wallet')} Внутренний баланс магазина (USD)`
-      : `${oe('stars')} Telegram Stars (XTR)`;
-
   const keyLines =
     order.deliveredKeyValues && order.deliveredKeyValues.length > 0
       ? [
           '',
-          `${oe('key')} <b>Ваш цифровой ключ:</b>`,
+          `${oe('key')} <b>Цифровой ключ:</b>`,
           ...order.deliveredKeyValues.map((k) => `<code>${escapeHtml(k)}</code>`),
         ]
       : [];
 
   return [
-    `${oe('orderDetail')} <b>Детали заказа #${escapeHtml(order.orderId)}</b>`,
+    `${oe('orderDetail')} <b>Заказ #${escapeHtml(order.orderId)}</b>`,
     '',
-    `${oe('catalog')} <b>Товар:</b> ${escapeHtml(order.productName)}`,
-    `📂 <b>Категория:</b> ${CATEGORY_LABELS[order.category]}`,
-    `🔢 <b>Количество:</b> ${order.quantity} шт.`,
-    `${oe('topup')} <b>Способ оплаты:</b> ${paymentMethodLabel}`,
-    `${oe('amount')} <b>Сумма:</b> <code>${order.paymentMethod === 'balance' ? `${formatUsd(order.totalPrice)} (USD)` : `${order.totalPrice} ⭐ (${order.currency})`}</code>`,
-    `📌 <b>Статус оплаты:</b> ${ORDER_STATUS_LABELS[order.paymentStatus]}`,
-    `🚚 <b>Статус выдачи:</b> ${ORDER_STATUS_LABELS[order.fulfillmentStatus]}`,
-    ...keyLines,
-    order.telegramPaymentChargeId
-      ? `${oe('lock')} <b>ID платежа Telegram:</b> <code>${escapeHtml(
-          order.telegramPaymentChargeId,
-        )}</code>`
+    `${oe('catalog')} Товар: ${escapeHtml(order.productName)} (x${order.quantity})`,
+    order.recipientUsername
+      ? `${oe('profile')} Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
       : '',
-    order.balancePaymentId
-      ? `${oe('lock')} <b>ID списания баланса:</b> <code>${escapeHtml(order.balancePaymentId)}</code>`
+    `${oe('topup')} Оплата: ${formatOrderPaymentMethodLabel(order)}`,
+    `${oe('amount')} Сумма: <code>${formatOrderAmountLabel(order)}</code>`,
+    `📌 Статус оплаты: ${ORDER_STATUS_LABELS[order.paymentStatus]}`,
+    `🚚 Статус выдачи: ${ORDER_STATUS_LABELS[order.fulfillmentStatus]}`,
+    ...keyLines,
+    order.activePaymentId
+      ? `${oe('lock')} ID платежа: <code>${escapeHtml(order.activePaymentId)}</code>`
       : '',
     order.fulfillmentNote
-      ? `${oe('support')} <b>Комментарий:</b> ${escapeHtml(order.fulfillmentNote)}`
+      ? `${oe('support')} Примечание: ${escapeHtml(order.fulfillmentNote)}`
       : '',
-    `🕒 <b>Создан:</b> ${formatDateRu(order.createdAt)}`,
-    order.paidAt ? `${oe('check')} <b>Оплачен:</b> ${formatDateRu(order.paidAt)}` : '',
-    order.completedAt
-      ? `${oe('check')} <b>Выполнен:</b> ${formatDateRu(order.completedAt)}`
-      : '',
+    `🕒 Создан: ${formatDateRu(order.createdAt)}`,
+    order.paidAt ? `${oe('check')} Оплачен: ${formatDateRu(order.paidAt)}` : '',
+    order.completedAt ? `${oe('check')} Выполнен: ${formatDateRu(order.completedAt)}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -484,26 +658,25 @@ export function formatOrderCompletedUserNotice(order: Order): string {
     order.deliveredKeyValues && order.deliveredKeyValues.length > 0
       ? [
           '',
-          `${oe('key')} <b>Ваш цифровой ключ:</b>`,
+          `${oe('key')} <b>Цифровой ключ:</b>`,
           ...order.deliveredKeyValues.map((k) => `<code>${escapeHtml(k)}</code>`),
         ]
       : [];
 
   return [
-    `${oe('check')} <b>Ваш заказ #${escapeHtml(order.orderId)} выполнен!</b>`,
+    `${oe('check')} <b>Заказ #${escapeHtml(order.orderId)} выполнен!</b>`,
     '',
-    `${oe('catalog')} <b>Товар:</b> ${escapeHtml(order.productName)}`,
-    `${oe('amount')} <b>Оплачено:</b> ${
-      order.paymentMethod === 'balance'
-        ? `${formatUsd(order.totalPrice)} с внутреннего баланса`
-        : `${order.totalPrice} ⭐ (XTR)`
-    }`,
+    `${oe('catalog')} Товар: ${escapeHtml(order.productName)} (x${order.quantity})`,
+    order.recipientUsername
+      ? `${oe('profile')} Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
+      : '',
+    `${oe('amount')} Оплачено: <code>${formatOrderAmountLabel(order)}</code>`,
     ...keySection,
     order.fulfillmentNote
-      ? `📋 <b>Информация о выдаче:</b>\n${escapeHtml(order.fulfillmentNote)}`
+      ? `📋 ${escapeHtml(order.fulfillmentNote)}`
       : '',
     '',
-    'Спасибо за покупку в Stars Shop! Чтобы посмотреть историю заказов, используйте команду /orders.',
+    'Спасибо за покупку в QuizyStars! История заказов: /orders.',
   ]
     .filter(Boolean)
     .join('\n');
@@ -512,87 +685,78 @@ export function formatOrderCompletedUserNotice(order: Order): string {
 export function formatHelpMessage(): string {
   const { storeSupportUsername } = getEnvConfig();
   return [
-    `${oe('help')} <b>Справка и навигация по Stars Shop</b>`,
+    `${oe('help')} <b>Справка QuizyStars</b>`,
     '',
-    '<b>Доступные команды:</b>',
-    '/start — Главное меню магазина',
-    '/catalog — Каталог цифровых товаров',
-    '/orders — История ваших заказов',
-    '/profile — Ваш профиль, баланс в USD ($) и статистика покупок',
-    '/topup — Пополнить внутренний баланс в USD (CryptoBot, xRocket)',
-    '/terms — Правила пользования магазином',
+    '/start — Главное меню',
+    '/catalog — Каталог (Stars, Premium, Gifts)',
+    '/orders — Мои заказы',
+    '/profile — Профиль и баланс (USD)',
+    '/topup — Пополнить баланс (CryptoBot / xRocket)',
+    '/terms — Правила',
     '/paysupport — Поддержка по платежам',
-    '/help — Помощь и ответы на вопросы',
     '',
-    '<b>Как происходит покупка:</b>',
-    '1. Выберите товар в разделе Stars, Premium или Gifts.',
-    '2. Оплатите товар напрямую через Telegram Stars (XTR) или с внутреннего баланса магазина в USD ($).',
-    '3. Сразу после подтверждения оплаты заказ получает статус <b>Оплачен</b> и передаётся на выдачу.',
-    '4. После выдачи товара вы получите уведомление в этом чате.',
-    '',
-    `${oe('support')} Контакт поддержки: @${escapeHtml(storeSupportUsername)}`,
+    `${oe('support')} Поддержка: @${escapeHtml(storeSupportUsername)}`,
   ].join('\n');
 }
 
 export function formatTermsMessage(): string {
   return [
-    `${oe('terms')} <b>Правила цифрового магазина Stars Shop</b>`,
+    `${oe('terms')} <b>Правила QuizyStars</b>`,
     '',
-    '1. <b>Предмет магазина:</b> Магазин предоставляет цифровые товары экосистемы Telegram (Telegram Stars, Telegram Premium, Telegram Gifts) исключительно через интерфейс данного бота.',
-    '2. <b>Оплата и пополнение баланса в USD ($):</b> Оплата принимается через официальный механизм Telegram Stars (XTR), а также с внутреннего баланса магазина в долларах США (пополнение через официальные API CryptoBot — комиссия 3%, xRocket — комиссия 2%, комиссия удерживается из введённой суммы). Магазин никогда не запрашивает пароли, коды входа, seed-фразы или приватные ключи.',
-    '3. <b>Порядок выдачи:</b> Выдача товара осуществляется после серверной верификации платежа. При наличии цифрового ключа на складе выдача происходит автоматически и мгновенно.',
-    '4. <b>Возврат средств:</b> Если заказ не может быть выдан по техническим причинам, выполняется полный возврат Telegram Stars (через <code>refundStarPayment</code>) либо возврат средств в USD ($) на внутренний баланс покупателя.',
+    '1. Магазин поставляет цифровые товары Telegram (Stars, Premium, Gifts) после серверной верификации оплаты.',
+    '2. Оплата принимается через CryptoBot, xRocket и с внутреннего баланса USD. Оплата через Telegram Stars (XTR) отключена.',
+    '3. Комиссия на пополнение баланса: CryptoBot — 3%, xRocket — 2% (удерживается из введённой суммы в USD).',
+    '4. При отмене или невозможности выдачи заказа средства возвращаются в USD на внутренний баланс либо рассматриваются поддержкой.',
   ].join('\n');
 }
 
 export function formatPaySupportMessage(): string {
   const { storeSupportUsername } = getEnvConfig();
   return [
-    `${oe('topup')} <b>Поддержка по платежам (Payment Support)</b>`,
+    `${oe('topup')} <b>Поддержка по платежам QuizyStars</b>`,
     '',
-    'По всем вопросам, связанным с оплатой в Telegram Stars (XTR), пополнением внутреннего баланса в USD (CryptoBot / xRocket), статусом заказа или возвратом средств:',
-    '',
-    `• ${oe('support')} Служба поддержки: @${escapeHtml(storeSupportUsername)}`,
-    '• При обращении укажите <b>ID заказа</b> (из раздела /orders) или <b>ID пополнения баланса</b>.',
-    '• Если средства были списаны, но товар ещё не доставлен, проверьте статус в /orders — администратор получает уведомление автоматически.',
+    `• Служба поддержки: @${escapeHtml(storeSupportUsername)}`,
+    '• Укажите ID заказа (/orders) или ID счёта пополнения.',
+    '• Криптоплатежи проверяются автоматически по webhook или кнопкой «Проверить оплату».',
   ].join('\n');
 }
 
 export function formatAdminOrderCard(order: Order): string {
-  const methodLabel =
-    order.paymentMethod === 'balance'
-      ? `${oe('wallet')} Внутренний баланс (USD)`
-      : `${oe('stars')} Telegram Stars (XTR)`;
   return [
     `${oe('orderDetail')} <b>Заказ #${escapeHtml(order.orderId)}</b>`,
-    `${oe('profile')} <b>Покупатель:</b> <code>${order.userTelegramId}</code> ${
-      order.username ? `(@${escapeHtml(order.username)})` : ''
+    `${oe('profile')} Покупатель: <code>${order.userTelegramId}</code>${
+      order.username ? ` (@${escapeHtml(order.username)})` : ''
     }`,
-    `${oe('catalog')} <b>Товар:</b> ${escapeHtml(order.productName)} (x${order.quantity})`,
-    `${oe('topup')} <b>Способ оплаты:</b> ${methodLabel}`,
-    `${oe('amount')} <b>Сумма:</b> <code>${order.paymentMethod === 'balance' ? `${formatUsd(order.totalPrice)} (BAL)` : `${order.totalPrice} ⭐ (${order.currency})`}</code>`,
-    `📌 <b>Статус оплаты:</b> ${ORDER_STATUS_LABELS[order.paymentStatus]}`,
-    `🚚 <b>Статус выдачи:</b> ${ORDER_STATUS_LABELS[order.fulfillmentStatus]}`,
+    order.recipientUsername
+      ? `🎯 Получатель: <b>@${escapeHtml(order.recipientUsername)}</b>`
+      : '',
+    `${oe('catalog')} Товар: ${escapeHtml(order.productName)} (x${order.quantity})`,
+    `${oe('topup')} Оплата: ${formatOrderPaymentMethodLabel(order)}`,
+    `${oe('amount')} Сумма: <code>${formatOrderAmountLabel(order)}</code>`,
+    `📌 Оплата: ${ORDER_STATUS_LABELS[order.paymentStatus]}`,
+    `🚚 Выдача: ${ORDER_STATUS_LABELS[order.fulfillmentStatus]}`,
+    order.mystarsCurrency
+      ? `📊 Учёт MyStars: <code>${escapeHtml(order.mystarsCurrency)}</code> | Выручка: <code>${formatUsdCents(order.grossRevenueUsdCents ?? order.totalPriceUsdCents ?? order.totalPrice)}</code>${
+          order.netProfitUsdCents !== undefined
+            ? ` | Прибыль: <code>${formatUsdCents(order.netProfitUsdCents)}</code>`
+            : ''
+        }`
+      : '',
     order.awaitingKeyStock
-      ? `${oe('warning')} <b>Ожидание склада ключей:</b> <code>Нет доступных цифровых ключей (заказ НЕ помечен как выполненный)</code>`
+      ? `${oe('warning')} Ожидание ключей на складе`
       : '',
-    order.assignedKeyIds && order.assignedKeyIds.length > 0
-      ? `${oe('key')} <b>Назначенные ID ключей:</b> <code>${escapeHtml(order.assignedKeyIds.join(', '))}</code>`
+    order.activePaymentId
+      ? `${oe('lock')} Payment ID: <code>${escapeHtml(order.activePaymentId)}</code>`
       : '',
-    order.telegramPaymentChargeId
-      ? `${oe('lock')} <b>Charge ID:</b> <code>${escapeHtml(order.telegramPaymentChargeId)}</code>`
-      : '',
-    order.balancePaymentId
-      ? `${oe('lock')} <b>Balance Payment ID:</b> <code>${escapeHtml(order.balancePaymentId)}</code>`
+    order.externalInvoiceId
+      ? `${oe('lock')} External Invoice: <code>${escapeHtml(order.externalInvoiceId)}</code>`
       : '',
     order.fulfillmentNote
-      ? `${oe('edit')} <b>Примечание:</b> ${escapeHtml(order.fulfillmentNote)}`
+      ? `${oe('edit')} Примечание: ${escapeHtml(order.fulfillmentNote)}`
       : '',
-    `🕒 <b>Создан:</b> ${formatDateRu(order.createdAt)}`,
-    order.paidAt ? `${oe('check')} <b>Оплачен:</b> ${formatDateRu(order.paidAt)}` : '',
-    order.completedAt
-      ? `${oe('check')} <b>Завершён:</b> ${formatDateRu(order.completedAt)}`
-      : '',
+    `🕒 Создан: ${formatDateRu(order.createdAt)}`,
+    order.paidAt ? `${oe('check')} Оплачен: ${formatDateRu(order.paidAt)}` : '',
+    order.completedAt ? `${oe('check')} Завершён: ${formatDateRu(order.completedAt)}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -608,21 +772,16 @@ export function formatOwnerKeysOverviewMessage(
   const lines = summaries.map((s, idx) => {
     const algLabel =
       s.algorithm && s.algorithm !== 'none'
-        ? `${oe('settings')} Алгоритм: <code>${escapeHtml(s.algorithm)}</code>`
-        : `${oe('edit')} Ручная загрузка ключей`;
-    return `${idx + 1}. <b>${escapeHtml(s.productName)}</b> (${algLabel})\n   🟢 Доступно: <b>${s.available}</b> | 📦 Выдано: <b>${s.delivered}</b> | 🚫 Отключено: <b>${s.disabled}</b>`;
+        ? `${oe('settings')} <code>${escapeHtml(s.algorithm)}</code>`
+        : `${oe('edit')} Ручная загрузка`;
+    return `${idx + 1}. <b>${escapeHtml(s.productName)}</b> (${algLabel})\n   🟢 ${s.available} | 📦 ${s.delivered} | 🚫 ${s.disabled}`;
   });
 
   return [
-    `${oe('key')} <b>Генератор и склад цифровых ключей (Owner-Only)</b>`,
-    '━━━━━━━━━━━━━━━━━━━━',
-    `🟢 Всего доступно на складе: <b>${totalAvail}</b>`,
-    `📦 Всего выдано покупателям: <b>${totalDeliv}</b>`,
-    `🚫 Отключено: <b>${totalDisabled}</b>`,
+    `${oe('key')} <b>Склад цифровых ключей (Owner-Only)</b>`,
+    `🟢 Доступно: <b>${totalAvail}</b> | 📦 Выдано: <b>${totalDeliv}</b> | 🚫 Откл.: <b>${totalDisabled}</b>`,
     '',
     ...lines,
-    '',
-    'Выберите товар ниже для добавления, генерации или управления ключами:',
   ].join('\n');
 }
 
@@ -631,20 +790,15 @@ export function formatOwnerProductKeysMessage(
   summary: ProductKeyStockSummary,
 ): string {
   return [
-    `${oe('key')} <b>Склад ключей: ${escapeHtml(product.name)}</b>`,
-    `${oe('id')} ID товара: <code>${escapeHtml(product.id)}</code>`,
-    `📂 Категория: <b>${CATEGORY_LABELS[product.category]}</b>`,
-    `${oe('settings')} Алгоритм генерации: ${
+    `${oe('key')} <b>Ключи: ${escapeHtml(product.name)}</b>`,
+    `${oe('id')} <code>${escapeHtml(product.id)}</code> | ${CATEGORY_LABELS[product.category]}`,
+    `${oe('settings')} Алгоритм: ${
       product.keyGeneratorAlgorithm && product.keyGeneratorAlgorithm !== 'none'
-        ? `<code>${escapeHtml(product.keyGeneratorAlgorithm)}</code> (поддерживает автогенерацию)`
-        : '<i>Не задан (только ручная загрузка реальных ключей поставщика)</i>'
+        ? `<code>${escapeHtml(product.keyGeneratorAlgorithm)}</code>`
+        : '<i>Ручная загрузка</i>'
     }`,
     '',
-    `${oe('stats')} <b>Остатки и статусы ключей:</b>`,
-    `• 🟢 Доступно к выдаче (available): <b>${summary.available}</b>`,
-    `• ⏳ Зарезервировано (reserved): <b>${summary.reserved}</b>`,
-    `• 📦 Выдано покупателям (delivered): <b>${summary.delivered}</b>`,
-    `• 🚫 Отключено (disabled): <b>${summary.disabled}</b>`,
+    `🟢 Доступно: <b>${summary.available}</b> | ⏳ Резерв: <b>${summary.reserved}</b> | 📦 Выдано: <b>${summary.delivered}</b> | 🚫 Откл.: <b>${summary.disabled}</b>`,
   ].join('\n');
 }
 
@@ -653,20 +807,18 @@ export function formatOwnerAvailableKeysListMessage(
   keys: DigitalKeyRecord[],
 ): string {
   if (keys.length === 0) {
-    return `🟢 Для товара <b>${escapeHtml(product.name)}</b> сейчас нет доступных ключей.`;
+    return `🟢 Для товара <b>${escapeHtml(product.name)}</b> нет доступных ключей.`;
   }
 
   const lines = keys.slice(0, 15).map(
     (k, idx) =>
-      `${idx + 1}. <code>${escapeHtml(k.maskedPreview)}</code> [ID: <code>${escapeHtml(k.keyId)}</code>] (${k.source === 'generated' ? 'сгенерирован' : 'вручную'})`,
+      `${idx + 1}. <code>${escapeHtml(k.maskedPreview)}</code> [<code>${escapeHtml(k.keyId)}</code>]`,
   );
 
   return [
-    `🟢 <b>Доступные ключи: ${escapeHtml(product.name)} (всего: ${keys.length})</b>`,
+    `🟢 <b>Доступные ключи: ${escapeHtml(product.name)} (${keys.length})</b>`,
     '',
     ...lines,
-    '',
-    'Нажмите на ключ ниже, чтобы отключить его (статус <code>disabled</code>):',
   ].join('\n');
 }
 
@@ -675,16 +827,16 @@ export function formatOwnerDeliveredKeysListMessage(
   keys: DigitalKeyRecord[],
 ): string {
   if (keys.length === 0) {
-    return `📦 По товару <b>${escapeHtml(product.name)}</b> ещё нет выданных ключей.`;
+    return `📦 По товару <b>${escapeHtml(product.name)}</b> нет выданных ключей.`;
   }
 
   const lines = keys.slice(0, 15).map(
     (k, idx) =>
-      `${idx + 1}. Ключ: <code>${escapeHtml(k.keyValue)}</code>\n   🧾 Заказ: <code>${escapeHtml(k.deliveredOrderId || '—')}</code> | 👤 Покупатель: <code>${k.deliveredUserTelegramId ?? '—'}</code> | 🕒 ${formatDateRu(k.deliveredAt)}`,
+      `${idx + 1}. <code>${escapeHtml(k.keyValue)}</code> — заказ #<code>${escapeHtml(k.deliveredOrderId || '—')}</code>`,
   );
 
   return [
-    `📦 <b>Выданные ключи: ${escapeHtml(product.name)} (показано: ${Math.min(keys.length, 15)} из ${keys.length})</b>`,
+    `📦 <b>Выданные ключи: ${escapeHtml(product.name)} (${keys.length})</b>`,
     '',
     ...lines,
   ].join('\n');
@@ -694,20 +846,16 @@ export function formatOwnerKeyDeliveryHistoryMessage(
   keys: DigitalKeyRecord[],
 ): string {
   if (keys.length === 0) {
-    return [
-      `${oe('history')} <b>История выдачи цифровых ключей</b>`,
-      '',
-      'Пока не выдано ни одного цифрового ключа.',
-    ].join('\n');
+    return `${oe('history')} <b>История выдачи ключей</b>\n\nПока пусто.`;
   }
 
   const lines = keys.slice(0, 20).map(
     (k, idx) =>
-      `${idx + 1}. <b>${escapeHtml(k.productId)}</b> — <code>${escapeHtml(k.maskedPreview)}</code>\n   🧾 Заказ: <code>${escapeHtml(k.deliveredOrderId || '—')}</code> | 👤 TG ID: <code>${k.deliveredUserTelegramId ?? '—'}</code> | 🕒 ${formatDateRu(k.deliveredAt)}`,
+      `${idx + 1}. <b>${escapeHtml(k.productId)}</b> — <code>${escapeHtml(k.maskedPreview)}</code> (#<code>${escapeHtml(k.deliveredOrderId || '—')}</code>)`,
   );
 
   return [
-    `${oe('history')} <b>История выдачи цифровых ключей (последние ${Math.min(keys.length, 20)})</b>`,
+    `${oe('history')} <b>История выдачи ключей (${Math.min(keys.length, 20)})</b>`,
     '',
     ...lines,
   ].join('\n');
@@ -721,7 +869,8 @@ export function formatAdminStatsMessage(params: {
   completedOrdersCount: number;
   pendingOrdersCount: number;
   refundedOrdersCount: number;
-  totalStarsRevenue: number;
+  totalUsdRevenueCents?: number;
+  totalStarsRevenue?: number;
   totalProducts: number;
   activeProducts: number;
   recentTransactions: StoreTransaction[];
@@ -729,6 +878,8 @@ export function formatAdminStatsMessage(params: {
   paidTopUpsCount?: number;
   totalTopUpCredited?: number;
   totalTopUpFees?: number;
+  totalTopUpCreditedCents?: number;
+  totalTopUpFeesCents?: number;
 }): string {
   const txLines =
     params.recentTransactions.length > 0
@@ -740,23 +891,27 @@ export function formatAdminStatsMessage(params: {
                 t.type,
               )}] — ${escapeHtml(t.details)}`,
           )
-      : ['• Транзакций пока нет'];
+      : ['• Событий пока нет'];
+
+  const usdRevCents = params.totalUsdRevenueCents ?? 0;
+  const creditedText =
+    params.totalTopUpCreditedCents !== undefined
+      ? formatUsdCents(params.totalTopUpCreditedCents)
+      : formatUsd(params.totalTopUpCredited ?? 0);
+  const feesText =
+    params.totalTopUpFeesCents !== undefined
+      ? formatUsdCents(params.totalTopUpFeesCents)
+      : formatUsd(params.totalTopUpFees ?? 0);
 
   return [
-    `${oe('stats')} <b>Статистика цифрового магазина Stars Shop</b>`,
+    `${oe('stats')} <b>Статистика QuizyStars</b>`,
     '',
-    `${oe('users')} <b>Пользователей всего:</b> ${params.totalUsers} (заблокировано: ${params.blockedUsers})`,
-    `${oe('catalog')} <b>Товаров в каталоге:</b> ${params.totalProducts} (активных: ${params.activeProducts})`,
-    '',
-    `${oe('orders')} <b>Заказов всего:</b> ${params.totalOrders}`,
-    `• ${oe('pending')} Ожидают оплаты: ${params.pendingOrdersCount}`,
-    `• ${oe('check')} Оплачены / в обработке: ${params.paidOrdersCount}`,
-    `• 🎉 Выполнены (выданы): ${params.completedOrdersCount}`,
-    `• ↩️ Возвраты (Refund): ${params.refundedOrdersCount}`,
-    '',
-    `${oe('stars')} <b>Выручка в Telegram Stars:</b> <code>${params.totalStarsRevenue} XTR</code>`,
+    `${oe('users')} Пользователей: ${params.totalUsers} (блок: ${params.blockedUsers})`,
+    `${oe('catalog')} Товаров: ${params.totalProducts} (активны: ${params.activeProducts})`,
+    `${oe('orders')} Заказов: ${params.totalOrders} (ожидают: ${params.pendingOrdersCount}, оплачены: ${params.paidOrdersCount}, выполнены: ${params.completedOrdersCount}, возвраты: ${params.refundedOrdersCount})`,
+    `${oe('amount')} Выручка заказов (USD): <code>${formatUsdCents(usdRevCents)}</code>`,
     params.totalTopUpsCount !== undefined
-      ? `${oe('topup')} <b>Пополнений баланса (USD):</b> ${params.totalTopUpsCount} (оплачено: ${params.paidTopUpsCount ?? 0}, зачислено: <code>${formatUsd(params.totalTopUpCredited ?? 0)}</code>, комиссия магазина: <code>${formatUsd(params.totalTopUpFees ?? 0)}</code>)`
+      ? `${oe('topup')} Пополнения (USD): ${params.totalTopUpsCount} (оплачено: ${params.paidTopUpsCount ?? 0}, зачислено: <code>${creditedText}</code>, комиссии: <code>${feesText}</code>)`
       : '',
     '',
     '📋 <b>Последние события:</b>',

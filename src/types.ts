@@ -26,7 +26,7 @@ export interface FirestoreErrorInfo {
 
 export type ProductCategory = 'stars' | 'premium' | 'gifts';
 
-export type FulfillmentType = 'manual' | 'provider_adapter';
+export type FulfillmentType = 'manual' | 'provider_adapter' | 'mystars';
 
 export type OrderStatus =
   | 'pending'
@@ -45,18 +45,35 @@ export type RefundExecutionState =
 
 export type BalanceTopUpProvider = 'cryptobot' | 'xrocket';
 
+export type PaymentProviderType = 'cryptobot' | 'xrocket' | 'balance' | 'telegram_stars';
+
 export type BalanceTopUpStatus =
   | 'pending'
   | 'paid'
+  | 'underpaid'
+  | 'overpaid'
   | 'expired'
   | 'cancelled'
-  | 'failed';
+  | 'failed'
+  | 'refunded';
+
+export type PaymentRecordStatus =
+  | 'pending'
+  | 'paid'
+  | 'underpaid'
+  | 'overpaid'
+  | 'expired'
+  | 'cancelled'
+  | 'failed'
+  | 'refunded';
 
 export type OrderPaymentMethod =
-  | 'stars'
+  | 'cryptobot'
+  | 'xrocket'
   | 'balance'
-  | 'telegram_stars'
-  | 'internal_balance';
+  | 'internal_balance'
+  | 'stars'
+  | 'telegram_stars';
 
 export interface XRocketErrorProblemDetails {
   status?: number;
@@ -73,25 +90,34 @@ export interface BalanceTopUpRecord {
   userTelegramId: number;
   username?: string;
   provider: BalanceTopUpProvider;
-  /** Amount entered in USD ($) before commission deduction */
-  amountUsd?: number;
-  /** Actual amount sent to the provider invoice in `currency` */
-  amountPaid: number;
+  /** Gross amount entered in integer USD cents (e.g. $10.00 = 1000) */
+  amountUsdCents: number;
+  /** Gateway commission in integer USD cents */
+  feeUsdCents: number;
+  /** Net amount credited to user balance in integer USD cents */
+  amountCreditedUsdCents: number;
+  /** Gateway fee basis points (e.g. 300 = 3%, 200 = 2%) */
+  feeBps: number;
   feePercent: number;
-  /** Commission deducted in USD ($) */
+  /** Exact crypto/fiat payable string sent to provider invoice */
+  expectedAmountStr: string;
+  /** Actual amount reported by provider upon payment (if any) */
+  actualAmountStr?: string;
+  /** Legacy numeric mirrors derived from cents/strings */
+  amountUsd?: number;
+  amountPaid: number;
   feeAmount: number;
-  /** Net amount credited to user balance in USD ($) */
   amountCredited: number;
-  /** Payment currency sent to the provider (e.g. USD, USDT, TON, BTC) */
+  /** Payment currency billed on provider invoice (e.g. USD, USDT, TON, BTC) */
   currency: string;
-  /** Original currency selected by buyer */
   originalCurrency?: string;
-  /** Original invoice amount in the payment currency */
   originalAmountPaid?: number;
-  /** Locked exchange rate (1 unit of currency in USD) at invoice creation time */
+  /** Locked exchange rate string (USD per 1 unit of currency) */
+  exchangeRateUsdStr?: string;
   exchangeRateUsd?: number;
   network?: string;
   paymentStatus: BalanceTopUpStatus;
+  statusReason?: string;
   externalInvoiceId: string;
   payUrl?: string;
   recipientMerchantId?: string;
@@ -99,6 +125,7 @@ export interface BalanceTopUpRecord {
   expiresAt?: string;
   createdAt: string;
   paidAt?: string;
+  confirmedAt?: string;
   updatedAt: string;
 }
 
@@ -111,6 +138,11 @@ export interface StoreUser {
   languageCode?: string;
   isBlocked: boolean;
   totalOrders: number;
+  /** Primary balance in integer USD cents (e.g. $10.00 = 1000) */
+  balanceUsdCents: number;
+  /** Cumulative confirmed order spend in integer USD cents */
+  totalSpentUsdCents: number;
+  /** Legacy/compatibility fields */
   totalSpentStars: number;
   balance?: number;
   createdAt: string;
@@ -158,8 +190,16 @@ export interface Product {
   name: string;
   category: ProductCategory;
   description: string;
+  /** Canonical unit price in integer USD cents ($1.00 = 100) */
+  priceUsdCents: number;
+  /** Optional explicit per-unit USD cents for custom quantity items (e.g., 1 Star) */
+  unitPriceUsdCents?: number;
+  /** Mirror of priceUsdCents for backward-compatible index/sorting */
   price: number;
-  currency: 'XTR';
+  currency: 'USD' | 'XTR';
+  minQuantity?: number;
+  maxQuantity?: number;
+  durationMonths?: 3 | 6 | 12;
   imageUrl: string;
   isActive: boolean;
   fulfillmentType: FulfillmentType;
@@ -173,19 +213,35 @@ export interface Order {
   userId: string;
   userTelegramId: number;
   username?: string;
+  /** Target Telegram @username for Stars / Premium delivery (normalized without @ or lowercase) */
+  recipientUsername?: string;
   productId: string;
   productName: string;
   category: ProductCategory;
   quantity: number;
+  /** Canonical unit and total prices in integer USD cents */
+  unitPriceUsdCents?: number;
+  totalPriceUsdCents: number;
   totalPrice: number;
-  currency: 'XTR';
+  currency: 'USD' | 'XTR';
   paymentMethod?: OrderPaymentMethod;
+  activePaymentId?: string;
+  externalInvoiceId?: string;
   balancePaymentId?: string;
   balanceRefunded?: boolean;
   paymentStatus: OrderStatus;
   fulfillmentStatus: OrderStatus;
   telegramPaymentChargeId?: string;
   providerPaymentChargeId?: string;
+  /** MyStars Stage 4.3 P&L & wholesale accounting fields */
+  grossRevenueUsdCents?: number;
+  providerFeeUsdCents?: number;
+  mystarsCurrency?: 'usdt_ton';
+  mystarsWholesaleCostUsdt?: string;
+  mystarsCostUsdCents?: number;
+  tonNetworkFeeTon?: string;
+  tonNetworkFeeUsdCents?: number;
+  netProfitUsdCents?: number;
   fulfillmentNote?: string;
   fulfillmentStartedAt?: string;
   fulfillmentAttempts?: number;
@@ -212,23 +268,59 @@ export interface Order {
 
 export interface PaymentRecord {
   paymentId: string;
-  telegramPaymentChargeId: string;
+  kind?: 'order' | 'topup';
+  provider: PaymentProviderType;
+  providerPaymentId?: string;
+  telegramPaymentChargeId?: string;
   providerPaymentChargeId?: string;
   orderId: string;
+  topUpId?: string;
   userId: string;
   userTelegramId: number;
   totalAmount: number;
-  currency: 'XTR';
+  expectedUsdCents: number;
+  feeUsdCents: number;
+  netUsdCents: number;
+  expectedAmountStr: string;
+  actualAmountStr?: string;
+  exchangeRateUsdStr?: string;
+  currency: string;
+  network?: string;
   invoicePayload: string;
-  status: 'paid' | 'refunded';
+  payUrl?: string;
+  status: PaymentRecordStatus;
+  statusReason?: string;
+  expiresAt?: string;
+  paidAt?: string;
+  confirmedAt?: string;
   createdAt: string;
+  updatedAt?: string;
   refundedAt?: string;
+}
+
+/**
+ * Atomic unique claim document stored in `payment_locks/{lockId}` to guarantee
+ * a single external `provider + providerPaymentId` can NEVER settle twice or across different orders.
+ */
+export interface PaymentLockRecord {
+  lockId: string;
+  provider: string;
+  providerPaymentId: string;
+  targetType: 'order' | 'topup';
+  targetId: string;
+  paymentId: string;
+  userId: string;
+  amountUsdCents: number;
+  claimedAt: string;
 }
 
 export type TransactionType =
   | 'invoice_created'
   | 'pre_checkout_ok'
   | 'payment_received'
+  | 'order_underpaid'
+  | 'order_overpaid'
+  | 'order_expired'
   | 'fulfillment_completed'
   | 'fulfillment_failed'
   | 'fulfillment_retry'
@@ -236,10 +328,13 @@ export type TransactionType =
   | 'payment_refunded'
   | 'balance_topup_created'
   | 'balance_topup_paid'
+  | 'balance_topup_underpaid'
+  | 'balance_topup_overpaid'
   | 'balance_topup_failed'
   | 'balance_topup_expired'
   | 'balance_deducted'
   | 'balance_refunded'
+  | 'exchange_rate_locked'
   | 'key_added'
   | 'key_generated'
   | 'key_delivered'
@@ -254,6 +349,7 @@ export interface StoreTransaction {
   userId: string;
   type: TransactionType;
   amount: number;
+  amountUsdCents?: number;
   currency: string;
   details: string;
   createdAt: string;
@@ -303,6 +399,7 @@ export interface AdminInteractiveSession {
     name?: string;
     description?: string;
     price?: number;
+    priceUsdCents?: number;
   };
   createdAt: number;
 }

@@ -8,8 +8,8 @@ export class UserService {
   }
 
   /**
-   * AUD-007: Atomically creates or updates Telegram user profile fields inside a Firestore transaction.
-   * Never overwrites concurrent updates to totalOrders, totalSpentStars, or isBlocked.
+   * Atomically creates or updates Telegram user profile fields inside a Firestore transaction.
+   * Preserves concurrent updates to balanceUsdCents, totalOrders, totalSpentUsdCents, and isBlocked.
    */
   public static async upsertFromTelegram(from: {
     id: number;
@@ -38,15 +38,24 @@ export class UserService {
           'ru'
         ).slice(0, 16);
 
+        const balanceUsdCents =
+          typeof existing.balanceUsdCents === 'number' &&
+          Number.isInteger(existing.balanceUsdCents)
+            ? existing.balanceUsdCents
+            : Math.round((existing.balance ?? 0) * 100);
+
         const updated: StoreUser = {
           ...existing,
           username: nextUsername,
           firstName: nextFirstName,
           lastName: nextLastName,
           languageCode: nextLanguageCode,
-          totalOrders: existing.totalOrders,
-          totalSpentStars: existing.totalSpentStars,
-          isBlocked: existing.isBlocked,
+          balanceUsdCents,
+          balance: Number((balanceUsdCents / 100).toFixed(2)),
+          totalSpentUsdCents: existing.totalSpentUsdCents ?? 0,
+          totalOrders: existing.totalOrders ?? 0,
+          totalSpentStars: existing.totalSpentStars ?? 0,
+          isBlocked: Boolean(existing.isBlocked),
           updatedAt: now,
         };
         tx.set<StoreUser>('users', userId, updated);
@@ -62,6 +71,9 @@ export class UserService {
         languageCode: (from.language_code || 'ru').slice(0, 16),
         isBlocked: false,
         totalOrders: 0,
+        balanceUsdCents: 0,
+        totalSpentUsdCents: 0,
+        balance: 0,
         totalSpentStars: 0,
         createdAt: now,
         updatedAt: now,
@@ -80,9 +92,6 @@ export class UserService {
     return firestoreRepo.getDoc<StoreUser>('users', userId);
   }
 
-  /**
-   * Server-side ordered and cursor-paginated users query.
-   */
   public static async getAllUsers(
     limit = 100,
     startAfterCursor?: unknown,
@@ -97,10 +106,6 @@ export class UserService {
     });
   }
 
-  /**
-   * AUD-007: Atomically toggles user block state inside a Firestore transaction
-   * without overwriting concurrent changes to totalOrders or totalSpentStars.
-   */
   public static async setUserBlocked(
     telegramId: number,
     isBlocked: boolean,
@@ -117,6 +122,24 @@ export class UserService {
       };
       tx.set<StoreUser>('users', userId, updated);
       return updated;
+    });
+  }
+
+  public static async incrementUserUsdStats(
+    userId: string,
+    spentUsdCents: number,
+  ): Promise<void> {
+    const safeCents = Math.max(0, Math.round(spentUsdCents));
+    await firestoreRepo.runTransaction(async (tx) => {
+      const existing = await tx.get<StoreUser>('users', userId);
+      if (!existing) return;
+
+      tx.set<StoreUser>('users', userId, {
+        ...existing,
+        totalOrders: (existing.totalOrders || 0) + 1,
+        totalSpentUsdCents: (existing.totalSpentUsdCents || 0) + safeCents,
+        updatedAt: new Date().toISOString(),
+      });
     });
   }
 

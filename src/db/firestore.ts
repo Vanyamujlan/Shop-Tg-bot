@@ -25,6 +25,7 @@ import {
   OperationType,
   BalanceTopUpRecord,
   DigitalKeyRecord,
+  PaymentLockRecord,
 } from '../types.ts';
 import { handleFirestoreError, testConnection } from './firestoreErrorHandler.ts';
 
@@ -40,7 +41,8 @@ export type CollectionName =
 export type StoreCollectionName =
   | CollectionName
   | 'balance_topups'
-  | 'digital_keys';
+  | 'digital_keys'
+  | 'payment_locks';
 
 export interface QueryWhereFilter {
   field: string;
@@ -85,6 +87,7 @@ interface LocalDatabaseState {
   payments: Record<string, PaymentRecord>;
   balance_topups: Record<string, BalanceTopUpRecord>;
   digital_keys: Record<string, DigitalKeyRecord>;
+  payment_locks: Record<string, PaymentLockRecord>;
   transactions: Record<string, StoreTransaction>;
   admins: Record<string, AdminRecord>;
   settings: Record<string, StoreSettings>;
@@ -173,6 +176,7 @@ export function sanitizeDocId(rawId: string): string {
 function getDocumentPrimaryKey(doc: Record<string, unknown>): string {
   return String(
     doc.orderId ??
+      doc.lockId ??
       doc.keyId ??
       doc.id ??
       doc.userId ??
@@ -334,6 +338,7 @@ export class FirestoreRepository {
       payments: {},
       balance_topups: {},
       digital_keys: {},
+      payment_locks: {},
       transactions: {},
       admins: {},
       settings: {},
@@ -358,8 +363,8 @@ export class FirestoreRepository {
       const config = getEnvConfig();
       this.localState.settings.global = {
         key: 'global',
-        storeName: 'Telegram Digital Store (Test)',
-        supportUsername: config.storeSupportUsername || 'support',
+        storeName: config.storeName || 'QuizyStars (Test)',
+        supportUsername: config.storeSupportUsername || 'quizystars_support',
         maintenanceMode: false,
         updatedAt: now,
       };
@@ -546,6 +551,7 @@ export class FirestoreRepository {
           payments: parsed.payments || {},
           balance_topups: parsed.balance_topups || {},
           digital_keys: parsed.digital_keys || {},
+          payment_locks: parsed.payment_locks || {},
           transactions: parsed.transactions || {},
           admins: parsed.admins || {},
           settings: parsed.settings || {},
@@ -699,9 +705,15 @@ export class FirestoreRepository {
 
     // 1. Seed or sync global settings
     const existingSettings = await this.getDoc<StoreSettings>('settings', 'global');
+    const resolvedStoreName =
+      !existingSettings?.storeName ||
+      existingSettings.storeName === 'Telegram Digital Store' ||
+      existingSettings.storeName === 'Stars Shop'
+        ? config.storeName || 'QuizyStars'
+        : existingSettings.storeName;
     await this.setDoc<StoreSettings>('settings', 'global', {
       key: 'global',
-      storeName: existingSettings?.storeName || 'Telegram Digital Store',
+      storeName: resolvedStoreName,
       supportUsername: config.storeSupportUsername,
       maintenanceMode: existingSettings?.maintenanceMode ?? false,
       updatedAt: now,

@@ -10,7 +10,6 @@ import { CATEGORY_LABELS } from '../../constants.ts';
 import { UserService } from '../../services/UserService.ts';
 import { ProductService } from '../../services/ProductService.ts';
 import { OrderService } from '../../services/OrderService.ts';
-import { PaymentService } from '../../services/PaymentService.ts';
 import { FulfillmentService } from '../../services/FulfillmentService.ts';
 import { balanceService } from '../../services/BalanceService.ts';
 import {
@@ -18,7 +17,15 @@ import {
   paymentProviderGateway,
 } from '../../services/PaymentProviders.ts';
 import { firestoreRepo } from '../../db/firestore.ts';
-import { getEnvConfig, isOwnerTelegramId } from '../../config/env.ts';
+import {
+  formatUsd,
+  getEnvConfig,
+  isOwnerTelegramId,
+} from '../../config/env.ts';
+import {
+  formatUsdCents,
+  usdInputToCents,
+} from '../../services/Money.ts';
 import {
   DigitalKeyService,
   DuplicateDigitalKeyError,
@@ -30,7 +37,6 @@ import {
   buildAdminMainKeyboard,
   buildAdminOrderActionKeyboard,
   buildAdminOrderBalanceRefundConfirmKeyboard,
-  buildAdminOrderRefundConfirmKeyboard,
   buildAdminOrdersKeyboard,
   buildAdminProductManageKeyboard,
   buildAdminProductsKeyboard,
@@ -174,7 +180,7 @@ export function registerAdminHandlers(
     await safeRespondOrEdit(
       ctx,
       [
-        '🛠 <b>Панель администратора цифрового магазина</b>',
+        '🛠 <b>Панель администратора QuizyStars</b>',
         '',
         'Выберите раздел для управления каталогом, заказами, пользователями или просмотра статуса интеграций:',
       ].join('\n'),
@@ -191,7 +197,7 @@ export function registerAdminHandlers(
     await safeRespondOrEdit(
       ctx,
       [
-        '🛠 <b>Панель администратора цифрового магазина</b>',
+        '🛠 <b>Панель администратора QuizyStars</b>',
         '',
         'Выберите раздел для управления:',
       ].join('\n'),
@@ -204,26 +210,48 @@ export function registerAdminHandlers(
     if (!(await ensureAdmin(ctx))) return;
     if (isDuplicateCallbackClick(ctx.from!.id, 'adm:stats')) return;
 
-    const [users, orders, products, payments, recentTransactions, topUps] =
+    const [users, orders, products, recentTransactions, topUps] =
       await Promise.all([
         UserService.getAllUsers(200),
         OrderService.getAllOrders(undefined, 200),
         ProductService.getAllProducts(true, 200),
-        PaymentService.getAllPayments(200),
         OrderService.getRecentTransactions(6),
         balanceService.getAllTopUps(undefined, 200),
       ]);
 
-    const paidRevenue = payments
-      .filter((p) => p.status === 'paid')
-      .reduce((acc, p) => acc + p.totalAmount, 0);
+    const totalUsdRevenueCents = orders
+      .filter(
+        (o) =>
+          o.currency !== 'XTR' &&
+          (o.paymentStatus === 'paid' ||
+            o.paymentStatus === 'processing' ||
+            o.paymentStatus === 'completed'),
+      )
+      .reduce(
+        (acc, o) =>
+          acc + (o.grossRevenueUsdCents ?? o.totalPriceUsdCents ?? o.totalPrice),
+        0,
+      );
 
-    const paidTopUps = topUps.filter((t) => t.paymentStatus === 'paid');
-    const totalTopUpCredited = paidTopUps.reduce(
-      (acc, t) => acc + t.amountCredited,
+    const paidTopUps = topUps.filter(
+      (t) => t.paymentStatus === 'paid' || t.paymentStatus === 'overpaid',
+    );
+    const totalTopUpCreditedCents = paidTopUps.reduce(
+      (acc, t) =>
+        acc +
+        (typeof t.amountCreditedUsdCents === 'number'
+          ? t.amountCreditedUsdCents
+          : Math.round(t.amountCredited * 100)),
       0,
     );
-    const totalTopUpFees = paidTopUps.reduce((acc, t) => acc + t.feeAmount, 0);
+    const totalTopUpFeesCents = paidTopUps.reduce(
+      (acc, t) =>
+        acc +
+        (typeof t.feeUsdCents === 'number'
+          ? t.feeUsdCents
+          : Math.round(t.feeAmount * 100)),
+      0,
+    );
 
     const text = formatAdminStatsMessage({
       totalUsers: users.length,
@@ -239,14 +267,14 @@ export function registerAdminHandlers(
       ).length,
       refundedOrdersCount: orders.filter((o) => o.paymentStatus === 'refunded')
         .length,
-      totalStarsRevenue: paidRevenue,
+      totalUsdRevenueCents,
       totalProducts: products.length,
       activeProducts: products.filter((p) => p.isActive).length,
       recentTransactions,
       totalTopUpsCount: topUps.length,
       paidTopUpsCount: paidTopUps.length,
-      totalTopUpCredited,
-      totalTopUpFees,
+      totalTopUpCreditedCents,
+      totalTopUpFeesCents,
     });
 
     await safeRespondOrEdit(
@@ -270,6 +298,7 @@ export function registerAdminHandlers(
           ? allTopUps.filter(
               (t) =>
                 t.paymentStatus === 'failed' ||
+                t.paymentStatus === 'underpaid' ||
                 t.paymentStatus === 'expired' ||
                 t.paymentStatus === 'cancelled',
             )
@@ -277,21 +306,44 @@ export function registerAdminHandlers(
               (t) => t.paymentStatus === (filterRaw as BalanceTopUpStatus),
             );
 
-    const paidList = allTopUps.filter((t) => t.paymentStatus === 'paid');
-    const totalPaidIn = paidList.reduce((acc, t) => acc + t.amountPaid, 0);
-    const totalCredited = paidList.reduce((acc, t) => acc + t.amountCredited, 0);
-    const totalFee = paidList.reduce((acc, t) => acc + t.feeAmount, 0);
+    const paidList = allTopUps.filter(
+      (t) => t.paymentStatus === 'paid' || t.paymentStatus === 'overpaid',
+    );
+    const totalPaidInCents = paidList.reduce(
+      (acc, t) =>
+        acc +
+        (typeof t.amountUsdCents === 'number'
+          ? t.amountUsdCents
+          : usdInputToCents(t.amountUsd ?? t.amountPaid)),
+      0,
+    );
+    const totalCreditedCents = paidList.reduce(
+      (acc, t) =>
+        acc +
+        (typeof t.amountCreditedUsdCents === 'number'
+          ? t.amountCreditedUsdCents
+          : Math.round(t.amountCredited * 100)),
+      0,
+    );
+    const totalFeeCents = paidList.reduce(
+      (acc, t) =>
+        acc +
+        (typeof t.feeUsdCents === 'number'
+          ? t.feeUsdCents
+          : Math.round(t.feeAmount * 100)),
+      0,
+    );
 
     const summaryLines = [
-      `💳 <b>Пополнения внутреннего баланса (фильтр: ${filterRaw}, найдено: ${filtered.length})</b>`,
+      `💳 <b>Пополнения баланса USD (фильтр: ${filterRaw}, найдено: ${filtered.length})</b>`,
       `• Успешных пополнений: <b>${paidList.length}</b>`,
-      `• Внесено покупателями: <code>${Number(totalPaidIn.toFixed(2))}</code>`,
-      `• Удержано комиссии магазином: <code>${Number(totalFee.toFixed(2))}</code>`,
-      `• Фактически зачислено на балансы: <code>${Number(totalCredited.toFixed(2))}</code>`,
+      `• Внесено покупателями: <code>${formatUsdCents(totalPaidInCents)}</code>`,
+      `• Удержано комиссии магазином: <code>${formatUsdCents(totalFeeCents)}</code>`,
+      `• Зачислено на балансы: <code>${formatUsdCents(totalCreditedCents)}</code>`,
       '',
       filtered.length === 0
         ? 'Записей о пополнениях по выбранному фильтру пока нет.'
-        : 'Нажмите на пополнение ниже для просмотра провайдера, суммы комиссии и статуса:',
+        : 'Нажмите на пополнение для просмотра деталей:',
     ].join('\n');
 
     await safeRespondOrEdit(
@@ -367,7 +419,7 @@ export function registerAdminHandlers(
     const header =
       orders.length === 0
         ? `📦 <b>Управление заказами (${filterRaw})</b>\n\nЗаказов по выбранному фильтру пока нет.`
-        : `📦 <b>Управление заказами (${filterRaw}, найдено: ${orders.length})</b>\n\nНажмите на заказ для просмотра деталей, ручной выдачи или возврата Stars:`;
+        : `📦 <b>Управление заказами (${filterRaw}, найдено: ${orders.length})</b>\n\nНажмите на заказ для просмотра деталей или ручной выдачи:`;
 
     await safeRespondOrEdit(ctx, header, buildAdminOrdersKeyboard(orders));
   });
@@ -602,187 +654,23 @@ export function registerAdminHandlers(
     }
   });
 
-  // AUD-004 (Шаг 1 из 2): Запрос подтверждения официального возврата Telegram Stars
+  // Возврат Telegram Stars (XTR) отключён вместе с XTR checkout
   bot.action(/^adm:ord_refund:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    const orderId = ctx.match[1];
-    if (isDuplicateCallbackClick(ctx.from!.id, `adm:ord_refund:${orderId}`, 1500)) {
-      return;
-    }
-
-    const order = await OrderService.getOrderById(orderId);
-
-    if (!order || !order.telegramPaymentChargeId) {
-      await safeAnswerCbQuery(
-        ctx,
-        'У заказа отсутствует telegram_payment_charge_id для возврата.',
-        true,
-      );
-      return;
-    }
-
-    if (
-      order.paymentStatus === 'refunded' ||
-      order.fulfillmentStatus === 'refunded'
-    ) {
-      await safeAnswerCbQuery(
-        ctx,
-        'По этому заказу уже выполнен возврат.',
-        true,
-      );
-      await safeRespondOrEdit(
-        ctx,
-        formatAdminOrderCard(order),
-        buildAdminOrderActionKeyboard(order),
-      );
-      return;
-    }
-
-    if (
-      order.paymentStatus !== 'paid' &&
-      order.paymentStatus !== 'processing' &&
-      order.paymentStatus !== 'completed'
-    ) {
-      await safeAnswerCbQuery(
-        ctx,
-        `Возврат невозможен для заказа со статусом оплаты «${order.paymentStatus}».`,
-        true,
-      );
-      await safeRespondOrEdit(
-        ctx,
-        formatAdminOrderCard(order),
-        buildAdminOrderActionKeyboard(order),
-      );
-      return;
-    }
-
-    if (order.refundState === 'refund_in_progress') {
-      await safeAnswerCbQuery(
-        ctx,
-        'Возврат по этому заказу уже выполняется другим запросом.',
-        true,
-      );
-      return;
-    }
-
-    const completedWarning =
-      order.fulfillmentStatus === 'completed'
-        ? [
-            '',
-            '🚨 <b>ВНИМАНИЕ: Заказ уже ВЫПОЛНЕН (товар был выдан покупателю)!</b>',
-            'Если вы подтвердите возврат, покупатель получит Stars обратно, сохранив выданный товар.',
-          ].join('\n')
-        : '';
-
-    const confirmText = [
-      `⚠️ <b>Подтверждение возврата Telegram Stars (Шаг 2 из 2)</b>`,
-      '',
-      `Заказ: <code>#${escapeHtml(order.orderId)}</code>`,
-      `Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
-      `Покупатель: <code>${order.userTelegramId}</code>${order.username ? ` (@${escapeHtml(order.username)})` : ''}`,
-      `Сумма к возврату: <b>${order.totalPrice} ⭐ (XTR)</b>`,
-      `Charge ID: <code>${escapeHtml(order.telegramPaymentChargeId)}</code>`,
-      completedWarning,
-      '',
-      'Вы действительно хотите выполнить официальный возврат средств через <code>refundStarPayment</code>? Это действие необратимо.',
-    ]
-      .filter(Boolean)
-      .join('\n');
-
-    await safeRespondOrEdit(
+    await safeAnswerCbQuery(
       ctx,
-      confirmText,
-      buildAdminOrderRefundConfirmKeyboard(order),
+      'Оплата и возвраты через Telegram Stars (XTR) отключены в QuizyStars.',
+      true,
     );
   });
 
-  // AUD-004 (Шаг 2 из 2): Выполнение подтверждённого возврата Telegram Stars через refundStarPayment
   bot.action(/^adm:ord_refund_confirm:([a-zA-Z0-9_-]+)$/, async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
-    const orderId = ctx.match[1];
-    if (
-      isDuplicateCallbackClick(
-        ctx.from!.id,
-        `adm:ord_refund_confirm:${orderId}`,
-        2500,
-      )
-    ) {
-      return;
-    }
-
-    try {
-      const result = await PaymentService.executeOrderRefund({
-        orderId,
-        adminTelegramId: ctx.from!.id,
-        callTelegramRefund: async (userTelegramId, telegramPaymentChargeId) => {
-          await (
-            ctx.telegram as unknown as {
-              callApi: (
-                method: string,
-                payload: Record<string, unknown>,
-              ) => Promise<boolean>;
-            }
-          ).callApi('refundStarPayment', {
-            user_id: userTelegramId,
-            telegram_payment_charge_id: telegramPaymentChargeId,
-          });
-        },
-      });
-
-      if (result.alreadyRefunded) {
-        await safeAnswerCbQuery(
-          ctx,
-          'По этому заказу уже выполнен возврат.',
-          true,
-        );
-        await safeRespondOrEdit(
-          ctx,
-          formatAdminOrderCard(result.order),
-          buildAdminOrderActionKeyboard(result.order),
-        );
-        return;
-      }
-
-      const refundedOrder = result.order;
-
-      await logAdminAudit(
-        ctx.from!.id,
-        refundedOrder.orderId,
-        refundedOrder.totalPrice,
-        `Выполнил возврат ${refundedOrder.totalPrice} XTR (charge_id: ${refundedOrder.telegramPaymentChargeId})`,
-      );
-
-      // Уведомляем покупателя о возврате
-      try {
-        await bot.telegram.sendMessage(
-          refundedOrder.userTelegramId,
-          `↩️ <b>Возврат средств по заказу #${escapeHtml(refundedOrder.orderId)}</b>\n\nНа ваш баланс возвращено <b>${refundedOrder.totalPrice} ⭐ (Telegram Stars)</b>.`,
-          { parse_mode: 'HTML' },
-        );
-      } catch {
-        // Ignore if user blocked the bot
-      }
-
-      await safeAnswerCbQuery(
-        ctx,
-        'Возврат Telegram Stars успешно выполнен!',
-        true,
-      );
-
-      await safeRespondOrEdit(
-        ctx,
-        formatAdminOrderCard(refundedOrder),
-        buildAdminOrderActionKeyboard(refundedOrder),
-      );
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      console.error('[AdminHandler] Ошибка refundStarPayment:', msg);
-      await safeAnswerCbQuery(
-        ctx,
-        `Ошибка возврата: ${msg.slice(0, 150)}`,
-        true,
-      );
-    }
+    await safeAnswerCbQuery(
+      ctx,
+      'Оплата и возвраты через Telegram Stars (XTR) отключены в QuizyStars.',
+      true,
+    );
   });
 
   // Возврат заказа, оплаченного с внутреннего баланса, обратно на внутренний баланс (Шаг 1 из 2)
@@ -819,13 +707,14 @@ export function registerAdminHandlers(
       return;
     }
 
+    const refundCents = order.totalPriceUsdCents ?? order.totalPrice;
     const confirmText = [
       '⚠️ <b>Подтверждение возврата средств на внутренний баланс (Шаг 2 из 2)</b>',
       '',
       `Заказ: <code>#${escapeHtml(order.orderId)}</code>`,
       `Товар: <b>${escapeHtml(order.productName)}</b> (x${order.quantity})`,
       `Покупатель: <code>${order.userTelegramId}</code>${order.username ? ` (@${escapeHtml(order.username)})` : ''}`,
-      `Сумма к возврату на внутренний баланс: <b>+${order.totalPrice}</b>`,
+      `Сумма к возврату на внутренний баланс: <b>+${formatUsdCents(refundCents)}</b>`,
       order.fulfillmentStatus === 'completed'
         ? '\n🚨 <b>ВНИМАНИЕ: Заказ уже ВЫПОЛНЕН!</b> При подтверждении средства вернутся на баланс покупателя.'
         : '',
@@ -877,17 +766,18 @@ export function registerAdminHandlers(
         return;
       }
 
+      const refundCents = res.order.totalPriceUsdCents ?? res.order.totalPrice;
       await logAdminAudit(
         ctx.from!.id,
         orderId,
-        res.order.totalPrice,
-        `Выполнил возврат +${res.order.totalPrice} на внутренний баланс покупателя ${res.order.userTelegramId} (новый баланс: ${res.newBalance})`,
+        refundCents,
+        `Выполнил возврат +${formatUsdCents(refundCents)} на внутренний баланс покупателя ${res.order.userTelegramId} (новый баланс: ${formatUsd(res.newBalance)})`,
       );
 
       try {
         await bot.telegram.sendMessage(
           res.order.userTelegramId,
-          `↩️ <b>Возврат средств по заказу #${escapeHtml(res.order.orderId)}</b>\n\nНа ваш внутренний баланс магазина возвращено <b>+${res.order.totalPrice}</b>. Текущий баланс: <code>${res.newBalance}</code>.`,
+          `↩️ <b>Возврат средств по заказу #${escapeHtml(res.order.orderId)}</b>\n\nНа ваш внутренний баланс QuizyStars возвращено <b>+${formatUsdCents(refundCents)}</b>. Текущий баланс: <code>${formatUsd(res.newBalance)}</code>.`,
           { parse_mode: 'HTML' },
         );
       } catch {
@@ -1082,13 +972,14 @@ export function registerAdminHandlers(
       createdAt: Date.now(),
     });
 
+    const currentCents = product.priceUsdCents ?? product.price;
     await safeRespondOrEdit(
       ctx,
       [
         `💰 <b>Изменение цены товара:</b> ${escapeHtml(product.name)}`,
-        `Текущая цена: <code>${product.price} ⭐ (XTR)</code>`,
+        `Текущая цена: <code>${formatUsdCents(currentCents)}</code>`,
         '',
-        'Отправьте в чат новое целое число (от 1 до 100000) для установки цены в Telegram Stars:',
+        'Отправьте в чат новую цену в USD (например: <code>13.90</code> или <code>0.90</code>):',
       ].join('\n'),
       Markup.inlineKeyboard([
         [Markup.button.callback('❌ Отмена', `adm:prod:${productId}`)],
@@ -1661,10 +1552,10 @@ export function registerAdminHandlers(
       }
 
       if (session.action === 'edit_price' && session.targetId) {
-        const price = Number(text);
-        const updated = await ProductService.updateProductPrice(
+        const priceCents = usdInputToCents(text);
+        const updated = await ProductService.updateProductPriceUsdCents(
           session.targetId,
-          price,
+          priceCents,
         );
         clearAdminSession(ctx.from.id);
         if (!updated) {
@@ -1674,8 +1565,8 @@ export function registerAdminHandlers(
         await logAdminAudit(
           ctx.from.id,
           updated.id,
-          updated.price,
-          `Изменил цену товара "${updated.name}" на ${updated.price} XTR`,
+          priceCents,
+          `Изменил цену товара "${updated.name}" на ${formatUsdCents(priceCents)}`,
         );
         await ctx.reply(
           `✅ <b>Цена товара обновлена!</b>\n\n${formatProductCardMessage(updated)}`,
@@ -1749,29 +1640,29 @@ export function registerAdminHandlers(
         session.action = 'add_product_price';
         setAdminSession(ctx.from.id, session);
         await ctx.reply(
-          '➕ <b>Шаг 4 из 4:</b> Отправьте <b>цену товара в Telegram Stars (XTR)</b> (целое число от 1 до 100000):',
+          '➕ <b>Шаг 4 из 4:</b> Отправьте <b>цену товара в USD</b> (например: <code>13.90</code> или <code>4.99</code>):',
           { parse_mode: 'HTML' },
         );
         return;
       }
 
       if (session.action === 'add_product_price' && session.draftProduct) {
-        const price = Number(text);
+        const priceUsdCents = usdInputToCents(text);
         const created = await ProductService.createProduct({
           category: session.draftProduct.category,
           name: session.draftProduct.name || 'Новый товар',
           description: session.draftProduct.description || 'Цифровой товар Telegram',
-          price,
+          priceUsdCents,
         });
         clearAdminSession(ctx.from.id);
         await logAdminAudit(
           ctx.from.id,
           created.id,
-          created.price,
-          `Создал новый товар "${created.name}" (${created.price} XTR)`,
+          priceUsdCents,
+          `Создал новый товар "${created.name}" (${formatUsdCents(priceUsdCents)})`,
         );
         await ctx.reply(
-          `🎉 <b>Новый товар успешно добавлен в каталог!</b>\n\n${formatProductCardMessage(
+          `🎉 <b>Новый товар успешно добавлен в каталог QuizyStars!</b>\n\n${formatProductCardMessage(
             created,
           )}`,
           {

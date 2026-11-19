@@ -66,7 +66,22 @@ service cloud.firestore {
     // Entity Blueprints synchronized with src/types.ts
     function isValidUser(data, userId) {
       return data.keys().hasAll(['userId', 'telegramId', 'firstName', 'isBlocked', 'totalOrders', 'totalSpentStars', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['userId', 'telegramId', 'username', 'firstName', 'lastName', 'languageCode', 'isBlocked', 'totalOrders', 'totalSpentStars', 'balance', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'userId',
+          'telegramId',
+          'username',
+          'firstName',
+          'lastName',
+          'languageCode',
+          'isBlocked',
+          'totalOrders',
+          'balanceUsdCents',
+          'totalSpentUsdCents',
+          'totalSpentStars',
+          'balance',
+          'createdAt',
+          'updatedAt'
+        ]) &&
         data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && data.userId == userId &&
         data.telegramId is number && data.telegramId > 0 &&
         (!('username' in data) || (data.username is string && data.username.size() <= 64)) &&
@@ -75,6 +90,8 @@ service cloud.firestore {
         (!('languageCode' in data) || (data.languageCode is string && data.languageCode.size() <= 16)) &&
         data.isBlocked is bool &&
         data.totalOrders is number && data.totalOrders >= 0 &&
+        (!('balanceUsdCents' in data) || (data.balanceUsdCents is int && data.balanceUsdCents >= 0)) &&
+        (!('totalSpentUsdCents' in data) || (data.totalSpentUsdCents is int && data.totalSpentUsdCents >= 0)) &&
         data.totalSpentStars is number && data.totalSpentStars >= 0 &&
         (!('balance' in data) || (data.balance is number && data.balance >= 0)) &&
         isValidDateVal(data.createdAt) &&
@@ -83,17 +100,40 @@ service cloud.firestore {
 
     function isValidProduct(data, productId) {
       return data.keys().hasAll(['id', 'name', 'category', 'description', 'price', 'currency', 'imageUrl', 'isActive', 'fulfillmentType', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['id', 'name', 'category', 'description', 'price', 'currency', 'imageUrl', 'isActive', 'fulfillmentType', 'keyGeneratorAlgorithm', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id',
+          'name',
+          'category',
+          'description',
+          'priceUsdCents',
+          'unitPriceUsdCents',
+          'price',
+          'currency',
+          'minQuantity',
+          'maxQuantity',
+          'durationMonths',
+          'imageUrl',
+          'isActive',
+          'fulfillmentType',
+          'keyGeneratorAlgorithm',
+          'createdAt',
+          'updatedAt'
+        ]) &&
         data.id is string && data.id.size() >= 1 && data.id.size() <= 64 && data.id == productId &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
         data.category is string && data.category.size() <= 32 && data.category in ['stars', 'premium', 'gifts'] &&
         data.description is string && data.description.size() >= 1 && data.description.size() <= 1000 &&
-        data.price is number && data.price > 0 && data.price <= 100000 &&
-        data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        data.price is number && data.price > 0 && data.price <= 10000000 &&
+        (!('priceUsdCents' in data) || (data.priceUsdCents is int && data.priceUsdCents > 0 && data.priceUsdCents <= 10000000)) &&
+        (!('unitPriceUsdCents' in data) || (data.unitPriceUsdCents is int && data.unitPriceUsdCents > 0 && data.unitPriceUsdCents <= 1000000)) &&
+        data.currency is string && data.currency.size() <= 8 && data.currency in ['USD', 'XTR'] &&
+        (!('minQuantity' in data) || (data.minQuantity is int && data.minQuantity >= 1 && data.minQuantity <= 100000)) &&
+        (!('maxQuantity' in data) || (data.maxQuantity is int && data.maxQuantity >= 1 && data.maxQuantity <= 100000)) &&
+        (!('durationMonths' in data) || data.durationMonths in [3, 6, 12]) &&
         data.imageUrl is string && data.imageUrl.size() <= 500 &&
         data.isActive is bool &&
-        data.fulfillmentType is string && data.fulfillmentType.size() <= 32 && data.fulfillmentType in ['manual', 'provider_adapter'] &&
-        (!('keyGeneratorAlgorithm' in data) || (data.keyGeneratorAlgorithm is string && data.keyGeneratorAlgorithm in ['none', 'stars_promo_v1', 'gift_voucher_v1'])) &&
+        data.fulfillmentType is string && data.fulfillmentType.size() <= 32 && data.fulfillmentType in ['manual', 'provider_adapter', 'mystars'] &&
+        (!('keyGeneratorAlgorithm' in data) || (data.keyGeneratorAlgorithm is string && data.keyGeneratorAlgorithm.size() <= 32 && data.keyGeneratorAlgorithm in ['none', 'stars_promo_v1', 'gift_voucher_v1'])) &&
         isValidDateVal(data.createdAt) &&
         isValidDateVal(data.updatedAt);
     }
@@ -105,19 +145,32 @@ service cloud.firestore {
           'userId',
           'userTelegramId',
           'username',
+          'recipientUsername',
           'productId',
           'productName',
           'category',
           'quantity',
+          'unitPriceUsdCents',
+          'totalPriceUsdCents',
           'totalPrice',
           'currency',
           'paymentMethod',
+          'activePaymentId',
+          'externalInvoiceId',
           'balancePaymentId',
           'balanceRefunded',
           'paymentStatus',
           'fulfillmentStatus',
           'telegramPaymentChargeId',
           'providerPaymentChargeId',
+          'grossRevenueUsdCents',
+          'providerFeeUsdCents',
+          'mystarsCurrency',
+          'mystarsWholesaleCostUsdt',
+          'mystarsCostUsdCents',
+          'tonNetworkFeeTon',
+          'tonNetworkFeeUsdCents',
+          'netProfitUsdCents',
           'fulfillmentNote',
           'fulfillmentStartedAt',
           'fulfillmentAttempts',
@@ -141,23 +194,36 @@ service cloud.firestore {
           'completedAt',
           'updatedAt'
         ]) &&
-        data.orderId is string && data.orderId == orderId &&
+        data.orderId is string && data.orderId.size() <= 64 && data.orderId == orderId &&
         isValidId(data.userId) &&
         data.userTelegramId is number && data.userTelegramId > 0 &&
         (!('username' in data) || (data.username is string && data.username.size() <= 64)) &&
+        (!('recipientUsername' in data) || (data.recipientUsername is string && data.recipientUsername.size() >= 1 && data.recipientUsername.size() <= 64)) &&
         isValidId(data.productId) &&
         data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 120 &&
-        data.category in ['stars', 'premium', 'gifts'] &&
-        data.quantity is number && data.quantity >= 1 && data.quantity <= 10 &&
+        data.category is string && data.category.size() <= 32 && data.category in ['stars', 'premium', 'gifts'] &&
+        data.quantity is int && data.quantity >= 1 && data.quantity <= 100000 &&
+        (!('unitPriceUsdCents' in data) || (data.unitPriceUsdCents is int && data.unitPriceUsdCents > 0)) &&
+        (!('totalPriceUsdCents' in data) || (data.totalPriceUsdCents is int && data.totalPriceUsdCents > 0)) &&
         data.totalPrice is number && data.totalPrice > 0 &&
-        data.currency == 'XTR' &&
-        (!('paymentMethod' in data) || data.paymentMethod in ['stars', 'balance', 'telegram_stars', 'internal_balance']) &&
+        data.currency is string && data.currency.size() <= 8 && data.currency in ['USD', 'XTR'] &&
+        (!('paymentMethod' in data) || (data.paymentMethod is string && data.paymentMethod.size() <= 32 && data.paymentMethod in ['cryptobot', 'xrocket', 'balance', 'internal_balance', 'stars', 'telegram_stars'])) &&
+        (!('activePaymentId' in data) || (data.activePaymentId is string && data.activePaymentId.size() <= 128)) &&
+        (!('externalInvoiceId' in data) || (data.externalInvoiceId is string && data.externalInvoiceId.size() <= 128)) &&
         (!('balancePaymentId' in data) || (data.balancePaymentId is string && data.balancePaymentId.size() <= 128)) &&
         (!('balanceRefunded' in data) || data.balanceRefunded is bool) &&
-        data.paymentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
-        data.fulfillmentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        data.paymentStatus is string && data.paymentStatus.size() <= 32 && data.paymentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
+        data.fulfillmentStatus is string && data.fulfillmentStatus.size() <= 32 && data.fulfillmentStatus in ['pending', 'paid', 'processing', 'completed', 'cancelled', 'refunded', 'failed'] &&
         (!('telegramPaymentChargeId' in data) || (data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() <= 128)) &&
         (!('providerPaymentChargeId' in data) || (data.providerPaymentChargeId is string && data.providerPaymentChargeId.size() <= 128)) &&
+        (!('grossRevenueUsdCents' in data) || (data.grossRevenueUsdCents is int && data.grossRevenueUsdCents >= 0)) &&
+        (!('providerFeeUsdCents' in data) || (data.providerFeeUsdCents is int && data.providerFeeUsdCents >= 0)) &&
+        (!('mystarsCurrency' in data) || (data.mystarsCurrency is string && data.mystarsCurrency.size() <= 16 && data.mystarsCurrency == 'usdt_ton')) &&
+        (!('mystarsWholesaleCostUsdt' in data) || (data.mystarsWholesaleCostUsdt is string && data.mystarsWholesaleCostUsdt.size() <= 64)) &&
+        (!('mystarsCostUsdCents' in data) || (data.mystarsCostUsdCents is int && data.mystarsCostUsdCents >= 0)) &&
+        (!('tonNetworkFeeTon' in data) || (data.tonNetworkFeeTon is string && data.tonNetworkFeeTon.size() <= 64)) &&
+        (!('tonNetworkFeeUsdCents' in data) || (data.tonNetworkFeeUsdCents is int && data.tonNetworkFeeUsdCents >= 0)) &&
+        (!('netProfitUsdCents' in data) || data.netProfitUsdCents is int) &&
         (!('fulfillmentNote' in data) || (data.fulfillmentNote is string && data.fulfillmentNote.size() <= 500)) &&
         (!('fulfillmentStartedAt' in data) || isValidDateVal(data.fulfillmentStartedAt)) &&
         (!('fulfillmentAttempts' in data) || (data.fulfillmentAttempts is number && data.fulfillmentAttempts >= 0 && data.fulfillmentAttempts <= 10)) &&
@@ -169,7 +235,7 @@ service cloud.firestore {
         (!('assignedKeyIds' in data) || (data.assignedKeyIds is list && data.assignedKeyIds.size() <= 10)) &&
         (!('deliveredKeyValues' in data) || (data.deliveredKeyValues is list && data.deliveredKeyValues.size() <= 10)) &&
         (!('awaitingKeyStock' in data) || data.awaitingKeyStock is bool) &&
-        (!('refundState' in data) || data.refundState in ['refund_in_progress', 'telegram_refund_succeeded_pending_commit', 'refund_failed_needs_reconciliation', 'refunded']) &&
+        (!('refundState' in data) || (data.refundState is string && data.refundState.size() <= 64 && data.refundState in ['refund_in_progress', 'telegram_refund_succeeded_pending_commit', 'refund_failed_needs_reconciliation', 'refunded'])) &&
         (!('refundLockToken' in data) || (data.refundLockToken is string && data.refundLockToken.size() <= 128)) &&
         (!('refundStartedAt' in data) || isValidDateVal(data.refundStartedAt)) &&
         (!('refundLastError' in data) || (data.refundLastError is string && data.refundLastError.size() <= 500)) &&
@@ -183,25 +249,72 @@ service cloud.firestore {
     }
 
     function isValidPayment(data, paymentId) {
-      return data.keys().hasAll(['paymentId', 'telegramPaymentChargeId', 'orderId', 'userId', 'userTelegramId', 'totalAmount', 'currency', 'invoicePayload', 'status', 'createdAt']) &&
-        data.keys().hasOnly(['paymentId', 'telegramPaymentChargeId', 'providerPaymentChargeId', 'orderId', 'userId', 'userTelegramId', 'totalAmount', 'currency', 'invoicePayload', 'status', 'createdAt', 'refundedAt']) &&
+      return data.keys().hasAll(['paymentId', 'orderId', 'userId', 'userTelegramId', 'totalAmount', 'currency', 'invoicePayload', 'status', 'createdAt']) &&
+        data.keys().hasOnly([
+          'paymentId',
+          'kind',
+          'provider',
+          'providerPaymentId',
+          'telegramPaymentChargeId',
+          'providerPaymentChargeId',
+          'orderId',
+          'topUpId',
+          'userId',
+          'userTelegramId',
+          'totalAmount',
+          'expectedUsdCents',
+          'feeUsdCents',
+          'netUsdCents',
+          'expectedAmountStr',
+          'actualAmountStr',
+          'exchangeRateUsdStr',
+          'currency',
+          'network',
+          'invoicePayload',
+          'payUrl',
+          'status',
+          'statusReason',
+          'expiresAt',
+          'paidAt',
+          'confirmedAt',
+          'createdAt',
+          'updatedAt',
+          'refundedAt'
+        ]) &&
         data.paymentId is string && data.paymentId.size() >= 1 && data.paymentId.size() <= 128 && data.paymentId == paymentId &&
-        data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() >= 1 && data.telegramPaymentChargeId.size() <= 128 &&
+        (!('kind' in data) || (data.kind is string && data.kind.size() <= 16 && data.kind in ['order', 'topup'])) &&
+        (!('provider' in data) || (data.provider is string && data.provider.size() <= 32 && data.provider in ['cryptobot', 'xrocket', 'balance', 'telegram_stars'])) &&
+        (!('providerPaymentId' in data) || (data.providerPaymentId is string && data.providerPaymentId.size() <= 128)) &&
+        (!('telegramPaymentChargeId' in data) || (data.telegramPaymentChargeId is string && data.telegramPaymentChargeId.size() >= 1 && data.telegramPaymentChargeId.size() <= 128)) &&
         (!('providerPaymentChargeId' in data) || (data.providerPaymentChargeId is string && data.providerPaymentChargeId.size() <= 128)) &&
         data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 64 && isValidId(data.orderId) &&
+        (!('topUpId' in data) || (data.topUpId is string && data.topUpId.size() <= 64)) &&
         data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && isValidId(data.userId) &&
         data.userTelegramId is number && data.userTelegramId > 0 &&
         data.totalAmount is number && data.totalAmount > 0 &&
-        data.currency is string && data.currency.size() <= 8 && data.currency == 'XTR' &&
+        (!('expectedUsdCents' in data) || (data.expectedUsdCents is int && data.expectedUsdCents >= 0)) &&
+        (!('feeUsdCents' in data) || (data.feeUsdCents is int && data.feeUsdCents >= 0)) &&
+        (!('netUsdCents' in data) || (data.netUsdCents is int && data.netUsdCents >= 0)) &&
+        (!('expectedAmountStr' in data) || (data.expectedAmountStr is string && data.expectedAmountStr.size() <= 64)) &&
+        (!('actualAmountStr' in data) || (data.actualAmountStr is string && data.actualAmountStr.size() <= 64)) &&
+        (!('exchangeRateUsdStr' in data) || (data.exchangeRateUsdStr is string && data.exchangeRateUsdStr.size() <= 64)) &&
+        data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
+        (!('network' in data) || (data.network is string && data.network.size() <= 32)) &&
         data.invoicePayload is string && data.invoicePayload.size() >= 1 && data.invoicePayload.size() <= 256 &&
-        data.status is string && data.status.size() <= 32 && data.status in ['paid', 'refunded'] &&
+        (!('payUrl' in data) || (data.payUrl is string && data.payUrl.size() <= 512)) &&
+        data.status is string && data.status.size() <= 32 && data.status in ['pending', 'paid', 'underpaid', 'overpaid', 'expired', 'cancelled', 'failed', 'refunded'] &&
+        (!('statusReason' in data) || (data.statusReason is string && data.statusReason.size() <= 500)) &&
+        (!('expiresAt' in data) || isValidDateVal(data.expiresAt)) &&
+        (!('paidAt' in data) || isValidDateVal(data.paidAt)) &&
+        (!('confirmedAt' in data) || isValidDateVal(data.confirmedAt)) &&
         isValidDateVal(data.createdAt) &&
+        (!('updatedAt' in data) || isValidDateVal(data.updatedAt)) &&
         (!('refundedAt' in data) || isValidDateVal(data.refundedAt));
     }
 
     function isValidTransaction(data, transactionId) {
       return data.keys().hasAll(['transactionId', 'orderId', 'userId', 'type', 'amount', 'currency', 'details', 'createdAt']) &&
-        data.keys().hasOnly(['transactionId', 'orderId', 'userId', 'type', 'amount', 'currency', 'details', 'createdAt']) &&
+        data.keys().hasOnly(['transactionId', 'orderId', 'userId', 'type', 'amount', 'amountUsdCents', 'currency', 'details', 'createdAt']) &&
         data.transactionId is string && data.transactionId.size() >= 1 && data.transactionId.size() <= 64 && data.transactionId == transactionId &&
         data.orderId is string && data.orderId.size() >= 1 && data.orderId.size() <= 64 && isValidId(data.orderId) &&
         data.userId is string && data.userId.size() >= 1 && data.userId.size() <= 64 && isValidId(data.userId) &&
@@ -209,6 +322,9 @@ service cloud.firestore {
           'invoice_created',
           'pre_checkout_ok',
           'payment_received',
+          'order_underpaid',
+          'order_overpaid',
+          'order_expired',
           'fulfillment_completed',
           'fulfillment_failed',
           'fulfillment_retry',
@@ -216,10 +332,13 @@ service cloud.firestore {
           'payment_refunded',
           'balance_topup_created',
           'balance_topup_paid',
+          'balance_topup_underpaid',
+          'balance_topup_overpaid',
           'balance_topup_failed',
           'balance_topup_expired',
           'balance_deducted',
           'balance_refunded',
+          'exchange_rate_locked',
           'key_added',
           'key_generated',
           'key_delivered',
@@ -229,6 +348,7 @@ service cloud.firestore {
           'error'
         ] &&
         data.amount is number && data.amount >= 0 &&
+        (!('amountUsdCents' in data) || (data.amountUsdCents is int && data.amountUsdCents >= 0)) &&
         data.currency is string && data.currency.size() >= 1 && data.currency.size() <= 16 &&
         data.details is string && data.details.size() >= 1 && data.details.size() <= 500 &&
         isValidDateVal(data.createdAt);
@@ -265,6 +385,8 @@ service cloud.firestore {
             incoming().isBlocked == false &&
             incoming().totalOrders == 0 &&
             incoming().totalSpentStars == 0 &&
+            (!('balanceUsdCents' in incoming()) || incoming().balanceUsdCents == 0) &&
+            (!('totalSpentUsdCents' in incoming()) || incoming().totalSpentUsdCents == 0) &&
             (!('balance' in incoming()) || incoming().balance == 0))
         );
       allow update: if isValidId(userId) && isValidUser(incoming(), userId) &&
@@ -278,6 +400,8 @@ service cloud.firestore {
             incoming().isBlocked == false &&
             incoming().totalOrders == existing().totalOrders &&
             incoming().totalSpentStars == existing().totalSpentStars &&
+            (!('balanceUsdCents' in existing()) || incoming().balanceUsdCents == existing().balanceUsdCents) &&
+            (!('totalSpentUsdCents' in existing()) || incoming().totalSpentUsdCents == existing().totalSpentUsdCents) &&
             incoming().diff(existing()).affectedKeys().hasOnly(['username', 'firstName', 'lastName', 'languageCode', 'updatedAt']))
         );
       allow delete: if isValidId(userId) && isAdmin();
@@ -310,8 +434,13 @@ service cloud.firestore {
           (isOwner(incoming().userId) &&
             incoming().paymentStatus == 'pending' &&
             incoming().fulfillmentStatus == 'pending' &&
+            !('activePaymentId' in incoming()) &&
+            !('externalInvoiceId' in incoming()) &&
+            !('balancePaymentId' in incoming()) &&
             !('telegramPaymentChargeId' in incoming()) &&
             !('providerPaymentChargeId' in incoming()) &&
+            !('grossRevenueUsdCents' in incoming()) &&
+            !('netProfitUsdCents' in incoming()) &&
             !('paidAt' in incoming()) &&
             !('completedAt' in incoming()) &&
             !('externalExecutionReference' in incoming()) &&
@@ -359,7 +488,6 @@ service cloud.firestore {
         exists(/databases/$(database)/documents/orders/$(incoming().orderId));
       allow update: if isValidId(paymentId) && isValidPayment(incoming(), paymentId) &&
         incoming().paymentId == existing().paymentId &&
-        incoming().telegramPaymentChargeId == existing().telegramPaymentChargeId &&
         incoming().orderId == existing().orderId &&
         incoming().userId == existing().userId &&
         incoming().totalAmount == existing().totalAmount &&
@@ -379,6 +507,11 @@ service cloud.firestore {
 
     // 4c. /digital_keys/{keyId} — Strictly backend/owner only; never accessible via client SDK
     match /digital_keys/{keyId} {
+      allow read, write: if false;
+    }
+
+    // 4d. /payment_locks/{lockId} — Strictly backend transaction claim lock; never accessible via client SDK
+    match /payment_locks/{lockId} {
       allow read, write: if false;
     }
 
