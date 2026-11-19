@@ -2,15 +2,557 @@
 <html lang="ru">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <title>Telegram Digital Store Bot</title>
     <meta name="description" content="Полноценный Telegram-магазин цифровых товаров (Telegram Stars, Premium, Gifts) на Node.js, TypeScript, Telegraf и Firebase Firestore." />
     <meta property="og:title" content="Telegram Digital Store Bot" />
     <meta property="og:description" content="Полноценный Telegram-магазин цифровых товаров (Telegram Stars, Premium, Gifts) на Node.js, TypeScript, Telegraf и Firebase Firestore." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <style>
+      :root {
+        --bg-primary: #0f131a;
+        --bg-card: #171d27;
+        --bg-input: #11161f;
+        --border-subtle: rgba(255, 255, 255, 0.08);
+        --border-focus: #38bdf8;
+        --text-primary: #f8fafc;
+        --text-secondary: #94a3b8;
+        --accent: #38bdf8;
+        --accent-emerald: #34d399;
+        --danger: #fb7185;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        background-color: var(--bg-primary);
+        color: var(--text-primary);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, sans-serif;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 20px 16px 40px;
+      }
+      .app-shell {
+        width: 100%;
+        max-width: 440px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .oe-icon {
+        display: inline-block;
+        vertical-align: -0.18em;
+        width: 1.15em;
+        height: 1.15em;
+        color: var(--accent);
+        flex-shrink: 0;
+      }
+      .top-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 16px;
+        background: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: 16px;
+      }
+      .brand-title {
+        font-size: 17px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        color: var(--text-primary);
+      }
+      .brand-sub {
+        font-size: 12px;
+        color: var(--text-secondary);
+        margin-top: 2px;
+      }
+      .balance-badge {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        background: rgba(56, 189, 248, 0.1);
+        border: 1px solid rgba(56, 189, 248, 0.25);
+        border-radius: 12px;
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--accent);
+      }
+      .central-input-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: 20px;
+        padding: 24px 20px;
+        text-align: center;
+        transition: border-color 0.2s ease;
+      }
+      .central-input-card:focus-within {
+        border-color: var(--border-focus);
+      }
+      .input-caption {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--text-secondary);
+        margin-bottom: 14px;
+      }
+      .usd-input-wrap {
+        display: flex;
+        align-items: baseline;
+        justify-content: center;
+        gap: 4px;
+        padding: 12px 16px;
+        background: var(--bg-input);
+        border: 1px solid var(--border-subtle);
+        border-radius: 16px;
+      }
+      .usd-prefix {
+        font-size: 36px;
+        font-weight: 700;
+        color: var(--accent);
+        user-select: none;
+      }
+      .usd-input {
+        width: 100%;
+        max-width: 240px;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: var(--text-primary);
+        font-size: 38px;
+        font-weight: 700;
+        text-align: left;
+        font-variant-numeric: tabular-nums;
+      }
+      .usd-input::placeholder {
+        color: rgba(148, 163, 184, 0.35);
+      }
+      .limits-hint {
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+      .error-banner {
+        display: none;
+        margin-top: 12px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(251, 113, 133, 0.12);
+        border: 1px solid rgba(251, 113, 133, 0.35);
+        color: var(--danger);
+        font-size: 13px;
+        text-align: left;
+      }
+      .section-card {
+        background: var(--bg-card);
+        border: 1px solid var(--border-subtle);
+        border-radius: 18px;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .section-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-secondary);
+      }
+      .provider-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .provider-btn {
+        background: var(--bg-input);
+        border: 1px solid var(--border-subtle);
+        border-radius: 14px;
+        padding: 12px;
+        color: var(--text-primary);
+        cursor: pointer;
+        text-align: left;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        transition: all 0.15s ease;
+      }
+      .provider-btn.active {
+        border-color: var(--accent);
+        background: rgba(56, 189, 248, 0.1);
+      }
+      .provider-name {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 15px;
+        font-weight: 600;
+      }
+      .provider-fee {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+      .currency-grid {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 8px;
+      }
+      .currency-btn {
+        background: var(--bg-input);
+        border: 1px solid var(--border-subtle);
+        border-radius: 10px;
+        padding: 8px 6px;
+        color: var(--text-primary);
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        text-align: center;
+      }
+      .currency-btn.active {
+        border-color: var(--accent);
+        background: rgba(56, 189, 248, 0.14);
+        color: var(--accent);
+      }
+      .summary-rows {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .summary-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 14px;
+      }
+      .summary-label {
+        color: var(--text-secondary);
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .summary-val {
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      .summary-row.total {
+        padding-top: 10px;
+        border-top: 1px solid var(--border-subtle);
+        font-size: 16px;
+      }
+      .summary-row.total .summary-val {
+        color: var(--accent-emerald);
+        font-size: 18px;
+        font-weight: 700;
+      }
+      .conversion-notice {
+        display: none;
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(56, 189, 248, 0.08);
+        border: 1px solid rgba(56, 189, 248, 0.22);
+        font-size: 12.5px;
+        color: var(--text-secondary);
+        line-height: 1.45;
+      }
+      .submit-btn {
+        width: 100%;
+        padding: 15px 18px;
+        border: none;
+        border-radius: 16px;
+        background: var(--accent);
+        color: #081018;
+        font-size: 15px;
+        font-weight: 700;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        transition: opacity 0.15s ease;
+      }
+      .submit-btn:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      .sections-preview {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+      .nav-chip {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 9px 10px;
+        background: var(--bg-input);
+        border: 1px solid var(--border-subtle);
+        border-radius: 12px;
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+    </style>
   </head>
   <body>
-    <pre>Telegram Digital Store Bot — Server Runtime</pre>
+    <main class="app-shell">
+      <!-- Stars Shop Brand Header (Logo/Name preserved without emoji replacement) -->
+      <header class="top-bar">
+        <div>
+          <div class="brand-title">STARS SHOP</div>
+          <div class="brand-sub">Пополнение внутреннего баланса (USD)</div>
+        </div>
+        <div class="balance-badge" title="Текущий баланс пользователя в USD">
+          <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M19 7V4a1 1 0 0 0-1-1H5a2 2 0 0 0 0 4h15a1 1 0 0 1 1 1v4h-3a2 2 0 0 0 0 4h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1"/><path d="M3 5v14a2 2 0 0 0 2 2h15a1 1 0 0 0 1-1v-4"/></svg>
+          <span>$0.00</span>
+        </div>
+      </header>
+
+      <!-- Central Free-Form USD Amount Input (No Fixed Preset Buttons) -->
+      <section class="central-input-card" aria-label="Ввод суммы пополнения в долларах">
+        <div class="input-caption">
+          <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="2" x2="12" y2="22"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+          <span>Введите сумму пополнения (USD)</span>
+        </div>
+        <div class="usd-input-wrap">
+          <span class="usd-prefix">$</span>
+          <input
+            id="usdAmountInput"
+            class="usd-input"
+            type="text"
+            inputmode="decimal"
+            pattern="[0-9]*[.,]?[0-9]*"
+            autocomplete="off"
+            placeholder="0.00"
+            value="100.00"
+            aria-label="Сумма пополнения в долларах США"
+          />
+        </div>
+        <div class="limits-hint">
+          Серверные лимиты: минимум <b>$0.50</b> • максимум <b>$50,000.00</b>
+        </div>
+        <div id="errorBanner" class="error-banner" role="alert"></div>
+      </section>
+
+      <!-- Payment Provider Selector -->
+      <section class="section-card">
+        <div class="section-title">
+          <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="5" width="20" height="14" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+          <span>Способ пополнения</span>
+        </div>
+        <div class="provider-grid">
+          <button type="button" class="provider-btn active" data-provider="cryptobot">
+            <div class="provider-name">
+              <span>CryptoBot</span>
+              <span>3%</span>
+            </div>
+            <div class="provider-fee">Зачисление: сумма × 0.97</div>
+          </button>
+          <button type="button" class="provider-btn" data-provider="xrocket">
+            <div class="provider-name">
+              <span>xRocket</span>
+              <span>2%</span>
+            </div>
+            <div class="provider-fee">Зачисление: сумма × 0.98</div>
+          </button>
+        </div>
+
+        <div class="section-title" style="margin-top: 4px;">
+          <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M14.8 9A2 2 0 0 0 13 8h-2a2 2 0 0 0 0 4h2a2 2 0 0 1 0 4h-2a2 2 0 0 1-1.8-1"/><path d="M12 6v2m0 8v2"/></svg>
+          <span>Валюта счёта</span>
+        </div>
+        <div id="currencyGrid" class="currency-grid"></div>
+      </section>
+
+      <!-- Live Fee & Net Credited Calculation -->
+      <section class="section-card">
+        <div class="section-title">
+          <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+          <span>Расчёт зачисления (USD)</span>
+        </div>
+        <div class="summary-rows">
+          <div class="summary-row">
+            <span class="summary-label">Введённая сумма:</span>
+            <span id="sumEntered" class="summary-val">$100.00</span>
+          </div>
+          <div class="summary-row">
+            <span id="sumFeeLabel" class="summary-label">Комиссия CryptoBot (3%):</span>
+            <span id="sumFee" class="summary-val">−$3.00</span>
+          </div>
+          <div class="summary-row total">
+            <span class="summary-label">К зачислению на баланс:</span>
+            <span id="sumCredited" class="summary-val">+$97.00</span>
+          </div>
+        </div>
+        <div id="conversionNotice" class="conversion-notice"></div>
+        <button id="submitBtn" type="button" class="submit-btn">
+          <svg class="oe-icon" style="color: #081018;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+          <span id="submitBtnText">Создать счёт ($100.00 → +$97.00)</span>
+        </button>
+      </section>
+
+      <!-- OutlineEmoji Unified Store Sections -->
+      <section class="section-card">
+        <div class="section-title">
+          <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          <span>Разделы Stars Shop • OutlineEmoji</span>
+        </div>
+        <div class="sections-preview">
+          <div class="nav-chip">
+            <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>
+            <span>Профиль</span>
+          </div>
+          <div class="nav-chip">
+            <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+            <span>Каталог</span>
+          </div>
+          <div class="nav-chip">
+            <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M16.5 9.4 7.55 4.24"/><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+            <span>Заказы</span>
+          </div>
+          <div class="nav-chip">
+            <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            <span>Правила</span>
+          </div>
+          <div class="nav-chip">
+            <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4"/></svg>
+            <span>Настройки</span>
+          </div>
+          <div class="nav-chip">
+            <svg class="oe-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+            <span>Уведомления</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      (function () {
+        const PROVIDER_CONFIG = {
+          cryptobot: {
+            title: 'CryptoBot',
+            feePercent: 3,
+            currencies: ['USD', 'USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC'],
+            defaultCurrency: 'USD',
+          },
+          xrocket: {
+            title: 'xRocket',
+            feePercent: 2,
+            currencies: ['USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB'],
+            defaultCurrency: 'USDT',
+          },
+        };
+
+        let activeProvider = 'cryptobot';
+        let activeCurrency = 'USD';
+
+        const inputEl = document.getElementById('usdAmountInput');
+        const errorBanner = document.getElementById('errorBanner');
+        const currencyGrid = document.getElementById('currencyGrid');
+        const sumEntered = document.getElementById('sumEntered');
+        const sumFeeLabel = document.getElementById('sumFeeLabel');
+        const sumFee = document.getElementById('sumFee');
+        const sumCredited = document.getElementById('sumCredited');
+        const conversionNotice = document.getElementById('conversionNotice');
+        const submitBtn = document.getElementById('submitBtn');
+        const submitBtnText = document.getElementById('submitBtnText');
+        const providerBtns = document.querySelectorAll('.provider-btn');
+
+        function renderCurrencies() {
+          const list = PROVIDER_CONFIG[activeProvider].currencies;
+          if (!list.includes(activeCurrency)) {
+            activeCurrency = PROVIDER_CONFIG[activeProvider].defaultCurrency;
+          }
+          currencyGrid.innerHTML = '';
+          list.forEach((curr) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'currency-btn' + (curr === activeCurrency ? ' active' : '');
+            btn.textContent = curr;
+            btn.addEventListener('click', () => {
+              activeCurrency = curr;
+              renderCurrencies();
+              recalculate();
+            });
+            currencyGrid.appendChild(btn);
+          });
+        }
+
+        async function recalculate() {
+          const rawValue = inputEl.value.trim();
+          try {
+            const response = await fetch('/api/topup/calculate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                amountUsd: rawValue,
+                provider: activeProvider,
+                currency: activeCurrency,
+              }),
+            });
+            const data = await response.json();
+            if (!response.ok || !data.ok) {
+              errorBanner.style.display = 'block';
+              errorBanner.textContent = data.error || 'Введите сумму от $0.50 до $50,000.00';
+              submitBtn.disabled = true;
+              sumEntered.textContent = '$0.00';
+              sumFee.textContent = '−$0.00';
+              sumCredited.textContent = '+$0.00';
+              conversionNotice.style.display = 'none';
+              return;
+            }
+
+            errorBanner.style.display = 'none';
+            submitBtn.disabled = false;
+            sumEntered.textContent = data.amountUsdFormatted;
+            sumFeeLabel.textContent = `Комиссия ${data.providerTitle} (${data.feePercent}%):`;
+            sumFee.textContent = `−${data.feeAmountFormatted}`;
+            sumCredited.textContent = `+${data.amountCreditedFormatted}`;
+            submitBtnText.textContent = `Создать счёт (${data.amountUsdFormatted} → +${data.amountCreditedFormatted})`;
+
+            if (data.currency !== 'USD' && data.currency !== 'USDT' && data.currency !== 'USDC') {
+              conversionNotice.style.display = 'block';
+              conversionNotice.innerHTML = `Конвертация из USD по фиксированному курсу счёта (<b>1 ${data.currency} = $${Number(data.exchangeRateUsd).toFixed(2)}</b>): к оплате <b>${data.amountToPayInCurrency} ${data.currency}</b>. Итоговая сумма зачисления (<b>+${data.amountCreditedFormatted}</b>) фиксируется при создании счёта.`;
+            } else {
+              conversionNotice.style.display = 'none';
+            }
+          } catch (e) {
+            // Fallback client calculation if offline
+          }
+        }
+
+        providerBtns.forEach((btn) => {
+          btn.addEventListener('click', () => {
+            providerBtns.forEach((b) => b.classList.remove('active'));
+            btn.classList.add('active');
+            activeProvider = btn.getAttribute('data-provider') || 'cryptobot';
+            renderCurrencies();
+            recalculate();
+          });
+        });
+
+        inputEl.addEventListener('input', () => {
+          recalculate();
+        });
+
+        submitBtn.addEventListener('click', () => {
+          recalculate();
+        });
+
+        renderCurrencies();
+        recalculate();
+      })();
+    </script>
   </body>
 </html>

@@ -1,10 +1,10 @@
-# Полный технический аудит проекта Stars Shop (Актуализированная ревизия после Stage 3.2 Update & Stage 3.3)
+# Полный технический аудит проекта Stars Shop (Актуализированная ревизия после Stage 3.2 Update, Stage 3.3 & USD Top-Up + OutlineEmoji)
 
 **Дата ревизии:** 2026-11-19  
 **Репозиторий:** `Vanyamujlan/Shop-Tg-bot` (актуальное состояние рабочей ветки `main`)  
 **Режим проверки:** Независимый технический аудит фактического исходного кода (без подключения к Production Firebase, без реальных токенов и без реальных платежей)  
 **Результаты локальных проверок:**
-- Локальные модульные и транзакционные тесты (`npm test` / `src/tests/stage1.test.ts`): **`52/52 PASS`** (`P-01`..`P-05`, `F-01`..`F-03`, `S-01`..`S-03`, `R-01`..`R-08`, `G-01`..`G-06`, `A-01`..`A-08`, `B-01`..`B-11`, `K-01`..`K-08`)
+- Локальные модульные и транзакционные тесты (`npm test` / `src/tests/stage1.test.ts`): **`56/56 PASS`** (`P-01`..`P-05`, `F-01`..`F-03`, `S-01`..`S-03`, `R-01`..`R-08`, `G-01`..`G-06`, `A-01`..`A-08`, `B-01`..`B-15`, `K-01`..`K-08`)
 - Пакет аудита на официальном Firebase Emulator (`npm run audit:emulator`): **`38/38 PASS`**
 - Статический анализ (`npm run lint` = `eslint . && tsc --noEmit`) и проверка сборки (`npm run build`): **`0 ошибок`**
 
@@ -15,7 +15,7 @@
 ### 1.1. Архитектура проекта, зависимости и точки входа
 - **Точки входа:**
   - Серверная: `server.ts` — инициализирует Express (`0.0.0.0:3000`), `firestoreRepo.init()`, `botManager.start()`, фоновый воркер `FulfillmentService.startRecoveryWorker(..., 30_000)` и graceful shutdown (`SIGINT`/`SIGTERM`).
-  - Клиентская заглушка превью: `index.html` + `src/index.ts`.
+  - Интерактивный экран пополнения баланса в USD по референсу `https://ibb.co/KpxHvx5V`: `index.html` + `POST /api/topup/calculate` в `server.ts` (центральное поле ввода суммы в USD с `inputmode="decimal"`, без фиксированных кнопок-пресетов, с автоматическим пересчётом комиссии CryptoBot 3% / xRocket 2% и иконками OutlineEmoji).
 - **Замечания:**
   - На сервере при импорте `src/db/firestore.ts` загружается `src/db/firestoreErrorHandler.ts`, инициализирующий браузерный клиентский SDK `firebase/firestore` (`AUD-001`).
   - В `package.json` остались неиспользуемые 3D/WebXR/AI-зависимости от базового шаблона (`AUD-011`).
@@ -24,7 +24,8 @@
 - **Маршруты Express (`server.ts`):**
   - `POST /webhook/telegram` — передаёт запрос в `botManager.handleWebhookRequest(req, res)`. Проверяется наличие `WEBHOOK_SECRET` (`503` при отсутствии), заголовок `X-Telegram-Bot-Api-Secret-Token` через `crypto.timingSafeEqual` (`401` при несовпадении) и структура `update_id` (`400` при некорректном теле).
   - `POST /webhook/cryptobot` и `POST /webhook/xrocket` — проверяют криптографические подписи вебхуков (`crypto-pay-api-signature`, `rocket-pay-signature`) по сырому телу запроса (`req.rawBody`) и запускают серверную сверку счёта через официальный REST API провайдера (`verifyAndProcessTopUp`). Маршрут `/webhook/lolzteam` и интеграция Lolzteam полностью удалены.
-  - `GET /health` и `GET /` публично возвращают внутренние идентификаторы проекта и БД (`AUD-009`).
+  - `POST /api/topup/calculate` — выполняет серверную валидацию свободной суммы пополнения в USD (`$0.50` – `$50,000.00`, не более 2 знаков после запятой) через `validateTopUpAmountUsd`, рассчитывает удержание комиссии (`CryptoBot 3%`, `xRocket 2%`) и конвертацию из USD в выбранную криптовалюту.
+  - `GET /health` и `GET /status` публично возвращают внутренние идентификаторы проекта и БД (`AUD-009`).
 
 ### 1.3. Telegram Bot: команды, callback, webhook, защита от повторных запросов
 - Инициализация в `src/bot/bot.ts` (фреймворк `telegraf@^4.16.3`).
@@ -73,7 +74,7 @@
 
 ### 1.11. Защита секретов, конфиденциальных данных и внутренних endpoint
 - Секреты (`TELEGRAM_BOT_TOKEN`, `WEBHOOK_SECRET`, `FIREBASE_PRIVATE_KEY`, `CRYPTOBOT_API_TOKEN`, `XROCKET_API_KEY`) маскируются в логах через `maskSecretsInText()` и `redactSecretsFromText()`, а значения цифровых ключей маскируются через `maskDigitalKey()` (`STAR****EF99`).
-- Публичные маршруты `GET /health` и `GET /` раскрывают инфраструктурные идентификаторы (`AUD-009`).
+- Публичные маршруты `GET /health` и `GET /status` раскрывают инфраструктурные идентификаторы (`AUD-009`).
 
 ### 1.12. Обработка ошибок, логирование и мониторинг
 - При недоступности Firebase Admin SDK в Production активируется защитный режим `degradedMode = true` (`StorageUnavailableError`), блокирующий создание новых заказов и `pre_checkout_query`.
@@ -81,7 +82,7 @@
 
 ### 1.13. Тесты, покрытие критических сценариев и конкурентные операции
 - В наличии два набора автотестов:
-  1. `npm test` (`src/tests/stage1.test.ts` — **`52/52 PASS`**): покрывает оплату Stars (`P-01`..`P-05`), выдачу и crash-recovery (`F-01`..`F-03`), защиту webhook (`S-01`..`S-03`), правила безопасности (`R-01`..`R-08`), граничные сценарии (`G-01`..`G-06`), финансовую консистентность и возвраты (`A-01`..`A-08`), пополнение баланса через CryptoBot (3%) и xRocket Pay REST API v1 (2%) (`B-01`..`B-11`), а также генератор ключей владельца и автоматическую выдачу ключей (`K-01`..`K-08`).
+  1. `npm test` (`src/tests/stage1.test.ts` — **`56/56 PASS`**): покрывает оплату Stars (`P-01`..`P-05`), выдачу и crash-recovery (`F-01`..`F-03`), защиту webhook (`S-01`..`S-03`), правила безопасности (`R-01`..`R-08`), граничные сценарии (`G-01`..`G-06`), финансовую консистентность и возвраты (`A-01`..`A-08`), пополнение баланса в USD через CryptoBot (3%) и xRocket Pay REST API v1 (2%), свободный ввод суммы, конвертацию валют и стиль OutlineEmoji (`B-01`..`B-15`), а также генератор ключей владельца и автоматическую выдачу ключей (`K-01`..`K-08`).
   2. `npm run audit:emulator` (`firestore-audit-package` — **`38/38 PASS`**): проверяет `firestore.rules`, CRUD и транзакции на реальном Firebase Emulator (`127.0.0.1:8080`).
 
 ### 1.14. Сборка, зависимости, конфигурация и готовность к развёртыванию
@@ -99,7 +100,7 @@
 - **`AUD-006` (`Medium` — `OPEN`):** Отсутствие пагинации длинных списков и лимит 200 документов в `adm:stats`.
 - **`AUD-007` (`Medium` — `FIXED` в Stage 3.1):** Транзакционное обновление профиля в `UserService.upsertFromTelegram` и `setUserBlocked` (`A-08`).
 - **`AUD-008` (`Medium` — `OPEN`):** Поле `maintenanceMode` в `settings/global` не проверяется при создании заказа.
-- **`AUD-009` (`Medium` — `OPEN`):** Публичные эндпоинты `GET /health` и `GET /` возвращают `projectId` и `databaseId`.
+- **`AUD-009` (`Medium` — `OPEN`):** Публичные эндпоинты `GET /health` и `GET /status` возвращают `projectId` и `databaseId`.
 - **`AUD-010` (`Medium` — `OPEN`):** В UI покупателя фиксировано `quantity: 1`.
 - **`AUD-011` (`Medium` — `OPEN`):** `npm run build` выполняет `tsc --noEmit`; в `package.json` присутствуют зависимости базового XR-шаблона.
 - **`AUD-012` (`Low` — `OPEN`):** Неиспользуемый метод `UserService.incrementUserPurchaseStats`.
@@ -115,19 +116,13 @@
 1. **Полное удаление LOLZTEAM:**
    - Интеграция Lolzteam (`lolzteam`), комиссия 5%, переменные `LOLZTEAM_API_TOKEN`, `LOLZTEAM_MERCHANT_ID`, `LOLZTEAM_WEBHOOK_SECRET`, `LOLZTEAM_API_URL`, маршрут `POST /webhook/lolzteam`, кнопки выбора и тесты Lolzteam полностью удалены из проекта.
    - Архитектура `BalanceService` и `PaymentProviderGateway` сохранена расширяемой для подключения новых провайдеров в будущем.
-2. **Минималистичный 3-шаговый интерфейс пополнения баланса (`src/bot/keyboards.ts`, `src/bot/formatters.ts`, `src/bot/handlers/userHandler.ts`):**
-   - **Шаг 1/3 (`💰 ПОПОЛНЕНИЕ БАЛАНСА · Шаг 1/3 · 💳 Выберите способ оплаты:`):** кнопки `💎 CryptoBot [3%]`, `🚀 xRocket [2%]`, `📜 История пополнений`, `« Назад`.
-   - **Шаг 2/3 (`💵 СУММА ПОПОЛНЕНИЯ · Шаг 2/3`):** отображает выбранный способ оплаты, комиссию (`3%` или `2%`), минимальную сумму, пресеты сумм, расчёт комиссии (`Сумма пополнения`, `Комиссия`, `Итоговая сумма зачисления`), ввод суммы вручную и кнопку `« Назад`.
-   - **Шаг 3/3 для xRocket (`🪙 ВАЛЮТА ОПЛАТЫ · Шаг 3/3`):** сетка поддерживаемых монет и сетей xRocket (`USDT (TON/TRC-20/BEP-20/ERC-20)`, `TON (TON)`, `BTC (Bitcoin)`, `ETH (ERC-20)`, `TRX (TRC-20)`, `BNB (BEP-20)`, `USDC (ERC-20/BEP-20)`) и кнопка `« Назад`.
-   - **Созданный счёт (`📄 СЧЁТ СОЗДАН · Шаг 3/3`):** показывает способ оплаты, валюту/сеть, сумму пополнения, комиссию и итоговую сумму к зачислению (`creditedAmount = paidAmount * (1 - feePercent / 100)`) и 3 кнопки: `💳 Оплатить`, `🔄 Проверить оплату`, `« Назад`.
-3. **Исправление ошибки xRocket HTTP 404 (переход на официальный xRocket Pay REST API v1):**
-   - Устаревший endpoint `https://pay.xrocket.tg/tg-invoices` и заголовок `Rocket-Pay-Key` заменены на актуальный официальный **xRocket Pay REST API v1**:
-     - Production URL: `https://pay.api.xrocket.exchange` (Testnet: `https://pay.api.testnet.xrocket.exchange`).
-     - Функция `buildXRocketApiV1Url()` формирует канонический путь `/api/v1/invoices` без дублирования `/api/v1`.
-     - Авторизация: заголовок `Authorization: Bearer <XROCKET_API_KEY>`.
-     - Создание счёта: `POST /api/v1/invoices` с телом `{ priceAmount, priceCurrency, payCurrencies: [priceCurrency], clientInvoiceId, description, expiresIn: 1800000 }`, обработка ответа HTTP `201 Created` и извлечение ссылки из `links.telegramBotLink`.
-     - Проверка статуса: `GET /api/v1/invoices?ids=<externalInvoiceId>` со сверкой `id`, `clientInvoiceId`, `priceAmount`, `priceCurrency` и статуса `PAID`.
-     - Диагностика ошибок: парсинг RFC 7807 Problem Details (`{ status, type, title, detail, instance, kind }`) в `XRocketApiError` с маскированием секретов.
+2. **Исправление ошибки xRocket HTTP 404 (переход на официальный xRocket Pay REST API v1):**
+   - Production URL: `https://pay.api.xrocket.exchange` (Testnet: `https://pay.api.testnet.xrocket.exchange`).
+   - Функция `buildXRocketApiV1Url()` формирует канонический путь `/api/v1/invoices` без дублирования `/api/v1`.
+   - Авторизация: заголовок `Authorization: Bearer <XROCKET_API_KEY>`.
+   - Создание счёта: `POST /api/v1/invoices` с телом `{ priceAmount, priceCurrency, payCurrencies: [priceCurrency], clientInvoiceId, description, expiresIn: 1800000 }`, обработка ответа HTTP `201 Created` и извлечение ссылки из `links.telegramBotLink`.
+   - Проверка статуса: `GET /api/v1/invoices?ids=<externalInvoiceId>` со сверкой `id`, `clientInvoiceId`, `priceAmount`, `priceCurrency` и статуса `PAID`.
+   - Диагностика ошибок: парсинг RFC 7807 Problem Details (`{ status, type, title, detail, instance, kind }`) в `XRocketApiError` с маскированием секретов.
 
 ---
 
@@ -146,4 +141,24 @@
    - Исключена двойная выдача одного ключа двум параллельным заказам (`K-05`) и повторная выдача при дублирующемся webhook (`K-06`).
    - При отсутствии свободных ключей заказ остаётся в `fulfillmentStatus: 'processing'` (`awaitingKeyStock: true`, **не** `completed`), а владельцу (`OWNER_TELEGRAM_ID`) отправляется уведомление (`K-07`).
    - При сбое отправки сообщения в Telegram выданный ключ остаётся привязанным к заказу в Firestore и доступен покупателю в карточке заказа (`K-08`).
+
+---
+
+## 5. Свободный ввод суммы пополнения в USD (`$`), удержание комиссии и визуальный стиль OutlineEmoji
+
+1. **Свободный ввод суммы пополнения без фиксированных пресетов (`B-12`):**
+   - Полностью удалены все предложенные фиксированные кнопки сумм (`100`, `250`, `500`, `1000`, `2500`, `5000`; `presetAmounts: []`).
+   - В Telegram-боте (Шаг 2/3) и в веб-интерфейсе предпросмотра (`index.html`, `inputmode="decimal"`, по референсу `https://ibb.co/KpxHvx5V`) центральным элементом экрана является свободный ввод суммы пополнения в долларах США (`USD`, `$`).
+   - Серверная валидация `validateTopUpAmountUsd()` проверяет диапазон от `$0.50` (`MIN_TOPUP_AMOUNT_USD`) до `$50,000.00` (`MAX_TOPUP_AMOUNT_USD`) и точность до 2 знаков после запятой; некорректные суммы отклоняются до создания счёта.
+2. **Удержание комиссии из внесённой суммы и автоматический пересчёт (`B-13`):**
+   - Комиссия удерживается из внесённой суммы (`CryptoBot`: 3% -> `зачисление = сумма × 0.97`; `xRocket`: 2% -> `зачисление = сумма × 0.98`).
+   - Примеры: `$10.00` -> `-$0.30` / `+$9.70` (CryptoBot) и `-$0.20` / `+$9.80` (xRocket); `$19.99` -> `-$0.60` / `+$19.39` (CryptoBot) и `-$0.40` / `+$19.59` (xRocket); `$100.00` -> `-$3.00` / `+$97.00` (CryptoBot) и `-$2.00` / `+$98.00` (xRocket).
+   - При смене платёжного провайдера на Шаге 2/3 или в веб-интерфейсе сумма зачисления и комиссия автоматически пересчитываются.
+3. **Отображение в долларах США (`USD`, `$`) и фиксация курса конвертации (`B-14`):**
+   - Все суммы пополнения и внутреннего баланса отображаются в формате `$10.00`, `$19.99`, `$100.00` (`formatUsd`) без смешивания с RUB или UAH.
+   - При выборе криптовалюты, отличной от USD/USDT (`TON`, `BTC`, `ETH`, `TRX`, `BNB`, `LTC`), `convertUsdToPaymentCurrency()` конвертирует сумму из USD по курсу счёта, уведомляет пользователя о курсе и фиксирует `amountUsd`, `originalCurrency`, `originalAmountPaid`, `exchangeRateUsd`, `feeAmount` и `amountCredited` в Firestore при создании счёта. После оплаты на баланс зачисляется строго зафиксированная сумма в USD.
+4. **Визуальный стиль Telegram OutlineEmoji (`https://t.me/addemoji/OutlineEmoji`, `B-15`):**
+   - Модуль `src/bot/outlineEmoji.ts` централизованно предоставляет теги `<tg-emoji emoji-id="...">fallback</tg-emoji>` (`oe()`), символы кнопок (`oeBtn()`) и минималистичные контурные SVG (`oeSvg()`) для всех разделов: профиль, баланс, пополнение, каталог, заказы, условия/правила, настройки, уведомления и админ-панель.
+   - Название и бренд **STARS SHOP** сохранены без замены логотипа на эмодзи.
+
 

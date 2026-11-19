@@ -1,10 +1,18 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import express, { Request, Response } from 'express';
-import { getEnvConfig } from './src/config/env.ts';
+import { formatUsd, getEnvConfig } from './src/config/env.ts';
 import { firestoreRepo } from './src/db/firestore.ts';
 import { botManager, maskSecretsInText } from './src/bot/bot.ts';
+import { oe } from './src/bot/outlineEmoji.ts';
 import { FulfillmentService } from './src/services/FulfillmentService.ts';
-import { balanceService } from './src/services/BalanceService.ts';
 import {
+  balanceService,
+  calculateTopUpCommission,
+  validateTopUpAmountUsd,
+} from './src/services/BalanceService.ts';
+import {
+  convertUsdToPaymentCurrency,
   paymentProviderGateway,
   PAYMENT_PROVIDER_CATALOG,
 } from './src/services/PaymentProviders.ts';
@@ -132,19 +140,27 @@ async function bootstrap(): Promise<void> {
         if (botInstance) {
           const topUp = result.topUp;
           const providerTitle = PAYMENT_PROVIDER_CATALOG[topUp.provider].title;
+          const usdVal = topUp.amountUsd ?? topUp.amountPaid;
+          const isConverted =
+            topUp.currency !== 'USD' &&
+            topUp.currency !== 'USDT' &&
+            topUp.currency !== 'USDC';
           botInstance.telegram
             .sendMessage(
               topUp.userTelegramId,
               [
-                '✅ <b>Баланс успешно пополнен!</b>',
+                `${oe('check')} <b>Баланс успешно пополнен!</b>`,
                 '━━━━━━━━━━━━━━━━━━━━',
-                `🆔 ID пополнения: <code>${topUp.paymentId}</code>`,
-                `🏦 Провайдер: <b>${providerTitle}</b>`,
-                `💵 Сумма оплаты: <b>${topUp.amountPaid} ${topUp.currency}</b>`,
-                `📉 Комиссия (${topUp.feePercent}%): <b>−${topUp.feeAmount} ${topUp.currency}</b>`,
-                `💰 Зачислено на баланс: <b>+${topUp.amountCredited} ⭐</b>`,
+                `${oe('id')} ID пополнения: <code>${topUp.paymentId}</code>`,
+                `${oe('provider')} Провайдер: <b>${providerTitle}</b>`,
+                `${oe('usd')} Введённая сумма: <b>${formatUsd(usdVal)}</b>`,
+                isConverted
+                  ? `${oe('coin')} Валюта оплаты: <b>${topUp.amountPaid} ${topUp.currency}</b>`
+                  : '',
+                `${oe('percent')} Комиссия (${topUp.feePercent}%): <b>−${formatUsd(topUp.feeAmount)}</b>`,
+                `${oe('money')} Зачислено на баланс: <b>+${formatUsd(topUp.amountCredited)}</b>`,
                 result.newBalance !== undefined
-                  ? `💳 Текущий баланс: <b>${result.newBalance} ⭐</b>`
+                  ? `${oe('wallet')} Текущий баланс: <b>${formatUsd(result.newBalance)}</b>`
                   : '',
               ]
                 .filter(Boolean)
@@ -185,7 +201,49 @@ async function bootstrap(): Promise<void> {
     await handleProviderWebhook('xrocket', req, res);
   });
 
-  // 5. Healthcheck endpoint for Cloud Run & status verification (NOT a web store or Mini App)
+  // 4c. Server-side validation & commission calculation endpoint for the USD Top-Up screen
+  app.post('/api/topup/calculate', (req: Request, res: Response) => {
+    try {
+      const rawProvider = String(req.body?.provider || 'cryptobot').toLowerCase();
+      const provider: BalanceTopUpProvider =
+        rawProvider === 'xrocket' ? 'xrocket' : 'cryptobot';
+      const meta = PAYMENT_PROVIDER_CATALOG[provider];
+      const rawCurrency = String(
+        req.body?.currency || meta.defaultCurrency,
+      ).toUpperCase();
+      const currency = meta.supportedCurrencies.includes(rawCurrency)
+        ? rawCurrency
+        : meta.defaultCurrency;
+
+      const amountUsd = validateTopUpAmountUsd(req.body?.amountUsd);
+      const calc = calculateTopUpCommission(amountUsd, provider);
+      const conversion = convertUsdToPaymentCurrency(amountUsd, currency);
+
+      res.status(200).json({
+        ok: true,
+        provider,
+        providerTitle: meta.shortTitle,
+        currency,
+        amountUsd,
+        amountUsdFormatted: formatUsd(amountUsd),
+        feePercent: calc.feePercent,
+        feeAmount: calc.feeAmount,
+        feeAmountFormatted: formatUsd(calc.feeAmount),
+        amountCredited: calc.amountCredited,
+        amountCreditedFormatted: formatUsd(calc.amountCredited),
+        amountToPayInCurrency: conversion.convertedAmount,
+        exchangeRateUsd: conversion.exchangeRateUsd,
+      });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      res.status(400).json({
+        ok: false,
+        error: msg,
+      });
+    }
+  });
+
+  // 5. Healthcheck endpoint for Cloud Run & status verification
   app.get('/health', (_req, res) => {
     const botStatus = botManager.getStatus();
     const dbStatus = firestoreRepo.getStatus();
@@ -195,7 +253,7 @@ async function bootstrap(): Promise<void> {
     const httpStatus = dbStatus.degradedMode ? 503 : 200;
     res.status(httpStatus).json({
       service: 'telegram-digital-store-bot',
-      interfaceType: 'telegram-bot-only (no web storefront, no mini app)',
+      interfaceType: 'telegram-bot-and-usd-topup-preview',
       bot: botStatus,
       database: dbStatus,
       fulfillment: {
@@ -216,30 +274,44 @@ async function bootstrap(): Promise<void> {
     });
   });
 
-  // 6. Minimal plain-text status on root path so Cloud Run / container check succeeds
-  app.get('/', (_req, res) => {
+  const renderPlainTextStatus = (): string => {
     const botStatus = botManager.getStatus();
     const dbStatus = firestoreRepo.getStatus();
+    return [
+      '=== TELEGRAM DIGITAL STORE BOT (SERVER PROCESS) ===',
+      'Stars Shop — Пополнение внутреннего баланса в USD ($0.50 – $50,000.00) через CryptoBot (3%) и xRocket (2%).',
+      '',
+      `Статус Telegram Bot API: ${
+        botStatus.connected
+          ? `ПОДКЛЮЧЁН (@${botStatus.botUsername} — ${botStatus.botFirstName})`
+          : `ОЖИДАНИЕ ТОКЕНА (${botStatus.error || 'TELEGRAM_BOT_TOKEN не задан'})`
+      }`,
+      `Режим работы бота: ${botStatus.mode} (Polling активен: ${
+        botStatus.pollingActive ? 'Да' : 'Нет'
+      })`,
+      `База данных Firestore: проект ${dbStatus.projectId} (${dbStatus.databaseId})`,
+      `Статус хранилища: ${dbStatus.degradedMode ? 'АВАРИЙНЫЙ РЕЖИМ (НЕДОСТУПНО)' : 'АКТИВНО'}`,
+      `Проверка здоровья (JSON): /health`,
+      `Расчёт пополнения (JSON): POST /api/topup/calculate`,
+      `Webhook endpoints: POST /webhook/telegram, /webhook/cryptobot, /webhook/xrocket`,
+    ].join('\n');
+  };
 
-    res.status(200).type('text/plain; charset=utf-8').send(
-      [
-        '=== TELEGRAM DIGITAL STORE BOT (SERVER PROCESS) ===',
-        'Интерфейс магазина работает исключительно внутри Telegram-бота (без веб-магазина и без Mini Apps).',
-        '',
-        `Статус Telegram Bot API: ${
-          botStatus.connected
-            ? `ПОДКЛЮЧЁН (@${botStatus.botUsername} — ${botStatus.botFirstName})`
-            : `ОЖИДАНИЕ ТОКЕНА (${botStatus.error || 'TELEGRAM_BOT_TOKEN не задан'})`
-        }`,
-        `Режим работы бота: ${botStatus.mode} (Polling активен: ${
-          botStatus.pollingActive ? 'Да' : 'Нет'
-        })`,
-        `База данных Firestore: проект ${dbStatus.projectId} (${dbStatus.databaseId})`,
-        `Статус хранилища: ${dbStatus.degradedMode ? 'АВАРИЙНЫЙ РЕЖИМ (НЕДОСТУПНО)' : ' АКТИВНО'}`,
-        `Проверка здоровья (JSON): /health`,
-        `Webhook endpoints: POST /webhook/telegram, /webhook/cryptobot, /webhook/xrocket`,
-      ].join('\n'),
-    );
+  app.get('/status', (_req, res) => {
+    res.status(200).type('text/plain; charset=utf-8').send(renderPlainTextStatus());
+  });
+
+  // 6. Serve interactive USD Top-Up screen for browser preview or plain-text status for CLI healthchecks
+  app.get('/', (req, res) => {
+    const accept = String(req.headers.accept || '');
+    if (accept.includes('text/html')) {
+      const htmlPath = path.resolve(process.cwd(), 'index.html');
+      if (fs.existsSync(htmlPath)) {
+        res.status(200).type('text/html; charset=utf-8').send(fs.readFileSync(htmlPath, 'utf-8'));
+        return;
+      }
+    }
+    res.status(200).type('text/plain; charset=utf-8').send(renderPlainTextStatus());
   });
 
   const server = app.listen(config.port, '0.0.0.0', () => {

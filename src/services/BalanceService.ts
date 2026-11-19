@@ -1,4 +1,9 @@
 import crypto from 'crypto';
+import {
+  MAX_TOPUP_AMOUNT_USD,
+  MIN_TOPUP_AMOUNT_USD,
+  formatUsd,
+} from '../config/env.ts';
 import { firestoreRepo } from '../db/firestore.ts';
 import {
   BalanceTopUpProvider,
@@ -12,6 +17,7 @@ import {
 import {
   PAYMENT_PROVIDER_CATALOG,
   PaymentProviderGateway,
+  convertUsdToPaymentCurrency,
   normalizeCurrencyCode,
   paymentProviderGateway,
   redactSecretsFromText,
@@ -25,7 +31,7 @@ export interface CommissionCalculationResult {
 }
 
 /**
- * Converts a monetary amount to integer minor units (kopecks/cents, x100)
+ * Converts a monetary amount to integer minor units (cents, x100)
  * and validates that there are no fractional sub-cent digits.
  */
 export function toMinorUnits(amount: number): number {
@@ -45,11 +51,50 @@ export function fromMinorUnits(minorUnits: number): number {
 }
 
 /**
- * Calculates store commission and credited amount using integer minor-unit math.
+ * Validates a free-form user top-up amount in US Dollars (USD, `$`).
+ * Enforces server-side limits: $0.50 minimum to $50,000.00 maximum, max 2 decimal places.
+ */
+export function validateTopUpAmountUsd(rawInput: string | number): number {
+  let num: number;
+  if (typeof rawInput === 'string') {
+    const cleaned = rawInput.trim().replace(/^\$/, '').trim().replace(',', '.');
+    if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) {
+      throw new Error(
+        `Введите корректную сумму в USD (например: 10, 19.99, 100.00). Допустимый диапазон: от ${formatUsd(MIN_TOPUP_AMOUNT_USD)} до ${formatUsd(MAX_TOPUP_AMOUNT_USD)}.`,
+      );
+    }
+    num = Number(cleaned);
+  } else {
+    num = rawInput;
+  }
+
+  if (!Number.isFinite(num) || num <= 0) {
+    throw new Error('Сумма пополнения должна быть положительным числом.');
+  }
+
+  const minor = toMinorUnits(num);
+  const normalized = fromMinorUnits(minor);
+
+  if (normalized < MIN_TOPUP_AMOUNT_USD) {
+    throw new Error(
+      `Минимальная сумма пополнения: ${formatUsd(MIN_TOPUP_AMOUNT_USD)}.`,
+    );
+  }
+  if (normalized > MAX_TOPUP_AMOUNT_USD) {
+    throw new Error(
+      `Максимальная сумма пополнения за одну операцию: ${formatUsd(MAX_TOPUP_AMOUNT_USD)}.`,
+    );
+  }
+  return normalized;
+}
+
+/**
+ * Calculates store commission and credited amount in USD using integer minor-unit math.
+ * Commission is deducted from the entered amount (never added on top):
  * Formula: amountCredited = amountPaid * (1 - feePercent / 100)
  * Examples:
- * - CryptoBot (3%): 100 -> 97 (fee 3)
- * - xRocket (2%): 100 -> 98 (fee 2)
+ * - CryptoBot (3%): $100.00 -> $97.00 (fee $3.00)
+ * - xRocket (2%): $100.00 -> $98.00 (fee $2.00)
  */
 export function calculateTopUpCommission(
   amountPaid: number,
@@ -136,6 +181,7 @@ export class BalanceService {
 
   /**
    * Creates a new balance top-up invoice with a provider and stores a pending record in Firestore.
+   * Locks USD amount, commission, net credited USD amount, original payment currency, and exchange rate.
    */
   public async createTopUp(params: {
     telegramId: number;
@@ -145,6 +191,8 @@ export class BalanceService {
     amountPaid: number;
     currency?: string;
     network?: string;
+    convertFromUsd?: boolean;
+    customExchangeRateUsd?: number;
     expiresInSeconds?: number;
   }): Promise<BalanceTopUpRecord> {
     firestoreRepo.assertReadyForOrdersAndPayments();
@@ -158,15 +206,18 @@ export class BalanceService {
       throw new Error('Сумма пополнения должна быть положительным числом.');
     }
 
-    if (params.amountPaid < providerMeta.minAmount) {
+    // Validate cent precision & server-side min/max limits ($0.50 to $50,000.00)
+    const validatedAmountUsd = fromMinorUnits(toMinorUnits(params.amountPaid));
+
+    if (validatedAmountUsd < providerMeta.minAmount) {
       throw new Error(
-        `Минимальная сумма пополнения через ${providerMeta.shortTitle}: ${providerMeta.minAmount} ${params.currency || providerMeta.defaultCurrency}.`,
+        `Минимальная сумма пополнения через ${providerMeta.shortTitle}: ${formatUsd(providerMeta.minAmount)}.`,
       );
     }
 
-    if (params.amountPaid > providerMeta.maxAmount) {
+    if (validatedAmountUsd > providerMeta.maxAmount) {
       throw new Error(
-        `Максимальная сумма пополнения за одну операцию: ${providerMeta.maxAmount}.`,
+        `Максимальная сумма пополнения за одну операцию: ${formatUsd(providerMeta.maxAmount)}.`,
       );
     }
 
@@ -188,16 +239,34 @@ export class BalanceService {
       throw new Error('Ваш аккаунт заблокирован. Пополнение баланса недоступно.');
     }
 
-    const calc = calculateTopUpCommission(params.amountPaid, params.provider);
-    const paymentId = `topup_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    // Calculate commission in USD from the entered USD amount
+    const calc = calculateTopUpCommission(validatedAmountUsd, params.provider);
     const normalizedCurr = normalizeCurrencyCode(requestedCurrency);
+
+    // If convertFromUsd is enabled for a non-USD crypto asset (e.g. TON, BTC), convert at locked rate
+    const conversion = params.convertFromUsd
+      ? convertUsdToPaymentCurrency(
+          calc.amountPaid,
+          normalizedCurr,
+          params.customExchangeRateUsd,
+        )
+      : {
+          amountUsd: calc.amountPaid,
+          targetCurrency: normalizedCurr,
+          exchangeRateUsd: 1.0,
+          convertedAmount: calc.amountPaid,
+          requiresConversionNotice: false,
+        };
+
+    const invoiceAmountToPay = conversion.convertedAmount;
+    const paymentId = `topup_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const networkTag = params.network ? ` [${params.network}]` : '';
-    const description = `Пополнение баланса Stars Shop (${paymentId}) — к зачислению ${calc.amountCredited} ${normalizedCurr}${networkTag}`;
+    const description = `Пополнение баланса Stars Shop (${paymentId}) — сумма ${formatUsd(calc.amountPaid)}, к зачислению ${formatUsd(calc.amountCredited)}${networkTag}`;
 
     const createdInvoice = await this.gateway.createInvoice({
       paymentId,
       provider: params.provider,
-      amountPaid: calc.amountPaid,
+      amountPaid: invoiceAmountToPay,
       currency: requestedCurrency,
       network: params.network,
       description,
@@ -213,11 +282,15 @@ export class BalanceService {
       provider: params.provider,
       externalInvoiceId: createdInvoice.externalInvoiceId,
       payUrl: createdInvoice.payUrl,
-      amountPaid: calc.amountPaid,
+      amountUsd: calc.amountPaid,
+      amountPaid: invoiceAmountToPay,
       feePercent: calc.feePercent,
       feeAmount: calc.feeAmount,
       amountCredited: calc.amountCredited,
       currency: normalizedCurr,
+      originalCurrency: normalizedCurr,
+      originalAmountPaid: invoiceAmountToPay,
+      exchangeRateUsd: conversion.exchangeRateUsd,
       ...(params.network ? { network: params.network } : {}),
       paymentStatus: 'pending',
       recipientMerchantId: createdInvoice.recipientMerchantId,
@@ -255,8 +328,8 @@ export class BalanceService {
         userId,
         type: 'balance_topup_created',
         amount: calc.amountPaid,
-        currency: topUpRecord.currency,
-        details: `Создан счёт пополнения ${paymentId} через ${providerMeta.shortTitle}: сумма=${calc.amountPaid} ${topUpRecord.currency}, комиссия=${calc.feePercent}% (${calc.feeAmount}), к зачислению=${calc.amountCredited}`,
+        currency: 'USD',
+        details: `Создан счёт пополнения ${paymentId} через ${providerMeta.shortTitle}: сумма=${formatUsd(calc.amountPaid)} (${invoiceAmountToPay} ${topUpRecord.currency}, курс=${conversion.exchangeRateUsd}), комиссия=${calc.feePercent}% (${formatUsd(calc.feeAmount)}), к зачислению=${formatUsd(calc.amountCredited)}`,
         createdAt: now,
       });
     });
@@ -660,8 +733,9 @@ export class BalanceService {
       }
 
       // Guard against tampering with amountCredited after invoice creation
+      const lockedUsdBase = freshTopUp.amountUsd ?? freshTopUp.amountPaid;
       const expectedCalc = calculateTopUpCommission(
-        freshTopUp.amountPaid,
+        lockedUsdBase,
         freshTopUp.provider,
       );
       if (

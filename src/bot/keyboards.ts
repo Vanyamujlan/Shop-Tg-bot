@@ -9,30 +9,38 @@ import {
   StoreUser,
 } from '../types.ts';
 import { CATEGORY_LABELS, ORDER_STATUS_LABELS } from '../constants.ts';
+import { formatUsd } from '../config/env.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
   XROCKET_SUPPORTED_ASSETS,
+  convertUsdToPaymentCurrency,
 } from '../services/PaymentProviders.ts';
 import { calculateTopUpCommission } from '../services/BalanceService.ts';
 import { ProductKeyStockSummary } from '../services/DigitalKeyService.ts';
+import { oeBtn } from './outlineEmoji.ts';
 
 export function buildMainMenuKeyboard(isAdmin = false) {
   const rows = [
-    [Markup.button.callback('⭐ Купить Stars', 'cat:stars')],
-    [Markup.button.callback('💎 Купить Premium', 'cat:premium')],
-    [Markup.button.callback('🎁 Купить Gifts', 'cat:gifts')],
+    [Markup.button.callback(`${oeBtn('stars')} Купить Stars`, 'cat:stars')],
+    [Markup.button.callback(`${oeBtn('premium')} Купить Premium`, 'cat:premium')],
+    [Markup.button.callback(`${oeBtn('gifts')} Купить Gifts`, 'cat:gifts')],
     [
-      Markup.button.callback('📦 Мои заказы', 'menu:orders'),
-      Markup.button.callback('👤 Мой профиль', 'menu:profile'),
+      Markup.button.callback(`${oeBtn('orders')} Мои заказы`, 'menu:orders'),
+      Markup.button.callback(`${oeBtn('profile')} Мой профиль`, 'menu:profile'),
     ],
     [
-      Markup.button.callback('💳 Пополнить баланс', 'menu:topup'),
-      Markup.button.callback('💬 Поддержка', 'menu:support'),
+      Markup.button.callback(`${oeBtn('topup')} Пополнить баланс`, 'menu:topup'),
+      Markup.button.callback(`${oeBtn('support')} Поддержка`, 'menu:support'),
     ],
   ];
 
   if (isAdmin) {
-    rows.push([Markup.button.callback('🛠 Админ-панель магазина', 'adm:home')]);
+    rows.push([
+      Markup.button.callback(
+        `${oeBtn('admin')} Админ-панель магазина`,
+        'adm:home',
+      ),
+    ]);
   }
 
   return Markup.inlineKeyboard(rows);
@@ -40,9 +48,19 @@ export function buildMainMenuKeyboard(isAdmin = false) {
 
 export function buildUserProfileKeyboard() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback('💳 Пополнить баланс', 'menu:topup')],
-    [Markup.button.callback('📜 История пополнений', 'topup:history')],
-    [Markup.button.callback('🏠 Вернуться в главное меню', 'menu:home')],
+    [Markup.button.callback(`${oeBtn('topup')} Пополнить баланс`, 'menu:topup')],
+    [
+      Markup.button.callback(
+        `${oeBtn('history')} История пополнений`,
+        'topup:history',
+      ),
+    ],
+    [
+      Markup.button.callback(
+        `${oeBtn('home')} Вернуться в главное меню`,
+        'menu:home',
+      ),
+    ],
   ]);
 }
 
@@ -52,20 +70,32 @@ export function buildUserProfileKeyboard() {
 export function buildTopUpStep1ProviderKeyboard() {
   return Markup.inlineKeyboard([
     [
-      Markup.button.callback('💎 CryptoBot [3%]', 'topup:prov:cryptobot'),
-      Markup.button.callback('🚀 xRocket [2%]', 'topup:prov:xrocket'),
+      Markup.button.callback(
+        `${oeBtn('cryptobot')} CryptoBot [3%]`,
+        'topup:prov:cryptobot',
+      ),
+      Markup.button.callback(
+        `${oeBtn('xrocket')} xRocket [2%]`,
+        'topup:prov:xrocket',
+      ),
     ],
-    [Markup.button.callback('📜 История пополнений', 'topup:history')],
-    [Markup.button.callback('« Назад', 'menu:profile')],
+    [
+      Markup.button.callback(
+        `${oeBtn('history')} История пополнений`,
+        'topup:history',
+      ),
+    ],
+    [Markup.button.callback(`${oeBtn('back')} Назад`, 'menu:profile')],
   ]);
 }
 
 /**
- * Шаг 2/3: Выбор или ввод суммы пополнения для выбранного провайдера.
+ * Шаг 2/3: Свободный ввод суммы пополнения в USD ($) без фиксированных кнопок сумм.
+ * Позволяет переключать способ оплаты с мгновенным пересчётом комиссии.
  */
 export function buildTopUpStep2AmountKeyboard(
   provider: BalanceTopUpProvider,
-  selectedAmount = 100,
+  selectedAmount?: number,
   selectedCurrency?: string,
 ) {
   const meta = PAYMENT_PROVIDER_CATALOG[provider];
@@ -73,50 +103,72 @@ export function buildTopUpStep2AmountKeyboard(
     selectedCurrency && meta.supportedCurrencies.includes(selectedCurrency)
       ? selectedCurrency
       : meta.defaultCurrency;
-  const calc = calculateTopUpCommission(selectedAmount, provider);
 
-  const amountRows = [];
-  const amounts = meta.presetAmounts;
-  for (let i = 0; i < amounts.length; i += 3) {
-    const slice = amounts.slice(i, i + 3);
-    amountRows.push(
-      slice.map((amt) =>
-        Markup.button.callback(
-          `${amt === selectedAmount ? '🔘 ' : ''}${amt} ${currency}`,
-          `topup:amt:${provider}:${currency}:${amt}`,
-        ),
-      ),
+  const hasValidAmount =
+    typeof selectedAmount === 'number' &&
+    Number.isFinite(selectedAmount) &&
+    selectedAmount >= meta.minAmount &&
+    selectedAmount <= meta.maxAmount;
+
+  const amountForSwitch = hasValidAmount ? selectedAmount : 0;
+
+  const providerSwitchRow = (['cryptobot', 'xrocket'] as const).map((provId) => {
+    const p = PAYMENT_PROVIDER_CATALOG[provId];
+    const isCurrent = provId === provider;
+    const icon = provId === 'cryptobot' ? oeBtn('cryptobot') : oeBtn('xrocket');
+    const targetCallback =
+      amountForSwitch > 0
+        ? `topup:amt:${provId}:${p.defaultCurrency}:${amountForSwitch}`
+        : `topup:prov:${provId}`;
+    return Markup.button.callback(
+      `${isCurrent ? '● ' : ''}${icon} ${p.shortTitle} [${p.feePercent}%]`,
+      targetCallback,
     );
-  }
+  });
 
-  const actionButton =
-    provider === 'xrocket'
-      ? Markup.button.callback(
-          `🪙 Выбрать монету и сеть (${calc.amountPaid} → +${calc.amountCredited})`,
-          `topup:xr_curr:${calc.amountPaid}`,
-        )
-      : Markup.button.callback(
-          `💳 Создать счёт ${calc.amountPaid} ${currency} (к зачислению +${calc.amountCredited})`,
-          `topup:create:cryptobot:${currency}:${calc.amountPaid}`,
-        );
+  const rows: Array<Array<ReturnType<typeof Markup.button.callback>>> = [
+    providerSwitchRow,
+  ];
 
-  return Markup.inlineKeyboard([
-    ...amountRows,
-    [
+  if (hasValidAmount) {
+    const calc = calculateTopUpCommission(selectedAmount, provider);
+    const actionButton =
+      provider === 'xrocket'
+        ? Markup.button.callback(
+            `${oeBtn('currency')} Выбрать монету и сеть (${formatUsd(calc.amountPaid)} → +${formatUsd(calc.amountCredited)})`,
+            `topup:xr_curr:${calc.amountPaid}`,
+          )
+        : Markup.button.callback(
+            `${oeBtn('topup')} Создать счёт ${formatUsd(calc.amountPaid)} (к зачислению +${formatUsd(calc.amountCredited)})`,
+            `topup:create:cryptobot:${currency}:${calc.amountPaid}`,
+          );
+
+    rows.push([actionButton]);
+    rows.push([
       Markup.button.callback(
-        '✏️ Ввести сумму вручную',
+        `${oeBtn('edit')} Изменить сумму ($)`,
         `topup:custom:${provider}:${currency}`,
       ),
-    ],
-    [actionButton],
-    [Markup.button.callback('« Назад', 'menu:topup')],
-  ]);
+    ]);
+  } else {
+    rows.push([
+      Markup.button.callback(
+        `${oeBtn('edit')} Ввести сумму в USD ($)`,
+        `topup:custom:${provider}:${currency}`,
+      ),
+    ]);
+  }
+
+  rows.push([Markup.button.callback(`${oeBtn('back')} Назад`, 'menu:topup')]);
+
+  return Markup.inlineKeyboard(rows);
 }
 
 /**
  * Шаг 3/3 (для xRocket): Выбор монеты и сети оплаты перед созданием счёта.
+ * Показывает конвертацию из USD, если монета отличается от USDT/USDC.
  */
-export function buildTopUpStep3XRocketCurrencyKeyboard(amount: number) {
+export function buildTopUpStep3XRocketCurrencyKeyboard(amountUsd: number) {
   const assetButtons: Array<ReturnType<typeof Markup.button.callback>> = [];
 
   const coinIcons: Record<string, string> = {
@@ -131,12 +183,16 @@ export function buildTopUpStep3XRocketCurrencyKeyboard(amount: number) {
 
   for (const asset of XROCKET_SUPPORTED_ASSETS) {
     const icon = coinIcons[asset.code] || '🪙';
+    const conv = convertUsdToPaymentCurrency(amountUsd, asset.code);
+    const amountSuffix = conv.requiresConversionNotice
+      ? ` • ~${conv.convertedAmount} ${asset.code}`
+      : '';
     for (const net of asset.networks) {
       const netCode = encodeURIComponent(net);
       assetButtons.push(
         Markup.button.callback(
-          `${icon} ${asset.code} (${net})`,
-          `topup:xr_pay:${asset.code}:${netCode}:${amount}`,
+          `${icon} ${asset.code} (${net})${amountSuffix}`,
+          `topup:xr_pay:${asset.code}:${netCode}:${amountUsd}`,
         ),
       );
     }
@@ -147,76 +203,28 @@ export function buildTopUpStep3XRocketCurrencyKeyboard(amount: number) {
     rows.push(assetButtons.slice(i, i + 2));
   }
 
-  rows.push([Markup.button.callback('« Назад', `topup:prov:xrocket`)]);
+  rows.push([
+    Markup.button.callback(
+      `${oeBtn('back')} Назад`,
+      `topup:amt:xrocket:USDT:${amountUsd}`,
+    ),
+  ]);
   return Markup.inlineKeyboard(rows);
 }
 
 /**
- * Совместимая клавиатура выбора пополнения баланса.
+ * Клавиатура меню пополнения баланса со свободным вводом суммы в USD (без фиксированных кнопок сумм).
  */
 export function buildTopUpMenuKeyboard(
   selectedProvider: BalanceTopUpProvider = 'cryptobot',
   selectedCurrency?: string,
-  selectedAmount = 100,
+  selectedAmount?: number,
 ) {
-  const meta = PAYMENT_PROVIDER_CATALOG[selectedProvider];
-  const currency =
-    selectedCurrency && meta.supportedCurrencies.includes(selectedCurrency)
-      ? selectedCurrency
-      : meta.defaultCurrency;
-  const calc = calculateTopUpCommission(selectedAmount, selectedProvider);
-
-  const providerRow = (['cryptobot', 'xrocket'] as const).map((provId) => {
-    const p = PAYMENT_PROVIDER_CATALOG[provId];
-    const activePrefix = provId === selectedProvider ? '✅ ' : '';
-    return Markup.button.callback(
-      `${activePrefix}${p.shortTitle} [${p.feePercent}%]`,
-      `topup:prov:${provId}`,
-    );
-  });
-
-  const amountRows = [];
-  const amounts = meta.presetAmounts;
-  for (let i = 0; i < amounts.length; i += 3) {
-    const slice = amounts.slice(i, i + 3);
-    amountRows.push(
-      slice.map((amt) =>
-        Markup.button.callback(
-          `${amt === selectedAmount ? '🔘 ' : ''}${amt} ${currency}`,
-          `topup:amt:${selectedProvider}:${currency}:${amt}`,
-        ),
-      ),
-    );
-  }
-
-  const payRow =
-    selectedProvider === 'xrocket'
-      ? [
-          Markup.button.callback(
-            `🪙 Выбрать монету и сеть (${calc.amountPaid} → +${calc.amountCredited})`,
-            `topup:xr_curr:${calc.amountPaid}`,
-          ),
-        ]
-      : [
-          Markup.button.callback(
-            `💳 Оплатить ${calc.amountPaid} ${currency} (к зачислению ${calc.amountCredited})`,
-            `topup:create:${selectedProvider}:${currency}:${calc.amountPaid}`,
-          ),
-        ];
-
-  return Markup.inlineKeyboard([
-    providerRow,
-    ...amountRows,
-    [
-      Markup.button.callback(
-        '✏️ Ввести свою сумму',
-        `topup:custom:${selectedProvider}:${currency}`,
-      ),
-    ],
-    payRow,
-    [Markup.button.callback('📜 История пополнений', 'topup:history')],
-    [Markup.button.callback('« Назад', 'menu:profile')],
-  ]);
+  return buildTopUpStep2AmountKeyboard(
+    selectedProvider,
+    selectedAmount,
+    selectedCurrency,
+  );
 }
 
 /**
@@ -228,17 +236,22 @@ export function buildTopUpMenuKeyboard(
 export function buildTopUpInvoiceKeyboard(topUp: BalanceTopUpRecord) {
   const rows = [];
   if (topUp.payUrl && topUp.paymentStatus === 'pending') {
-    rows.push([Markup.button.url('💳 Оплатить', topUp.payUrl)]);
+    rows.push([
+      Markup.button.url(
+        `${oeBtn('topup')} Оплатить (${formatUsd(topUp.amountUsd ?? topUp.amountPaid)})`,
+        topUp.payUrl,
+      ),
+    ]);
   }
   if (topUp.paymentStatus === 'pending') {
     rows.push([
       Markup.button.callback(
-        '🔄 Проверить оплату',
+        `${oeBtn('refresh')} Проверить оплату`,
         `topup:check:${topUp.paymentId}`,
       ),
     ]);
   }
-  rows.push([Markup.button.callback('« Назад', 'menu:topup')]);
+  rows.push([Markup.button.callback(`${oeBtn('back')} Назад`, 'menu:topup')]);
   return Markup.inlineKeyboard(rows);
 }
 

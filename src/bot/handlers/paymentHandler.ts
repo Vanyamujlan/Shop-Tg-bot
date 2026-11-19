@@ -4,6 +4,8 @@ import { ProductService } from '../../services/ProductService.ts';
 import { PaymentService } from '../../services/PaymentService.ts';
 import { FulfillmentService } from '../../services/FulfillmentService.ts';
 import { balanceService } from '../../services/BalanceService.ts';
+import { formatUsd } from '../../config/env.ts';
+import { oe } from '../outlineEmoji.ts';
 import { isDuplicateCallbackClick, safeAnswerCbQuery } from './userHandler.ts';
 import { escapeHtml, formatOrderDetailMessage } from '../formatters.ts';
 import { buildBackToMenuKeyboard } from '../keyboards.ts';
@@ -35,7 +37,7 @@ export function registerPaymentHandlers(bot: Telegraf): void {
 
       await safeAnswerCbQuery(
         ctx,
-        `Оплачено с внутреннего баланса! Остаток: ${result.newBalance}`,
+        `Оплачено с внутреннего баланса! Остаток: ${formatUsd(result.newBalance)}`,
       );
 
       const orderInFulfillment = await FulfillmentService.initiateFulfillment(
@@ -45,12 +47,12 @@ export function registerPaymentHandlers(bot: Telegraf): void {
 
       await ctx.reply(
         [
-          '✅ <b>Заказ успешно оплачен с внутреннего баланса!</b>',
-          `💰 <b>Остаток на внутреннем балансе:</b> <code>${result.newBalance}</code>`,
+          `${oe('check')} <b>Заказ успешно оплачен с внутреннего баланса!</b>`,
+          `${oe('money')} <b>Остаток на внутреннем балансе:</b> <code>${formatUsd(result.newBalance)}</code>`,
           '',
           formatOrderDetailMessage(orderInFulfillment),
           '',
-          '🚚 <b>Что дальше:</b> ваш заказ передан на выдачу. Как только товар будет выдан, бот пришлёт вам уведомление в этот чат.',
+          `${oe('rocket')} <b>Что дальше:</b> ваш заказ передан на выдачу. Как только товар будет выдан, бот пришлёт вам уведомление в этот чат.`,
         ].join('\n'),
         {
           parse_mode: 'HTML',

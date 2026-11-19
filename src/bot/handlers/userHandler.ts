@@ -4,7 +4,12 @@ import { StorageUnavailableError } from '../../db/firestore.ts';
 import { UserService } from '../../services/UserService.ts';
 import { ProductService } from '../../services/ProductService.ts';
 import { OrderService } from '../../services/OrderService.ts';
-import { balanceService } from '../../services/BalanceService.ts';
+import {
+  balanceService,
+  validateTopUpAmountUsd,
+} from '../../services/BalanceService.ts';
+import { formatUsd } from '../../config/env.ts';
+import { oe, oeBtn } from '../outlineEmoji.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
   paymentProviderGateway,
@@ -46,6 +51,7 @@ import {
 interface UserTopUpCustomSession {
   provider: BalanceTopUpProvider;
   currency: string;
+  amountUsd?: number;
   createdAt: number;
 }
 
@@ -188,7 +194,7 @@ async function renderTopUpStep2(
   ctx: Context,
   provider: BalanceTopUpProvider,
   currency?: string,
-  amountPaid = 100,
+  amountPaid?: number,
 ): Promise<void> {
   if (!ctx.from) return;
   const meta = PAYMENT_PROVIDER_CATALOG[provider];
@@ -198,10 +204,11 @@ async function renderTopUpStep2(
       : meta.defaultCurrency;
   const providerConfigured = paymentProviderGateway.isProviderConfigured(provider);
 
-  // Allow user to type custom amount directly in chat on Step 2/3
+  // Allow user to type custom USD amount directly in chat on Step 2
   setUserTopUpSession(ctx.from.id, {
     provider,
     currency: resolvedCurrency,
+    amountUsd: amountPaid,
     createdAt: Date.now(),
   });
 
@@ -402,8 +409,14 @@ export function registerUserHandlers(bot: Telegraf): void {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, `topup:prov:${provider}`)) {
       return;
     }
+    const existingSession = getUserTopUpSession(ctx.from.id);
     const meta = PAYMENT_PROVIDER_CATALOG[provider];
-    await renderTopUpStep2(ctx, provider, meta.defaultCurrency, 100);
+    await renderTopUpStep2(
+      ctx,
+      provider,
+      meta.defaultCurrency,
+      existingSession?.amountUsd,
+    );
   });
 
   // Callback: Выбор валюты пополнения (topup:curr:<provider>:<currency>)
@@ -418,11 +431,17 @@ export function registerUserHandlers(bot: Telegraf): void {
       ) {
         return;
       }
-      await renderTopUpStep2(ctx, provider, currency, 100);
+      const existingSession = getUserTopUpSession(ctx.from.id);
+      await renderTopUpStep2(
+        ctx,
+        provider,
+        currency,
+        existingSession?.amountUsd,
+      );
     },
   );
 
-  // Callback: Выбор суммы пополнения на Шаге 2/3 (topup:amt:<provider>:<currency>:<amount>)
+  // Callback: Пересчёт введённой суммы пополнения при смене провайдера на Шаге 2/3 (topup:amt:<provider>:<currency>:<amount>)
   bot.action(
     /^topup:amt:(cryptobot|xrocket):([A-Z0-9]+):([0-9.]+)$/,
     async (ctx) => {
@@ -442,7 +461,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     },
   );
 
-  // Callback: Шаг 3/3 (для xRocket) — экран выбора монеты и сети (topup:xr_curr:<amount>)
+  // Callback: Шаг 3/3 (для xRocket) — экран выбора монеты и сети (topup:xr_curr:<amountUsd>)
   bot.action(/^topup:xr_curr:([0-9.]+)$/, async (ctx) => {
     const amountPaid = Number(ctx.match[1]);
     if (
@@ -454,18 +473,18 @@ export function registerUserHandlers(bot: Telegraf): void {
     await renderTopUpStep3XRocketCurrency(ctx, amountPaid);
   });
 
-  // Callback: Шаг 3/3 (для xRocket) — создание счёта по выбранной монете и сети (topup:xr_pay:<currency>:<network>:<amount>)
+  // Callback: Шаг 3/3 (для xRocket) — создание счёта по выбранной монете и сети (topup:xr_pay:<currency>:<network>:<amountUsd>)
   bot.action(
     /^topup:xr_pay:([A-Z0-9]+):([^:]+):([0-9.]+)$/,
     async (ctx) => {
       const currency = ctx.match[1];
       const network = decodeURIComponent(ctx.match[2]);
-      const amountPaid = Number(ctx.match[3]);
+      const amountUsd = Number(ctx.match[3]);
       if (
         !ctx.from ||
         isDuplicateCallbackClick(
           ctx.from.id,
-          `topup:xr_pay:${currency}:${network}:${amountPaid}`,
+          `topup:xr_pay:${currency}:${network}:${amountUsd}`,
           1500,
         )
       ) {
@@ -479,9 +498,10 @@ export function registerUserHandlers(bot: Telegraf): void {
           username: ctx.from.username,
           firstName: ctx.from.first_name,
           provider: 'xrocket',
-          amountPaid,
+          amountPaid: amountUsd,
           currency,
           network,
+          convertFromUsd: true,
         });
 
         await safeAnswerCbQuery(ctx, 'Счёт xRocket создан!');
@@ -497,7 +517,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     },
   );
 
-  // Callback: Ввод произвольной суммы пополнения (topup:custom:<provider>:<currency>)
+  // Callback: Сброс и повторный свободный ввод суммы в USD (topup:custom:<provider>:<currency>)
   bot.action(
     /^topup:custom:(cryptobot|xrocket):([A-Z0-9]+)$/,
     async (ctx) => {
@@ -505,37 +525,11 @@ export function registerUserHandlers(bot: Telegraf): void {
       const currency = ctx.match[2];
       if (!ctx.from) return;
 
-      const meta = PAYMENT_PROVIDER_CATALOG[provider];
-      setUserTopUpSession(ctx.from.id, {
-        provider,
-        currency,
-        createdAt: Date.now(),
-      });
-
-      await safeRespondOrEdit(
-        ctx,
-        [
-          '💵 <b>СУММА ПОПОЛНЕНИЯ</b>',
-          '<i>Шаг 2/3</i>',
-          '',
-          `🏦 Способ оплаты: <b>${escapeHtml(meta.shortTitle)}</b> [${meta.feePercent}%]`,
-          `📝 <b>Введите сумму в ${escapeHtml(currency)} (минимум ${meta.minAmount} ${escapeHtml(currency)}):</b>`,
-          '',
-          'Отправьте число в чат (например: <code>100</code>):',
-        ].join('\n'),
-        Markup.inlineKeyboard([
-          [
-            Markup.button.callback(
-              '« Назад',
-              `topup:prov:${provider}`,
-            ),
-          ],
-        ]),
-      );
+      await renderTopUpStep2(ctx, provider, currency, undefined);
     },
   );
 
-  // Callback: Создание счёта у провайдера (topup:create:<provider>:<currency>:<amount>)
+  // Callback: Создание счёта у провайдера (topup:create:<provider>:<currency>:<amountUsd>)
   bot.action(
     /^topup:create:(cryptobot|xrocket):([A-Z0-9]+):([0-9.]+)$/,
     async (ctx) => {
@@ -562,6 +556,7 @@ export function registerUserHandlers(bot: Telegraf): void {
           provider,
           amountPaid,
           currency,
+          convertFromUsd: true,
         });
 
         await safeAnswerCbQuery(ctx, 'Счёт на пополнение успешно создан!');
@@ -600,7 +595,7 @@ export function registerUserHandlers(bot: Telegraf): void {
           ctx,
           verifyRes.duplicate
             ? 'Этот счёт уже был оплачен и зачислен ранее.'
-            : `Оплата подтверждена! На баланс зачислено +${verifyRes.topUp.amountCredited}.`,
+            : `Оплата подтверждена! На баланс зачислено +${formatUsd(verifyRes.topUp.amountCredited)}.`,
           true,
         );
       } else if (verifyRes.status === 'pending') {
@@ -664,7 +659,7 @@ export function registerUserHandlers(bot: Telegraf): void {
       ctx,
       formatSupportedCryptoInfoMessage(),
       Markup.inlineKeyboard([
-        [Markup.button.callback('« Назад', 'menu:topup')],
+        [Markup.button.callback(`${oeBtn('back')} Назад`, 'menu:topup')],
       ]),
     );
   });
@@ -682,8 +677,8 @@ export function registerUserHandlers(bot: Telegraf): void {
       ctx,
       formatUserTopUpHistoryMessage(topUps, currentBalance),
       Markup.inlineKeyboard([
-        [Markup.button.callback('💳 Пополнить баланс', 'menu:topup')],
-        [Markup.button.callback('« Назад', 'menu:profile')],
+        [Markup.button.callback(`${oeBtn('card')} Пополнить баланс`, 'menu:topup')],
+        [Markup.button.callback(`${oeBtn('back')} Назад`, 'menu:profile')],
       ]),
     );
   });
@@ -829,7 +824,7 @@ export function registerUserHandlers(bot: Telegraf): void {
     }
   });
 
-  // Обработка текстового ввода пользовательской суммы пополнения на Шаге 2/3
+  // Обработка свободного текстового ввода пользовательской суммы пополнения в USD ($) на Шаге 2/3
   bot.on('text', async (ctx, next) => {
     if (!ctx.from) return next();
     const session = getUserTopUpSession(ctx.from.id);
@@ -841,26 +836,19 @@ export function registerUserHandlers(bot: Telegraf): void {
       return next();
     }
 
-    const parsedAmount = Number(text.replace(',', '.'));
-    const meta = PAYMENT_PROVIDER_CATALOG[session.provider];
-    if (
-      !Number.isFinite(parsedAmount) ||
-      parsedAmount < meta.minAmount ||
-      parsedAmount > meta.maxAmount
-    ) {
-      await ctx.reply(
-        `⚠️ Введите корректное число от <code>${meta.minAmount}</code> до <code>${meta.maxAmount} ${escapeHtml(session.currency)}</code>.`,
-        { parse_mode: 'HTML' },
+    try {
+      const validatedAmountUsd = validateTopUpAmountUsd(text);
+      await renderTopUpStep2(
+        ctx,
+        session.provider,
+        session.currency,
+        validatedAmountUsd,
       );
-      return;
-    }
-
-    const roundedAmount = Number(parsedAmount.toFixed(2));
-    clearUserTopUpSession(ctx.from.id);
-    if (session.provider === 'xrocket') {
-      await renderTopUpStep3XRocketCurrency(ctx, roundedAmount);
-    } else {
-      await renderTopUpStep2(ctx, session.provider, session.currency, roundedAmount);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      await ctx.reply(`${oe('warning')} ${escapeHtml(msg)}`, {
+        parse_mode: 'HTML',
+      });
     }
   });
 }

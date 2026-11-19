@@ -35,6 +35,7 @@ import {
 import {
   BalanceService,
   calculateTopUpCommission,
+  validateTopUpAmountUsd,
 } from '../services/BalanceService.ts';
 import {
   PaymentProviderGateway,
@@ -43,9 +44,31 @@ import {
   buildXRocketApiV1Url,
   computeCryptoBotWebhookSignature,
   computeXRocketWebhookSignature,
+  convertUsdToPaymentCurrency,
   type HttpTransportRequest,
   type HttpTransportResponse,
 } from '../services/PaymentProviders.ts';
+import {
+  formatUsd,
+  MAX_TOPUP_AMOUNT_USD,
+  MIN_TOPUP_AMOUNT_USD,
+} from '../config/env.ts';
+import {
+  OUTLINE_EMOJI_REGISTRY,
+  oe,
+  oeBtn,
+  oeSvg,
+} from '../bot/outlineEmoji.ts';
+import {
+  formatCatalogOverviewMessage,
+  formatHelpMessage,
+  formatTermsMessage,
+  formatTopUpInvoiceCardMessage,
+  formatTopUpStep2AmountMessage,
+  formatUserProfileMessage,
+  formatUserTopUpHistoryMessage,
+  formatWelcomeMessage,
+} from '../bot/formatters.ts';
 import {
   DigitalKeyService,
   DuplicateDigitalKeyError,
@@ -1811,7 +1834,7 @@ async function runFullAuditTestSuite(): Promise<void> {
   await runTest(
     'B-01',
     'Payments',
-    'Проверка комиссий (CryptoBot 3%, xRocket 2%), копеечной точности и минималистичного 3-шагового интерфейса пополнения',
+    'Проверка комиссий в USD (CryptoBot 3%, xRocket 2%), копеечной точности и минималистичного 3-шагового интерфейса пополнения без пресетов',
     async () => {
       const cb100 = calculateTopUpCommission(100, 'cryptobot');
       assert.equal(cb100.amountPaid, 100);
@@ -1830,26 +1853,30 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(cbFractional.feeAmount, 7.52);
       assert.equal(cbFractional.amountCredited, 242.98);
 
-      // Проверка кнопки «💳 Пополнить баланс» в профиле пользователя
+      // Проверка кнопки «Пополнить баланс» в профиле пользователя
       const profileKbJson = JSON.stringify(buildUserProfileKeyboard());
       assert.ok(
-        profileKbJson.includes('💳 Пополнить баланс') &&
+        profileKbJson.includes('Пополнить баланс') &&
           profileKbJson.includes('menu:topup'),
-        'Кнопка «💳 Пополнить баланс» (menu:topup) должна присутствовать в профиле',
+        'Кнопка «Пополнить баланс» (menu:topup) должна присутствовать в профиле',
       );
 
-      // Проверка каталога провайдеров (ровно 2 поддерживаемых провайдера: cryptobot и xrocket)
+      // Проверка каталога провайдеров (ровно 2 поддерживаемых провайдера: cryptobot и xrocket, presetAmounts пуст)
       assert.deepEqual(
         Object.keys(PAYMENT_PROVIDER_CATALOG).sort(),
         ['cryptobot', 'xrocket'],
       );
       assert.equal(PAYMENT_PROVIDER_CATALOG.cryptobot.feePercent, 3);
       assert.equal(PAYMENT_PROVIDER_CATALOG.xrocket.feePercent, 2);
+      assert.equal(PAYMENT_PROVIDER_CATALOG.cryptobot.defaultCurrency, 'USD');
+      assert.equal(PAYMENT_PROVIDER_CATALOG.xrocket.defaultCurrency, 'USDT');
+      assert.deepEqual(PAYMENT_PROVIDER_CATALOG.cryptobot.presetAmounts, []);
+      assert.deepEqual(PAYMENT_PROVIDER_CATALOG.xrocket.presetAmounts, []);
 
       // Проверка 3-шагового минималистичного интерфейса
       const step1Kb = JSON.stringify(buildTopUpStep1ProviderKeyboard());
-      assert.ok(step1Kb.includes('💎 CryptoBot [3%]'));
-      assert.ok(step1Kb.includes('🚀 xRocket [2%]'));
+      assert.ok(step1Kb.includes('CryptoBot [3%]'));
+      assert.ok(step1Kb.includes('xRocket [2%]'));
 
       const step2Kb = JSON.stringify(
         buildTopUpStep2AmountKeyboard('xrocket', 100, 'USDT'),
@@ -1862,14 +1889,14 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.ok(step3XrKb.includes('USDT (TON)'));
       assert.ok(step3XrKb.includes('BTC (Bitcoin)'));
 
-      return 'Комиссии провайдеров проверены: CryptoBot 100 -> 97 (3%), xRocket 100 -> 98 (2%), 3-шаговый минималистичный UI активен.';
+      return 'Комиссии провайдеров в USD проверены: CryptoBot $100.00 -> $97.00 (3%), xRocket $100.00 -> $98.00 (2%), пресеты удалены.';
     },
   );
 
   await runTest(
     'B-02',
     'Payments',
-    'Успешное пополнение баланса через CryptoBot (создание счёта -> подписанный webhook -> серверная проверка API -> атомарное зачисление)',
+    'Успешное пополнение баланса в USD через CryptoBot (создание счёта -> подписанный webhook -> серверная проверка API -> атомарное зачисление)',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
 
@@ -1887,7 +1914,7 @@ async function runFullAuditTestSuite(): Promise<void> {
                 invoice_id: 910001,
                 status: 'active',
                 amount: body.amount,
-                fiat: 'RUB',
+                fiat: 'USD',
                 currency_type: 'fiat',
                 bot_invoice_url: 'https://t.me/CryptoBot?start=IV910001',
                 payload: body.payload,
@@ -1907,7 +1934,7 @@ async function runFullAuditTestSuite(): Promise<void> {
                     invoice_id: 910001,
                     status: 'paid',
                     amount: '100.00',
-                    fiat: 'RUB',
+                    fiat: 'USD',
                     currency_type: 'fiat',
                     payload: created.paymentId,
                     paid_at: new Date().toISOString(),
@@ -1929,11 +1956,12 @@ async function runFullAuditTestSuite(): Promise<void> {
         firstName: buyer1.first_name,
         provider: 'cryptobot',
         amountPaid: 100,
-        currency: 'RUB',
+        currency: 'USD',
       });
 
       assert.equal(created.paymentStatus, 'pending');
       assert.equal(created.amountPaid, 100);
+      assert.equal(created.amountUsd, 100);
       assert.equal(created.feePercent, 3);
       assert.equal(created.feeAmount, 3);
       assert.equal(created.amountCredited, 97);
@@ -1941,9 +1969,9 @@ async function runFullAuditTestSuite(): Promise<void> {
 
       // Проверка минималистичной клавиатуры созданного счёта (3 кнопки)
       const invKb = JSON.stringify(buildTopUpInvoiceKeyboard(created));
-      assert.ok(invKb.includes('💳 Оплатить'));
-      assert.ok(invKb.includes('🔄 Проверить оплату'));
-      assert.ok(invKb.includes('« Назад'));
+      assert.ok(invKb.includes('Оплатить'));
+      assert.ok(invKb.includes('Проверить оплату'));
+      assert.ok(invKb.includes('Назад'));
 
       const webhookBody = JSON.stringify({
         update_id: 5001,
@@ -1952,7 +1980,7 @@ async function runFullAuditTestSuite(): Promise<void> {
           invoice_id: 910001,
           status: 'paid',
           amount: '100.00',
-          fiat: 'RUB',
+          fiat: 'USD',
           currency_type: 'fiat',
           payload: created.paymentId,
         },
@@ -1978,7 +2006,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(savedTopUp?.paymentStatus, 'paid');
       assert.ok(savedTopUp?.paidAt);
 
-      return `Счёт ${created.paymentId} на 100 RUB успешно подтверждён через серверный API CryptoBot, зачислено 97 ⭐ (комиссия 3%).`;
+      return `Счёт ${created.paymentId} на $100.00 USD успешно подтверждён через серверный API CryptoBot, зачислено $97.00 (комиссия 3%).`;
     },
   );
 
@@ -2004,7 +2032,7 @@ async function runFullAuditTestSuite(): Promise<void> {
                 invoice_id: 910002,
                 status: 'active',
                 amount: body.amount,
-                fiat: 'RUB',
+                fiat: 'USD',
                 currency_type: 'fiat',
                 bot_invoice_url: 'https://t.me/CryptoBot?start=IV910002',
                 payload: body.payload,
@@ -2024,7 +2052,7 @@ async function runFullAuditTestSuite(): Promise<void> {
         username: buyer1.username,
         provider: 'cryptobot',
         amountPaid: 500,
-        currency: 'RUB',
+        currency: 'USD',
       });
 
       const forgedRawBody = JSON.stringify({
@@ -2033,7 +2061,7 @@ async function runFullAuditTestSuite(): Promise<void> {
           invoice_id: 910002,
           status: 'paid',
           amount: '500.00',
-          fiat: 'RUB',
+          fiat: 'USD',
           currency_type: 'fiat',
           payload: created.paymentId,
         },
@@ -2058,7 +2086,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(verifyApiCalled, 0);
       assert.equal(await service.getBalance(buyer1.id), 0);
 
-      return 'Поддельные вебхуки CryptoBot и xRocket отклонены с INVALID_WEBHOOK_SIGNATURE, баланс остался 0.';
+      return 'Поддельные вебхуки CryptoBot и xRocket отклонены с INVALID_WEBHOOK_SIGNATURE, баланс остался $0.00.';
     },
   );
 
@@ -2226,10 +2254,10 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(
         await service.getBalance(buyer1.id),
         98,
-        'Баланс должен быть пополнен ровно 1 раз на 98 ⭐ (xRocket комиссия 2%)',
+        'Баланс должен быть пополнен ровно 1 раз на $98.00 (xRocket комиссия 2%)',
       );
 
-      return 'xRocket Pay REST API v1 (POST /api/v1/invoices, Bearer Auth, HTTP 201 Created, links.telegramBotLink) проверен; из 5 параллельных вызовов баланс пополнен ровно 1 раз на 98 ⭐.';
+      return 'xRocket Pay REST API v1 (POST /api/v1/invoices, Bearer Auth, HTTP 201 Created, links.telegramBotLink) проверен; из 5 параллельных вызовов баланс пополнен ровно 1 раз на $98.00.';
     },
   );
 
@@ -2297,7 +2325,7 @@ async function runFullAuditTestSuite(): Promise<void> {
               result: {
                 invoice_id: 55001,
                 amount: String(body.amount),
-                fiat: 'RUB',
+                fiat: 'USD',
                 currency_type: 'fiat',
                 status: 'active',
                 bot_invoice_url: 'https://t.me/CryptoBot?start=IV55001',
@@ -2319,7 +2347,7 @@ async function runFullAuditTestSuite(): Promise<void> {
                     invoice_id: 55001,
                     payload: currentTopUpId,
                     amount: '50.00',
-                    fiat: 'RUB',
+                    fiat: 'USD',
                     currency_type: 'fiat',
                     status: 'paid',
                   },
@@ -2338,7 +2366,7 @@ async function runFullAuditTestSuite(): Promise<void> {
         telegramId: buyer1.id,
         provider: 'cryptobot',
         amountPaid: 200,
-        currency: 'RUB',
+        currency: 'USD',
       });
       currentTopUpId = topUp.paymentId;
 
@@ -2448,7 +2476,7 @@ async function runFullAuditTestSuite(): Promise<void> {
                 invoice_id: 910007,
                 status: 'active',
                 amount: body.amount,
-                fiat: 'RUB',
+                fiat: 'USD',
                 currency_type: 'fiat',
                 bot_invoice_url: 'https://t.me/CryptoBot?start=IV910007',
                 payload: body.payload,
@@ -2468,7 +2496,7 @@ async function runFullAuditTestSuite(): Promise<void> {
                     invoice_id: 910007,
                     status: 'expired',
                     amount: '100.00',
-                    fiat: 'RUB',
+                    fiat: 'USD',
                     currency_type: 'fiat',
                     payload: currentTopUpId,
                   },
@@ -2487,7 +2515,7 @@ async function runFullAuditTestSuite(): Promise<void> {
         telegramId: buyer1.id,
         provider: 'cryptobot',
         amountPaid: 100,
-        currency: 'RUB',
+        currency: 'USD',
       });
       currentTopUpId = topUp.paymentId;
 
@@ -2527,7 +2555,7 @@ async function runFullAuditTestSuite(): Promise<void> {
           const amount = Number(body.amount ?? body.priceAmount ?? 100);
 
           if (req.url.includes('crypt.bot')) {
-            const curr = String(body.fiat ?? body.asset ?? 'RUB');
+            const curr = String(body.fiat ?? body.asset ?? 'USD');
             invoicesByExtId.set(extId, { paymentId, amount, currency: curr });
             return {
               status: 200,
@@ -2582,7 +2610,7 @@ async function runFullAuditTestSuite(): Promise<void> {
                         amount: String(info.amount),
                         fiat: info.currency,
                         asset: info.currency,
-                        currency_type: info.currency === 'RUB' ? 'fiat' : 'crypto',
+                        currency_type: info.currency === 'USD' ? 'fiat' : 'crypto',
                         payload: info.paymentId,
                       },
                     ],
@@ -2613,14 +2641,14 @@ async function runFullAuditTestSuite(): Promise<void> {
       const gateway = new PaymentProviderGateway(transport, mockCreds);
       const service = new BalanceService(gateway);
 
-      // Создаём 3 счёта по 100 единиц:
-      // CryptoBot #1 (3% -> +97), CryptoBot #2 (3% -> +97), xRocket (2% -> +98). Итого: 97 + 97 + 98 = 292.
+      // Создаём 3 счёта по $100.00:
+      // CryptoBot #1 (3% -> +$97.00), CryptoBot #2 (3% -> +$97.00), xRocket (2% -> +$98.00). Итого: 97 + 97 + 98 = $292.00.
       const [tCrypto1, tCrypto2, tXRocket] = await Promise.all([
         service.createTopUp({
           telegramId: buyer1.id,
           provider: 'cryptobot',
           amountPaid: 100,
-          currency: 'RUB',
+          currency: 'USD',
         }),
         service.createTopUp({
           telegramId: buyer1.id,
@@ -2648,10 +2676,10 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(
         finalBalance,
         292,
-        'Сумма параллельных зачислений (97 + 97 + 98) должна составить ровно 292 ⭐ без потери обновлений',
+        'Сумма параллельных зачислений ($97.00 + $97.00 + $98.00) должна составить ровно $292.00 без потери обновлений',
       );
 
-      return 'Три параллельных пополнения через CryptoBot (+97, +97) и xRocket (+98) атомарно зачислены: итоговый баланс 292 ⭐.';
+      return 'Три параллельных пополнения через CryptoBot (+$97.00, +$97.00) и xRocket (+$98.00) атомарно зачислены: итоговый баланс $292.00.';
     },
   );
 
@@ -2782,7 +2810,271 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(refundedOrder?.fulfillmentStatus, 'refunded');
       assert.equal(refundedOrder?.balanceRefunded, true);
 
-      return 'Возврат заказа на внутренний баланс выполнен атомарно (242 -> 292 ⭐), повторный вызов идемпотентно заблокирован.';
+      return 'Возврат заказа на внутренний баланс выполнен атомарно ($242.00 -> $292.00), повторный вызов идемпотентно заблокирован.';
+    },
+  );
+
+  await runTest(
+    'B-12',
+    'Security',
+    'Свободный ввод суммы пополнения в USD ($0.50 – $50,000.00): полное удаление фиксированных пресетов и серверная валидация лимитов',
+    async () => {
+      assert.equal(MIN_TOPUP_AMOUNT_USD, 0.5);
+      assert.equal(MAX_TOPUP_AMOUNT_USD, 50000);
+
+      // 1. Полное отсутствие предложенных фиксированных сумм (100, 250, 500, 1000, 2500, 5000)
+      assert.deepEqual(PAYMENT_PROVIDER_CATALOG.cryptobot.presetAmounts, []);
+      assert.deepEqual(PAYMENT_PROVIDER_CATALOG.xrocket.presetAmounts, []);
+
+      const emptyStep2Kb = JSON.stringify(
+        buildTopUpStep2AmountKeyboard('cryptobot', undefined, 'USD'),
+      );
+      for (const preset of ['100', '250', '500', '1000', '2500', '5000']) {
+        assert.equal(
+          emptyStep2Kb.includes(`topup:amt:cryptobot:USD:${preset}`),
+          false,
+          `Кнопка фиксированной суммы ${preset} не должна присутствовать в клавиатуре Шага 2`,
+        );
+      }
+
+      // 2. Валидация корректных сумм в USD (с поддержкой "$", точки и запятой)
+      assert.equal(validateTopUpAmountUsd('0.50'), 0.5);
+      assert.equal(validateTopUpAmountUsd('$10.00'), 10);
+      assert.equal(validateTopUpAmountUsd('19,99'), 19.99);
+      assert.equal(validateTopUpAmountUsd('100'), 100);
+      assert.equal(validateTopUpAmountUsd('50000.00'), 50000);
+
+      // 3. Серверный отказ для некорректных сумм (< $0.50, > $50,000.00, <= 0, текст, > 2 знаков после запятой)
+      assert.throws(() => validateTopUpAmountUsd('0.49'), /Минимальная сумма пополнения: \$0\.50/);
+      assert.throws(() => validateTopUpAmountUsd('0'), /положительным числом/);
+      assert.throws(() => validateTopUpAmountUsd(-25), /положительным числом/);
+      assert.throws(() => validateTopUpAmountUsd('50000.01'), /Максимальная сумма пополнения за одну операцию: \$50000\.00/);
+      assert.throws(() => validateTopUpAmountUsd(10.999), /более 2 знаков после запятой/);
+      assert.throws(() => validateTopUpAmountUsd('10.999'), /Введите корректную сумму в USD/);
+      assert.throws(() => validateTopUpAmountUsd('abc'), /Введите корректную сумму в USD/);
+
+      return 'Фиксированные пресеты сумм полностью удалены; серверная валидация USD ($0.50 – $50,000.00, не более 2 знаков) работает корректно.';
+    },
+  );
+
+  await runTest(
+    'B-13',
+    'Payments',
+    'Точный расчёт удержания комиссии в USD ($10.00, $19.99, $100.00) для CryptoBot (3%) и xRocket (2%) и автоматический пересчёт при смене способа оплаты',
+    async () => {
+      // CryptoBot 3% (зачисление = сумма * 0.97)
+      const cb10 = calculateTopUpCommission(10.0, 'cryptobot');
+      assert.equal(formatUsd(cb10.amountPaid), '$10.00');
+      assert.equal(formatUsd(cb10.feeAmount), '$0.30');
+      assert.equal(formatUsd(cb10.amountCredited), '$9.70');
+
+      const cb1999 = calculateTopUpCommission(19.99, 'cryptobot');
+      assert.equal(formatUsd(cb1999.amountPaid), '$19.99');
+      assert.equal(formatUsd(cb1999.feeAmount), '$0.60');
+      assert.equal(formatUsd(cb1999.amountCredited), '$19.39');
+
+      const cb100 = calculateTopUpCommission(100.0, 'cryptobot');
+      assert.equal(formatUsd(cb100.amountPaid), '$100.00');
+      assert.equal(formatUsd(cb100.feeAmount), '$3.00');
+      assert.equal(formatUsd(cb100.amountCredited), '$97.00');
+
+      // xRocket 2% (зачисление = сумма * 0.98)
+      const xr10 = calculateTopUpCommission(10.0, 'xrocket');
+      assert.equal(formatUsd(xr10.amountPaid), '$10.00');
+      assert.equal(formatUsd(xr10.feeAmount), '$0.20');
+      assert.equal(formatUsd(xr10.amountCredited), '$9.80');
+
+      const xr1999 = calculateTopUpCommission(19.99, 'xrocket');
+      assert.equal(formatUsd(xr1999.amountPaid), '$19.99');
+      assert.equal(formatUsd(xr1999.feeAmount), '$0.40');
+      assert.equal(formatUsd(xr1999.amountCredited), '$19.59');
+
+      const xr100 = calculateTopUpCommission(100.0, 'xrocket');
+      assert.equal(formatUsd(xr100.amountPaid), '$100.00');
+      assert.equal(formatUsd(xr100.feeAmount), '$2.00');
+      assert.equal(formatUsd(xr100.amountCredited), '$98.00');
+
+      // Автоматический пересчёт при переключении провайдера на Шаге 2
+      const msgCrypto = formatTopUpStep2AmountMessage({
+        provider: 'cryptobot',
+        amountPaid: 100,
+        currency: 'USD',
+        providerConfigured: true,
+      });
+      assert.ok(msgCrypto.includes('$100.00'));
+      assert.ok(msgCrypto.includes('-$3.00'));
+      assert.ok(msgCrypto.includes('+$97.00'));
+
+      const msgXRocket = formatTopUpStep2AmountMessage({
+        provider: 'xrocket',
+        amountPaid: 100,
+        currency: 'USDT',
+        providerConfigured: true,
+      });
+      assert.ok(msgXRocket.includes('$100.00'));
+      assert.ok(msgXRocket.includes('-$2.00'));
+      assert.ok(msgXRocket.includes('+$98.00'));
+
+      return 'Расчёт комиссий в USD ($10.00, $19.99, $100.00) для CryptoBot (3%) и xRocket (2%) и автоматический пересчёт проверены.';
+    },
+  );
+
+  await runTest(
+    'B-14',
+    'Payments',
+    'Конвертация суммы из USD в криптовалюту провайдера (TON/BTC) с фиксацией курса и неизменной суммой зачисления в USD',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      // 1. Проверка функции конвертации USD -> TON (по курсу 1 TON = $5.50)
+      const tonConv = convertUsdToPaymentCurrency(100, 'TON', 5.5);
+      assert.equal(tonConv.amountUsd, 100);
+      assert.equal(tonConv.targetCurrency, 'TON');
+      assert.equal(tonConv.exchangeRateUsd, 5.5);
+      assert.equal(tonConv.convertedAmount, 18.18);
+
+      let currentTopUpId = '';
+      let currentAmountToPay = '';
+      const transport = async (
+        req: HttpTransportRequest,
+      ): Promise<HttpTransportResponse> => {
+        if (req.url.endsWith('/api/v1/invoices') && req.method === 'POST') {
+          const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+          currentAmountToPay = String(body.priceAmount);
+          return {
+            status: 201,
+            ok: true,
+            json: {
+              id: 'xr_ton_conv_1',
+              priceAmount: currentAmountToPay,
+              priceCurrency: 'TON',
+              status: 'PENDING',
+              clientInvoiceId: body.clientInvoiceId,
+              links: {
+                telegramBotLink: 'https://t.me/xrocket?start=xr_ton_conv_1',
+              },
+            },
+          };
+        }
+        if (
+          req.url.includes('/api/v1/invoices?ids=xr_ton_conv_1') &&
+          req.method === 'GET'
+        ) {
+          return {
+            status: 200,
+            ok: true,
+            json: [
+              {
+                id: 'xr_ton_conv_1',
+                priceAmount: currentAmountToPay,
+                priceCurrency: 'TON',
+                status: 'PAID',
+                clientInvoiceId: currentTopUpId,
+              },
+            ],
+          };
+        }
+        throw new Error(`Unexpected request: ${req.url}`);
+      };
+
+      const gateway = new PaymentProviderGateway(transport, mockCreds);
+      const service = new BalanceService(gateway);
+
+      // Пользователь вводит $100.00 USD и выбирает оплату в TON через xRocket (комиссия 2% -> к зачислению $98.00)
+      const topUp = await service.createTopUp({
+        telegramId: buyer1.id,
+        username: buyer1.username,
+        provider: 'xrocket',
+        amountPaid: 100,
+        currency: 'TON',
+        network: 'TON',
+        convertFromUsd: true,
+        customExchangeRateUsd: 5.5,
+      });
+      currentTopUpId = topUp.paymentId;
+
+      assert.equal(topUp.amountUsd, 100);
+      assert.equal(topUp.feePercent, 2);
+      assert.equal(topUp.feeAmount, 2);
+      assert.equal(topUp.amountCredited, 98);
+      assert.equal(topUp.currency, 'TON');
+      assert.equal(topUp.originalCurrency, 'TON');
+      assert.equal(topUp.exchangeRateUsd, 5.5);
+      assert.equal(topUp.amountPaid, 18.18);
+
+      // Карточка счёта уведомляет пользователя о курсе конвертации и фиксированной сумме зачисления в USD
+      const invoiceCardHtml = formatTopUpInvoiceCardMessage(topUp);
+      assert.ok(invoiceCardHtml.includes('$100.00'));
+      assert.ok(invoiceCardHtml.includes('18.18 TON'));
+      assert.ok(invoiceCardHtml.includes('1 TON = $5.50'));
+      assert.ok(invoiceCardHtml.includes('+$98.00'));
+
+      // Проверяем подтверждение оплаты и зачисление строго зафиксированной суммы $98.00 USD
+      const verified = await service.verifyAndProcessTopUp(topUp.paymentId);
+      assert.equal(verified.ok, true);
+      assert.equal(verified.status, 'paid');
+      assert.equal(verified.newBalance, 98);
+      assert.equal(await service.getBalance(buyer1.id), 98);
+
+      // История пополнений сохраняет и отображает исходную валюту оплаты (TON) и сумму в USD ($100.00 -> +$98.00)
+      const historyHtml = formatUserTopUpHistoryMessage([verified.topUp], 98);
+      assert.ok(historyHtml.includes('$100.00'));
+      assert.ok(historyHtml.includes('+$98.00'));
+      assert.ok(historyHtml.includes('TON'));
+
+      return 'Конвертация $100.00 USD -> 18.18 TON по фиксированному курсу $5.50 проверена; на баланс зачислено ровно +$98.00 USD.';
+    },
+  );
+
+  await runTest(
+    'B-15',
+    'Fulfillment',
+    'Визуальный стиль Telegram OutlineEmoji (https://t.me/addemoji/OutlineEmoji) во всех разделах бота и веб-интерфейса с сохранением бренда STARS SHOP',
+    async () => {
+      // 1. Все иконки реестра OutlineEmoji формируют валидный тег <tg-emoji emoji-id="...">fallback</tg-emoji> и минималистичный SVG
+      const keys = Object.keys(OUTLINE_EMOJI_REGISTRY) as Array<
+        keyof typeof OUTLINE_EMOJI_REGISTRY
+      >;
+      assert.ok(keys.length >= 30);
+      for (const k of keys) {
+        const tag = oe(k);
+        assert.match(tag, /^<tg-emoji emoji-id="\d+">.+<\/tg-emoji>$/);
+        assert.ok(oeBtn(k).length > 0);
+        assert.ok(oeSvg(k, 18, 'oe-icon').includes('class="oe-icon"'));
+      }
+
+      // 2. Сообщения всех разделов используют <tg-emoji>, а бренд Stars Shop сохранён без замены логотипа на эмодзи
+      const welcomeHtml = formatWelcomeMessage('Alex', true);
+      assert.ok(welcomeHtml.includes('Stars Shop'));
+      assert.ok(welcomeHtml.includes('<tg-emoji emoji-id='));
+
+      const userRecord = await UserService.getUserByTelegramId(buyer1.id);
+      assert.ok(userRecord);
+      const profileHtml = formatUserProfileMessage(userRecord, false);
+      assert.ok(profileHtml.includes('<tg-emoji emoji-id='));
+      assert.ok(profileHtml.includes('$98.00'));
+
+      const catalogHtml = formatCatalogOverviewMessage();
+      assert.ok(catalogHtml.includes('Stars Shop'));
+      assert.ok(catalogHtml.includes('<tg-emoji emoji-id='));
+
+      const termsHtml = formatTermsMessage();
+      assert.ok(termsHtml.includes('Stars Shop'));
+      assert.ok(termsHtml.includes('<tg-emoji emoji-id='));
+
+      const helpHtml = formatHelpMessage();
+      assert.ok(helpHtml.includes('<tg-emoji emoji-id='));
+
+      // 3. Проверка index.html на наличие мобильной числовой клавиатуры (inputmode="decimal") и отсутствие пресетов
+      const indexHtml = fs.readFileSync(
+        path.resolve(process.cwd(), 'index.html'),
+        'utf-8',
+      );
+      assert.ok(indexHtml.includes('inputmode="decimal"'));
+      assert.ok(indexHtml.includes('STARS SHOP'));
+      assert.ok(indexHtml.includes('oe-icon'));
+
+      return `Набор OutlineEmoji (${keys.length} иконок <tg-emoji> и SVG) применён во всех разделах магазина; логотип и название STARS SHOP сохранены.`;
     },
   );
 

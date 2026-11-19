@@ -73,11 +73,23 @@ export interface BalanceTopUpRecord {
   userTelegramId: number;
   username?: string;
   provider: BalanceTopUpProvider;
+  /** Amount entered in USD ($) before commission deduction */
+  amountUsd?: number;
+  /** Actual amount sent to the provider invoice in `currency` */
   amountPaid: number;
   feePercent: number;
+  /** Commission deducted in USD ($) */
   feeAmount: number;
+  /** Net amount credited to user balance in USD ($) */
   amountCredited: number;
+  /** Payment currency sent to the provider (e.g. USD, USDT, TON, BTC) */
   currency: string;
+  /** Original currency selected by buyer */
+  originalCurrency?: string;
+  /** Original invoice amount in the payment currency */
+  originalAmountPaid?: number;
+  /** Locked exchange rate (1 unit of currency in USD) at invoice creation time */
+  exchangeRateUsd?: number;
   network?: string;
   paymentStatus: BalanceTopUpStatus;
   externalInvoiceId: string;

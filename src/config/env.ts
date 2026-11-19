@@ -231,3 +231,37 @@ export function isOwnerTelegramId(telegramId: number | undefined): boolean {
   return config.ownerTelegramId === telegramId;
 }
 
+/**
+ * Server-side limits for free-form balance top-ups in US Dollars (USD).
+ */
+export const MIN_TOPUP_AMOUNT_USD = 0.5;
+export const MAX_TOPUP_AMOUNT_USD = 50000.0;
+
+/**
+ * Reference USD exchange rates for supported payment currencies (1 unit in USD).
+ * Used when a user enters a top-up amount in USD ($) and chooses a non-USD crypto asset.
+ * The rate and net credited USD amount are locked in Firestore at invoice creation time.
+ */
+export const CRYPTO_USD_RATES: Readonly<Record<string, number>> = Object.freeze({
+  USD: 1.0,
+  USDT: 1.0,
+  USDC: 1.0,
+  TON: 5.5,
+  TONCOIN: 5.5,
+  TRX: 0.25,
+  BNB: 600.0,
+  ETH: 3000.0,
+  BTC: 90000.0,
+  LTC: 100.0,
+});
+
+/**
+ * Formats a numeric USD amount consistently as `$10.00`, `$19.99`, `$100.00`.
+ */
+export function formatUsd(amount: number): string {
+  const num = Number.isFinite(amount) ? amount : 0;
+  const sign = num < 0 ? '-' : '';
+  return `${sign}$${Math.abs(num).toFixed(2)}`;
+}
+
+

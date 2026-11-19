@@ -1,5 +1,10 @@
 import crypto from 'crypto';
-import { getEnvConfig } from '../config/env.ts';
+import {
+  CRYPTO_USD_RATES,
+  MAX_TOPUP_AMOUNT_USD,
+  MIN_TOPUP_AMOUNT_USD,
+  getEnvConfig,
+} from '../config/env.ts';
 import {
   BalanceTopUpProvider,
   BalanceTopUpStatus,
@@ -11,6 +16,7 @@ export interface XRocketAssetOption {
   label: string;
   networks: string[];
   defaultNetwork: string;
+  rateUsd: number;
 }
 
 export const XROCKET_SUPPORTED_ASSETS: XRocketAssetOption[] = [
@@ -19,42 +25,49 @@ export const XROCKET_SUPPORTED_ASSETS: XRocketAssetOption[] = [
     label: 'USDT',
     networks: ['TON', 'TRC-20', 'BEP-20', 'ERC-20'],
     defaultNetwork: 'TON',
+    rateUsd: CRYPTO_USD_RATES.USDT,
   },
   {
     code: 'TON',
     label: 'TON',
     networks: ['TON'],
     defaultNetwork: 'TON',
+    rateUsd: CRYPTO_USD_RATES.TON,
   },
   {
     code: 'BTC',
     label: 'BTC',
     networks: ['Bitcoin'],
     defaultNetwork: 'Bitcoin',
+    rateUsd: CRYPTO_USD_RATES.BTC,
   },
   {
     code: 'ETH',
     label: 'ETH',
     networks: ['ERC-20'],
     defaultNetwork: 'ERC-20',
+    rateUsd: CRYPTO_USD_RATES.ETH,
   },
   {
     code: 'TRX',
     label: 'TRX',
     networks: ['TRC-20'],
     defaultNetwork: 'TRC-20',
+    rateUsd: CRYPTO_USD_RATES.TRX,
   },
   {
     code: 'BNB',
     label: 'BNB',
     networks: ['BEP-20'],
     defaultNetwork: 'BEP-20',
+    rateUsd: CRYPTO_USD_RATES.BNB,
   },
   {
     code: 'USDC',
     label: 'USDC',
     networks: ['ERC-20', 'BEP-20'],
     defaultNetwork: 'ERC-20',
+    rateUsd: CRYPTO_USD_RATES.USDC,
   },
 ];
 
@@ -82,8 +95,8 @@ export const PAYMENT_PROVIDER_CATALOG: Record<BalanceTopUpProvider, ProviderMeta
     shortTitle: 'CryptoBot',
     buttonLabel: '💎 CryptoBot [3%]',
     feePercent: 3,
-    defaultCurrency: 'USDT',
-    supportedCurrencies: ['USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC', 'LTC', 'RUB'],
+    defaultCurrency: 'USD',
+    supportedCurrencies: ['USD', 'USDT', 'TON', 'BTC', 'ETH', 'TRX', 'BNB', 'USDC', 'LTC'],
     supportedNetworks: [
       'TON (The Open Network)',
       'TRC-20 (TRON)',
@@ -92,13 +105,13 @@ export const PAYMENT_PROVIDER_CATALOG: Record<BalanceTopUpProvider, ProviderMeta
       'Bitcoin Network',
       'Litecoin Network',
     ],
-    minAmount: 1,
-    maxAmount: 500000,
-    presetAmounts: [100, 250, 500, 1000, 2500, 5000],
+    minAmount: MIN_TOPUP_AMOUNT_USD,
+    maxAmount: MAX_TOPUP_AMOUNT_USD,
+    presetAmounts: [],
     apiBaseUrl: 'https://pay.crypt.bot/api',
     officialDocsUrl: 'https://help.send.tg/en/articles/10279948-crypto-pay-api',
     description:
-      'Оплата через официальный сервис @CryptoBot (комиссия магазина 3%).',
+      'Оплата в долларах США (USD / USDT / крипто) через официальный сервис @CryptoBot (комиссия магазина 3%).',
   },
   xrocket: {
     id: 'xrocket',
@@ -115,15 +128,51 @@ export const PAYMENT_PROVIDER_CATALOG: Record<BalanceTopUpProvider, ProviderMeta
       'ERC-20',
       'Bitcoin',
     ],
-    minAmount: 1,
-    maxAmount: 500000,
-    presetAmounts: [100, 250, 500, 1000, 2500, 5000],
+    minAmount: MIN_TOPUP_AMOUNT_USD,
+    maxAmount: MAX_TOPUP_AMOUNT_USD,
+    presetAmounts: [],
     apiBaseUrl: 'https://pay.api.xrocket.exchange',
     officialDocsUrl: 'https://docs.xrocket.exchange/ru/api/pay/reference/pay-rest-api',
     description:
-      'Оплата криптовалютой (USDT, TON, BTC, ETH, TRX, BNB, USDC) через xRocket Pay REST API v1 (комиссия магазина 2%).',
+      'Оплата в USD эквиваленте (USDT, TON, BTC, ETH, TRX, BNB, USDC) через xRocket Pay REST API v1 (комиссия магазина 2%).',
   },
 };
+
+export interface UsdCurrencyConversionResult {
+  amountUsd: number;
+  targetCurrency: string;
+  exchangeRateUsd: number;
+  convertedAmount: number;
+  requiresConversionNotice: boolean;
+}
+
+/**
+ * Converts a USD ($) top-up amount into the target payment currency at a locked exchange rate.
+ * For 1:1 USD currencies (`USD`, `USDT`, `USDC`), `exchangeRateUsd = 1.0` and `convertedAmount = amountUsd`.
+ * For other crypto currencies (`TON`, `BTC`, `ETH`, `TRX`, `BNB`, `LTC`), converts using `CRYPTO_USD_RATES`.
+ */
+export function convertUsdToPaymentCurrency(
+  amountUsd: number,
+  targetCurrency: string,
+  customRateUsd?: number,
+): UsdCurrencyConversionResult {
+  const normCurr = normalizeCurrencyCode(targetCurrency || 'USD');
+  const rate =
+    customRateUsd && customRateUsd > 0
+      ? customRateUsd
+      : CRYPTO_USD_RATES[normCurr] ?? 1.0;
+  const isPeggedUsd = normCurr === 'USD' || normCurr === 'USDT' || normCurr === 'USDC';
+  const convertedRaw = isPeggedUsd ? amountUsd : amountUsd / rate;
+  const convertedAmount = Number(convertedRaw.toFixed(2));
+
+  return Object.freeze({
+    amountUsd: Number(amountUsd.toFixed(2)),
+    targetCurrency: normCurr,
+    exchangeRateUsd: rate,
+    convertedAmount: convertedAmount > 0 ? convertedAmount : Number(convertedRaw.toFixed(6)),
+    requiresConversionNotice: !isPeggedUsd,
+  });
+}
 
 export interface CreateProviderInvoiceInput {
   paymentId: string;
@@ -511,7 +560,7 @@ export class PaymentProviderGateway {
       }
       const currencyRaw =
         payloadObj.currency_type === 'fiat'
-          ? String(payloadObj.fiat ?? 'RUB')
+          ? String(payloadObj.fiat ?? 'USD')
           : String(payloadObj.asset ?? payloadObj.fiat ?? 'USDT');
       return {
         provider: 'cryptobot',
@@ -815,7 +864,7 @@ export class PaymentProviderGateway {
 
       const rawCurrency =
         found.currency_type === 'fiat'
-          ? String(found.fiat || 'RUB')
+          ? String(found.fiat || 'USD')
           : String(found.asset || found.fiat || 'USDT');
 
       return {
