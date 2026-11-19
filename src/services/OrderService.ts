@@ -11,15 +11,15 @@ import { formatUsdCents } from './Money.ts';
 import { ProductService } from './ProductService.ts';
 import { UserService } from './UserService.ts';
 
-const TELEGRAM_USERNAME_REGEX = /^[a-zA-Z](?:[a-zA-Z0-9]|_(?=[a-zA-Z0-9])){4,31}$/;
+const TELEGRAM_USERNAME_REGEX = /^[a-zA-Z0-9_]{5,32}$/;
 
 /**
  * Validates and normalizes a Telegram recipient @username (stores without leading @, lowercased).
- * Official Telegram rules:
+ * Verified against official Telegram FAQ & API docs (`telegram.org/faq`, `core.telegram.org`):
  * - 5..32 characters total
- * - Allowed characters: Latin letters (a-z), digits (0-9), underscore (_)
- * - Must start with a Latin letter; cannot start/end with "_" or contain "__"
+ * - Allowed characters: Latin letters (a-z, case-insensitive), digits (0-9), and underscores (_)
  * - Only a single optional leading "@" is allowed; internal whitespace and extra "@" are rejected
+ * - Unconfirmed restrictions (such as banning "__" or trailing "_") are NOT enforced as Telegram rules
  * - Explicitly passing an empty string ("", "   ", "@") throws an error; only `undefined` returns `undefined`.
  */
 export function normalizeRecipientUsername(raw?: string): string | undefined {
@@ -51,7 +51,7 @@ export function normalizeRecipientUsername(raw?: string): string | undefined {
 
   if (!TELEGRAM_USERNAME_REGEX.test(withoutAt)) {
     throw new Error(
-      'Некорректный @username получателя. Укажите от 5 до 32 символов латиницы, цифр или "_" (начинается с буквы, без "__" и "_" в конце).',
+      'Некорректный @username получателя. По правилам Telegram допускаются от 5 до 32 символов: латинские буквы (a–z), цифры (0–9) и "_".',
     );
   }
 
@@ -107,25 +107,8 @@ export class OrderService {
 
     const resolvedDurationMonths =
       product.category === 'premium'
-        ? (product.durationMonths ??
-          (product.id === 'premium_3m'
-            ? 3
-            : product.id === 'premium_6m'
-              ? 6
-              : product.id === 'premium_12m'
-                ? 12
-                : undefined))
+        ? ProductService.resolvePremiumDurationMonths(product)
         : undefined;
-
-    if (
-      product.category === 'premium' &&
-      (resolvedDurationMonths === undefined ||
-        !ProductService.ALLOWED_PREMIUM_DURATIONS.has(resolvedDurationMonths))
-    ) {
-      throw new Error(
-        'Недопустимый срок подписки Telegram Premium: доступны только 3, 6 или 12 месяцев.',
-      );
-    }
 
     const normalizedRecipient = normalizeRecipientUsername(params.recipientUsername);
     if (

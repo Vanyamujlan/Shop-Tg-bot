@@ -116,7 +116,7 @@ import {
   handleTopUpCalculateRequest,
   renderPlainTextStatus,
 } from '../../server.ts';
-import type { Order, PaymentRecord, StoreUser } from '../types.ts';
+import type { Order, PaymentRecord, Product, StoreUser } from '../types.ts';
 
 // Force isolated test environment so production Firestore and .data/ are NEVER touched
 process.env.NODE_ENV = 'test';
@@ -5167,28 +5167,28 @@ async function runFullAuditTestSuite(): Promise<void> {
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
 
-      // Допустимые форматы (5..32 символа, нормализация одного ведущего @ без повреждения)
+      // Допустимые форматы по официальной документации Telegram (5..32 символов: a-z, 0-9, _)
       assert.equal(normalizeRecipientUsername('abcde'), 'abcde');
       assert.equal(normalizeRecipientUsername('@AbC_1'), 'abc_1');
       assert.equal(normalizeRecipientUsername('  @QuizyStars_5 '), 'quizystars_5');
+      assert.equal(normalizeRecipientUsername('al__ice'), 'al__ice');
+      assert.equal(normalizeRecipientUsername('alice_'), 'alice_');
       const max32 = 'a' + 'b'.repeat(31);
       assert.equal(normalizeRecipientUsername(`@${max32}`), max32);
 
-      // Недопустимая длина, символы, пробелы, лишние @, подчёркивания и пустые значения
+      // Недопустимая длина, символы, пробелы, лишние @ и пустые значения
       const invalidUsernames = [
         'abcd',
         '@abcd',
         'a' + 'b'.repeat(32), // 33 символа
         '@@alice',
+        'alice@bot',
         'alice test',
         '@ alice',
         'alice\ttest',
         'user!name',
+        'alice-test',
         'иван_тест',
-        '_alice',
-        'alice_',
-        'al__ice',
-        '1abcd',
         '',
         '   ',
         '@',
@@ -5957,6 +5957,8 @@ async function runFullAuditTestSuite(): Promise<void> {
         ['abcde', 'abcde'],
         ['@Alice_5', 'alice_5'],
         ['a_b_c_1', 'a_b_c_1'],
+        ['al__ice5', 'al__ice5'],
+        ['alice5_', 'alice5_'],
         ['a' + '1_2'.repeat(10) + 'z', 'a' + '1_2'.repeat(10) + 'z'], // 32 chars
       ];
       for (const [raw, expected] of validCases) {
@@ -5968,12 +5970,9 @@ async function runFullAuditTestSuite(): Promise<void> {
         'abcd',
         '@ab_c',
         'a' + 'b'.repeat(32), // 33 chars
-        '_alice5',
-        'alice5_',
-        'al__ice5',
-        '1alice5',
         'alice test',
         '@@alice5',
+        'alice@bot',
         'alice-test',
         'иван_55',
         '',
@@ -6015,7 +6014,7 @@ async function runFullAuditTestSuite(): Promise<void> {
       await harness.sendCallback(noUsernameBuyer, 'rcpt_self');
       assert.ok(harness.lastAnswer()?.text?.includes('не задан корректный @username'));
 
-      return 'Правила Telegram @username (5..32 символов, без _ по краям и __) и условный показ «Купить себе» полностью подтверждены.';
+      return 'Правила Telegram @username (5..32 символов: a-z, 0-9, _) и условный показ «Купить себе» полностью подтверждены.';
     },
   );
 
@@ -6068,6 +6067,507 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal(getUserCheckoutSession(buyer1.id), undefined);
 
       return 'Навигация редактирования (количество/получатель/назад) и чистая отмена сессии без мусорных заказов подтверждены.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 4.2.3: FINAL VALIDATION & EDGE CASE FIXES
+  // =========================================================================
+
+  await runTest(
+    'S423-01',
+    'Security',
+    'Stage 4.2.3: Premium-товар без durationMonths отклоняется при создании, заказе и оплате',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const bs = new BalanceService();
+
+      // 1. Создание Premium-товара без durationMonths (undefined или null) отклоняется
+      await assert.rejects(
+        () =>
+          ProductService.createProduct({
+            name: 'Premium Missing Duration',
+            description: 'Missing durationMonths',
+            category: 'premium',
+            priceUsdCents: 1390,
+          }),
+        /обязательно укажите 3, 6 или 12/,
+      );
+      await assert.rejects(
+        () =>
+          ProductService.createProduct({
+            name: 'Premium Null Duration',
+            description: 'Null durationMonths',
+            category: 'premium',
+            priceUsdCents: 1390,
+            durationMonths: null as unknown as 3,
+          }),
+        /обязательно укажите 3, 6 или 12/,
+      );
+
+      // 2. Искусственно добавленный неканонический Premium-товар без durationMonths отклоняется во всех сервисах
+      const now = new Date().toISOString();
+      await firestoreRepo.setDoc<Product>('products', 'premium_custom_nodur', {
+        id: 'premium_custom_nodur',
+        name: 'Custom Premium No Duration',
+        category: 'premium',
+        description: 'Corrupted custom premium',
+        priceUsdCents: 1390,
+        price: 1390,
+        currency: 'USD',
+        minQuantity: 1,
+        maxQuantity: 1,
+        imageUrl: '',
+        isActive: true,
+        fulfillmentType: 'mystars',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      await assert.rejects(
+        () =>
+          OrderService.createOrder({
+            telegramUser: buyer1,
+            productId: 'premium_custom_nodur',
+            quantity: 1,
+            recipientUsername: '@valid_user5',
+          }),
+        /не указан обязательный срок подписки/,
+      );
+      await assert.rejects(
+        () =>
+          bs.purchaseWithInternalBalance({
+            telegramId: buyer1.id,
+            productId: 'premium_custom_nodur',
+            quantity: 1,
+            recipientUsername: '@valid_user5',
+          }),
+        /не указан обязательный срок подписки/,
+      );
+
+      // 3. Совместимость с историческим Premium-товаром без поля durationMonths в БД для канонического ID (без мутации БД)
+      const existingP3 = await ProductService.getProductById('premium_3m');
+      assert.ok(existingP3);
+      const { durationMonths: _omitted, ...legacyP3 } = existingP3;
+      void _omitted;
+      assert.equal(ProductService.resolvePremiumDurationMonths(legacyP3 as Product), 3);
+
+      return 'Создание и использование кастомного Premium без durationMonths заблокировано; совместимость с каноническим товаром в БД сохранена.';
+    },
+  );
+
+  await runTest(
+    'S423-02',
+    'Security',
+    'Stage 4.2.3: Premium с недопустимым сроком и quantity != 1 отклоняется при создании, заказе, оплате и переиспользовании заказа',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const bs = new BalanceService();
+      await UserService.upsertFromTelegram(buyer1);
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        balanceUsdCents: 10000,
+        balance: 100,
+      });
+
+      // 1. Все некорректные сроки при создании товара отклоняются
+      const badDurations: unknown[] = [undefined, null, 0, -3, 1, 2, 3.5, 6.25, 9, 24, '3', NaN, Infinity];
+      for (const bad of badDurations) {
+        await assert.rejects(
+          () =>
+            ProductService.createProduct({
+              name: `Bad Premium ${String(bad)}`,
+              description: 'Invalid duration test',
+              category: 'premium',
+              priceUsdCents: 1390,
+              durationMonths: bad as 3,
+            }),
+          /3, 6 или 12/,
+        );
+      }
+
+      // 2. Повреждённый срок (0, -6, 3.5, 9, null) на существующем товаре отклоняется в каталоге и при создании/оплате заказа
+      const now = new Date().toISOString();
+      await firestoreRepo.updateDoc<Product>('products', 'premium_6m', {
+        durationMonths: 9 as unknown as 6,
+      });
+      assert.equal(
+        ProductService.isValidBuyerPremiumProduct(await ProductService.getProductById('premium_6m')),
+        false,
+      );
+      await assert.rejects(
+        () =>
+          OrderService.createOrder({
+            telegramUser: buyer1,
+            productId: 'premium_6m',
+            quantity: 1,
+            recipientUsername: '@target_user5',
+          }),
+        /(обязательно укажите 3, 6 или 12|Некорректный срок|допустимы только 3, 6 или 12)/,
+      );
+
+      // Восстанавливаем premium_6m для дальнейших проверок
+      await firestoreRepo.updateDoc<Product>('products', 'premium_6m', {
+        durationMonths: 6,
+      });
+
+      // 3. Попытка заказать quantity != 1 или оплатить с другим quantity при переиспользовании заказа отклоняется
+      await assert.rejects(
+        () =>
+          OrderService.createOrder({
+            telegramUser: buyer1,
+            productId: 'premium_3m',
+            quantity: 2,
+            recipientUsername: '@target_user5',
+          }),
+        /количество всегда равно 1/,
+      );
+
+      const validOrder = await OrderService.createOrder({
+        telegramUser: buyer1,
+        productId: 'premium_3m',
+        quantity: 1,
+        recipientUsername: '@target_user5',
+        requireRecipient: true,
+      });
+
+      await assert.rejects(
+        () =>
+          bs.purchaseWithInternalBalance({
+            telegramId: buyer1.id,
+            productId: 'premium_3m',
+            quantity: 2,
+            orderId: validOrder.orderId,
+            recipientUsername: '@target_user5',
+          }),
+        /Количество при оплате существующего заказа изменить нельзя/,
+      );
+
+      // Искусственно повреждаем quantity в уже сохранённом заказе -> отклоняется и баланс, и внешний провайдер
+      await firestoreRepo.setDoc<Order>('orders', 'ord_tampered_prem_qty', {
+        ...validOrder,
+        orderId: 'ord_tampered_prem_qty',
+        quantity: 2,
+        updatedAt: now,
+      });
+      await assert.rejects(
+        () =>
+          bs.purchaseWithInternalBalance({
+            telegramId: buyer1.id,
+            productId: 'premium_3m',
+            orderId: 'ord_tampered_prem_qty',
+            recipientUsername: '@target_user5',
+          }),
+        /количество всегда равно 1/,
+      );
+      const ps = new PaymentService('s423-02', new PaymentProviderGateway(async () => {
+        throw new Error('Should not reach HTTP');
+      }, TEST_MOCK_CREDS));
+      await assert.rejects(
+        () =>
+          ps.createOrReuseOrderPayment({
+            orderId: 'ord_tampered_prem_qty',
+            callerTelegramId: buyer1.id,
+            provider: 'cryptobot',
+            currency: 'USDT',
+            requireRecipient: true,
+          }),
+        /количество всегда равно 1/,
+      );
+
+      return 'Недопустимые сроки Premium и quantity != 1 блокируются при создании товара/заказа, оплате и переиспользовании заказа.';
+    },
+  );
+
+  await runTest(
+    'S423-03',
+    'Fulfillment',
+    'Stage 4.2.3: Отсутствующий/неактивный/повреждённый Premium-тариф не отображается как доступный и блокируется в callback',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+
+      // Отключаем premium_6m (или удаляем его / портим цену)
+      await firestoreRepo.updateDoc<Product>('products', 'premium_6m', {
+        isActive: false,
+      });
+
+      await harness.sendCallback(buyer1, 'cat:premium');
+      const uiWhenMissing = harness.lastUiCall()!;
+      assert.ok(uiWhenMissing.text.includes('временно недоступен'));
+      assert.equal(uiWhenMissing.text.includes('$19.90'), false);
+      assert.equal(uiWhenMissing.text.includes('6 месяцев'), false);
+      assert.equal(uiWhenMissing.callbacks.some((c) => c.startsWith('prem:select:')), false);
+      assert.deepEqual(uiWhenMissing.callbacks, ['menu:home']);
+
+      // Попытка нажать устаревшую кнопку prem:select:premium_6m или prem:select:premium_3m при неполном каталоге отклоняется
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'prem:select:premium_6m');
+      assert.ok(harness.lastAnswer()?.text?.includes('временно недоступен'));
+
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'prem:select:premium_3m');
+      assert.ok(harness.lastAnswer()?.text?.includes('временно недоступен'));
+
+      // Восстанавливаем активность, но ломаем цену (вместо $19.90 ставим $15.00 = 1500) -> тоже отклоняется
+      await firestoreRepo.updateDoc<Product>('products', 'premium_6m', {
+        isActive: true,
+        priceUsdCents: 1500,
+        price: 1500,
+      });
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'cat:premium');
+      const uiWrongPrice = harness.lastUiCall()!;
+      assert.ok(uiWrongPrice.text.includes('временно недоступен'));
+      assert.equal(uiWrongPrice.callbacks.some((c) => c.startsWith('prem:select:')), false);
+
+      return 'При отсутствии, отключении или неверной цене обязательного Premium-тарифа раздел показывает недоступность без фиктивных тарифов и кнопок.';
+    },
+  );
+
+  await runTest(
+    'S423-04',
+    'Fulfillment',
+    'Stage 4.2.3: Текст Premium-каталога и клавиатура всегда используют один и тот же список доступных тарифов',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      const p3 = (await ProductService.getProductById('premium_3m'))!;
+      const p6 = (await ProductService.getProductById('premium_6m'))!;
+      const p12 = (await ProductService.getProductById('premium_12m'))!;
+
+      // 1. Полный корректный список (даже в обратном порядке и с дублем) -> ровно 3 тарифа в тексте и кнопках в порядке 3 -> 6 -> 12
+      const msgFull = formatPremiumTariffsMessage([p12, p3, p6, p3]);
+      const kbFull = buildPremiumTariffsKeyboard([p12, p3, p6, p3]);
+      const cbFull = kbFull.reply_markup.inline_keyboard
+        .flat()
+        .map((b) => (b as { callback_data?: string }).callback_data);
+      assert.deepEqual(cbFull, [
+        'prem:select:premium_3m',
+        'prem:select:premium_6m',
+        'prem:select:premium_12m',
+        'menu:home',
+      ]);
+      assert.ok(msgFull.includes('3 месяца') && msgFull.includes('$13.90'));
+      assert.ok(msgFull.includes('6 месяцев') && msgFull.includes('$19.90'));
+      assert.ok(msgFull.includes('12 месяцев') && msgFull.includes('$34.90'));
+
+      // 2. Пустой массив -> сообщение о недоступности (БЕЗ фиктивных $13.90/$19.90/$34.90!) и 0 кнопок покупки
+      const msgEmpty = formatPremiumTariffsMessage([]);
+      const kbEmpty = buildPremiumTariffsKeyboard([]);
+      const cbEmpty = kbEmpty.reply_markup.inline_keyboard
+        .flat()
+        .map((b) => (b as { callback_data?: string }).callback_data);
+      assert.ok(msgEmpty.includes('временно недоступен'));
+      assert.equal(msgEmpty.includes('$13.90'), false);
+      assert.equal(msgEmpty.includes('$19.90'), false);
+      assert.equal(msgEmpty.includes('$34.90'), false);
+      assert.deepEqual(cbEmpty, ['menu:home']);
+
+      // 3. Неполный список (нет premium_12m) -> единое состояние недоступности и в тексте, и в кнопках
+      const msgPartial = formatPremiumTariffsMessage([p3, p6]);
+      const kbPartial = buildPremiumTariffsKeyboard([p3, p6]);
+      const cbPartial = kbPartial.reply_markup.inline_keyboard
+        .flat()
+        .map((b) => (b as { callback_data?: string }).callback_data);
+      assert.ok(msgPartial.includes('временно недоступен'));
+      assert.equal(msgPartial.includes('12 месяцев'), false);
+      assert.equal(msgPartial.includes('$34.90'), false);
+      assert.deepEqual(cbPartial, ['menu:home']);
+
+      return 'Полное соответствие текста и клавиатуры Premium подтверждено для полного, пустого и неполного наборов товаров.';
+    },
+  );
+
+  await runTest(
+    'S423-05',
+    'Security',
+    'Stage 4.2.3: Проверка корректных и некорректных @username строго по документированным правилам Telegram (без неподтверждённых запретов)',
+    async () => {
+      // Допустимые по официальной документации Telegram (5..32 символа: a-z, 0-9, _)
+      const validPairs: Array<[string, string]> = [
+        ['abcde', 'abcde'],
+        ['@Alice_5', 'alice_5'],
+        ['al__ice', 'al__ice'],
+        ['@alice_', 'alice_'],
+        ['_alice5', '_alice5'],
+        ['1alice5', '1alice5'],
+        ['  @My__Name_2025_  ', 'my__name_2025_'],
+        ['a'.repeat(32), 'a'.repeat(32)],
+      ];
+      for (const [input, expected] of validPairs) {
+        assert.equal(normalizeRecipientUsername(input), expected);
+        assert.equal(canUseTelegramUsernameAsRecipient(input), expected);
+      }
+
+      // Недопустимые по документированным правилам (длина <5 / >32, недопустимые символы, пробелы, лишние @, пустые)
+      const invalidInputs = [
+        'a',
+        'abcd',
+        '@abcd',
+        'a'.repeat(33),
+        '@@alice',
+        'alice@bot',
+        'alice test',
+        '@ alice',
+        'alice\nbot',
+        'alice-test',
+        'alice.test',
+        'иван_55',
+        '',
+        '   ',
+        '@',
+      ];
+      for (const bad of invalidInputs) {
+        assert.throws(
+          () => normalizeRecipientUsername(bad),
+          /(Некорректный|Укажите)/,
+          `Ожидался отказ для ${JSON.stringify(bad)}`,
+        );
+        assert.equal(canUseTelegramUsernameAsRecipient(bad), null);
+      }
+
+      return 'Валидация @username соответствует документированным правилам Telegram (5..32 символов, a-z/0-9/_, без неподтверждённых запретов).';
+    },
+  );
+
+  await runTest(
+    'S423-06',
+    'Security',
+    'Stage 4.2.3: Защита кнопки «Купить себе» (rcpt_self) при отсутствии/невалидности и валидности username',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      const harness = createWiredBotHarness();
+
+      // 1. Пользователь без username -> кнопка не показывается, прямой callback rcpt_self отклоняется
+      const noUser = { id: 889000111, first_name: 'NoUser' };
+      clearAllUserInteractiveSessions(noUser.id);
+      await harness.sendCallback(noUser, 'cat:stars');
+      await harness.sendText(noUser, '100');
+      assert.equal(harness.lastUiCall()?.callbacks.includes('rcpt_self'), false);
+
+      await harness.sendCallback(noUser, 'rcpt_self');
+      assert.ok(harness.lastAnswer()?.text?.includes('не задан корректный @username'));
+
+      // 2. Пользователь со слишком коротким или некорректным username -> кнопка скрыта и callback отклонён
+      const shortUser = { id: 889000222, first_name: 'Short', username: 'ab_1' };
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(shortUser.id);
+      await harness.sendCallback(shortUser, 'cat:premium');
+      await harness.sendCallback(shortUser, 'prem:select:premium_3m');
+      assert.equal(harness.lastUiCall()?.callbacks.includes('rcpt_self'), false);
+
+      await harness.sendCallback(shortUser, 'rcpt_self');
+      assert.ok(harness.lastAnswer()?.text?.includes('не задан корректный @username'));
+
+      // 3. Пользователь с корректным username (в том числе содержащим "__" или "_" в конце) -> кнопка есть и работает без создания заказа до proceed
+      const validUnderscoreUser = { id: 889000333, first_name: 'Valid', username: 'Dev__User_' };
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(validUnderscoreUser.id);
+      await harness.sendCallback(validUnderscoreUser, 'cat:premium');
+      await harness.sendCallback(validUnderscoreUser, 'prem:select:premium_3m');
+      const promptUi = harness.lastUiCall()!;
+      assert.equal(promptUi.callbacks.includes('rcpt_self'), true);
+
+      await harness.sendCallback(validUnderscoreUser, 'rcpt_self');
+      const confirmUi = harness.lastUiCall()!;
+      assert.ok(confirmUi.text.includes('Подтверждение заказа'));
+      assert.ok(confirmUi.text.includes('@dev__user_'));
+      assert.equal((await OrderService.getUserOrders(validUnderscoreUser.id)).length, 0);
+
+      return 'Защита rcpt_self подтверждена для отсутствующих, коротких и корректных Telegram username.';
+    },
+  );
+
+  await runTest(
+    'S423-07',
+    'Payments',
+    'Stage 4.2.3: Полная регрессия Stage 4.2.2 (меню, Stars $0.02, 3 тарифа Premium, единый экран оплаты, отмена, сохранность Gifts в БД)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+      const bs = new BalanceService();
+
+      // Пополняем баланс до $40.00
+      await UserService.upsertFromTelegram(buyer1);
+      await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+        balanceUsdCents: 4000,
+        balance: 40,
+      });
+
+      // Главное меню: ровно 6 кнопок, без Gifts
+      await harness.sendText(buyer1, '/start');
+      const menuUi = harness.lastUiCall()!;
+      assert.deepEqual(menuUi.callbacks, [
+        'cat:stars',
+        'cat:premium',
+        'menu:orders',
+        'menu:profile',
+        'menu:topup',
+        'menu:support',
+      ]);
+      assert.equal(menuUi.text.toLowerCase().includes('gift'), false);
+
+      // Историческая запись Gifts остаётся в БД нетронутой
+      const histGift = await ProductService.getProductById('gift_star_box');
+      assert.ok(histGift && histGift.category === 'gifts');
+
+      // Stars 75 шт ($1.50 = 150 cents) -> изменение получателя -> подтверждение -> единый экран оплаты -> баланс
+      await harness.sendCallback(buyer1, 'cat:stars');
+      await harness.sendText(buyer1, '75');
+      await harness.sendText(buyer1, '@alpha_five');
+      await harness.sendCallback(buyer1, 'checkout:edit_recipient');
+      await harness.sendText(buyer1, '@Beta_Six6');
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      await harness.sendCallback(buyer1, 'checkout:proceed');
+      const chooser = harness.lastUiCall()!;
+      assert.ok(chooser.text.includes('1. Внутренний USD-баланс'));
+      assert.ok(chooser.text.includes('2. CryptoBot'));
+      assert.ok(chooser.text.includes('3. xRocket'));
+      assert.equal(chooser.text.includes('XTR'), false);
+
+      const ordersAfterProceed = await OrderService.getUserOrders(buyer1.id);
+      assert.equal(ordersAfterProceed.length, 1);
+      assert.equal(ordersAfterProceed[0].totalPriceUsdCents, 150);
+      assert.equal(ordersAfterProceed[0].recipientUsername, 'beta_six6');
+
+      await harness.sendCallback(buyer1, `pay_bal:${ordersAfterProceed[0].orderId}`);
+      assert.equal(await bs.getBalanceUsdCents(buyer1.id), 3850); // 4000 - 150
+      const paidStars = await OrderService.getOrderById(ordersAfterProceed[0].orderId);
+      assert.equal(paidStars?.paymentStatus, 'paid');
+
+      // Все 3 тарифа Premium доступны с прежними ценами ($13.90 / $19.90 / $34.90), оформление и отмена второго заказа
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'cat:premium');
+      const premUi = harness.lastUiCall()!;
+      assert.deepEqual(premUi.callbacks, [
+        'prem:select:premium_3m',
+        'prem:select:premium_6m',
+        'prem:select:premium_12m',
+        'menu:home',
+      ]);
+      assert.ok(premUi.text.includes('$13.90') && premUi.text.includes('$19.90') && premUi.text.includes('$34.90'));
+
+      await harness.sendCallback(buyer1, 'prem:select:premium_12m');
+      await harness.sendCallback(buyer1, 'rcpt_self');
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'checkout:proceed');
+      const allOrders = await OrderService.getUserOrders(buyer1.id);
+      assert.equal(allOrders.length, 2);
+      const prem12Order = allOrders.find((o) => o.productId === 'premium_12m')!;
+      assert.equal(prem12Order.totalPriceUsdCents, 3490);
+      assert.equal(prem12Order.durationMonths, 12);
+      assert.equal(prem12Order.quantity, 1);
+
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, `ucancel:${prem12Order.orderId}`);
+      assert.equal((await OrderService.getOrderById(prem12Order.orderId))?.paymentStatus, 'cancelled');
+
+      return 'Регрессия Stage 4.2.2 пройдена: меню, Stars ($0.02), Premium ($13.90/$19.90/$34.90), единый экран оплаты, отмена и БД-совместимость без сбоев.';
     },
   );
 

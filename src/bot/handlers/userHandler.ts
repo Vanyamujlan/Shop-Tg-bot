@@ -379,7 +379,13 @@ export async function renderCheckoutRecipientPrompt(
 ): Promise<void> {
   if (!ctx.from) return;
   const product = await ProductService.getProductById(session.productId);
-  if (!product || !product.isActive || product.category === 'gifts') {
+  if (
+    !product ||
+    !product.isActive ||
+    product.category === 'gifts' ||
+    (product.category === 'premium' &&
+      !ProductService.isValidBuyerPremiumProduct(product))
+  ) {
     clearUserCheckoutSession(ctx.from.id);
     await safeAnswerCbQuery(ctx, 'Выбранный товар сейчас недоступен.', true);
     await renderMainMenu(ctx);
@@ -390,6 +396,10 @@ export async function renderCheckoutRecipientPrompt(
   const calc = ProductService.calculateOrderPriceUsdCents(product, qty);
   const validSelfUsername = canUseTelegramUsernameAsRecipient(ctx.from.username);
   const canReturn = Boolean(session.returnToConfirm && session.recipientUsername);
+  const resolvedDuration =
+    product.category === 'premium'
+      ? ProductService.resolvePremiumDurationMonths(product)
+      : undefined;
 
   await safeRespondOrEdit(
     ctx,
@@ -398,7 +408,7 @@ export async function renderCheckoutRecipientPrompt(
       quantity: calc.quantity,
       totalPriceUsdCents: calc.totalPriceUsdCents,
       category: product.category,
-      durationMonths: product.durationMonths,
+      durationMonths: resolvedDuration,
     }),
     buildPromptRecipientKeyboard(product.category, validSelfUsername, canReturn),
   );
@@ -414,6 +424,8 @@ export async function renderCheckoutConfirmationCard(
     !product ||
     !product.isActive ||
     product.category === 'gifts' ||
+    (product.category === 'premium' &&
+      !ProductService.isValidBuyerPremiumProduct(product)) ||
     !session.recipientUsername
   ) {
     clearUserCheckoutSession(ctx.from.id);
@@ -424,11 +436,18 @@ export async function renderCheckoutConfirmationCard(
 
   const qty = product.category === 'premium' ? 1 : (session.quantity ?? 1);
   const calc = ProductService.calculateOrderPriceUsdCents(product, qty);
+  const resolvedProduct =
+    product.category === 'premium'
+      ? {
+          ...product,
+          durationMonths: ProductService.resolvePremiumDurationMonths(product),
+        }
+      : product;
 
   await safeRespondOrEdit(
     ctx,
     formatOrderConfirmationCardMessage({
-      product,
+      product: resolvedProduct,
       quantity: calc.quantity,
       unitPriceUsdCents: calc.unitPriceUsdCents,
       totalPriceUsdCents: calc.totalPriceUsdCents,
@@ -982,11 +1001,11 @@ export function registerUserHandlers(bot: Telegraf): void {
     }
 
     clearAllUserInteractiveSessions(ctx.from.id);
-    const products = await ProductService.getBuyerPremiumProducts();
+    const catalogState = await ProductService.getValidatedBuyerPremiumCatalog();
     await safeRespondOrEdit(
       ctx,
-      formatPremiumTariffsMessage(products),
-      buildPremiumTariffsKeyboard(products),
+      formatPremiumTariffsMessage(catalogState.availableProducts),
+      buildPremiumTariffsKeyboard(catalogState.availableProducts),
     );
   });
 
@@ -1012,8 +1031,22 @@ export function registerUserHandlers(bot: Telegraf): void {
 
     if (
       product.category === 'premium' &&
-      ProductService.BUYER_PREMIUM_IDS.has(product.id)
+      ProductService.isValidBuyerPremiumProduct(product)
     ) {
+      const catalogState = await ProductService.getValidatedBuyerPremiumCatalog();
+      if (!catalogState.allAvailable) {
+        await safeAnswerCbQuery(
+          ctx,
+          'Раздел Telegram Premium временно недоступен.',
+          true,
+        );
+        await safeRespondOrEdit(
+          ctx,
+          formatPremiumTariffsMessage(catalogState.availableProducts),
+          buildPremiumTariffsKeyboard(catalogState.availableProducts),
+        );
+        return;
+      }
       const nextSession: UserCheckoutSession = {
         mode: 'recipient_username',
         productId: product.id,
@@ -1025,11 +1058,11 @@ export function registerUserHandlers(bot: Telegraf): void {
       return;
     }
 
-    const products = await ProductService.getBuyerPremiumProducts();
+    const catalogState = await ProductService.getValidatedBuyerPremiumCatalog();
     await safeRespondOrEdit(
       ctx,
-      formatPremiumTariffsMessage(products),
-      buildPremiumTariffsKeyboard(products),
+      formatPremiumTariffsMessage(catalogState.availableProducts),
+      buildPremiumTariffsKeyboard(catalogState.availableProducts),
     );
   });
 

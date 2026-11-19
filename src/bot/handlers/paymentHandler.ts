@@ -100,8 +100,20 @@ export function registerPaymentHandlers(bot: Telegraf): void {
 
       if (
         product.category === 'premium' &&
-        ProductService.BUYER_PREMIUM_IDS.has(product.id)
+        ProductService.isValidBuyerPremiumProduct(product)
       ) {
+        const catalogState =
+          await ProductService.getValidatedBuyerPremiumCatalog();
+        if (!catalogState.allAvailable) {
+          clearAllUserInteractiveSessions(ctx.from.id);
+          await safeAnswerCbQuery(
+            ctx,
+            'Раздел Telegram Premium временно недоступен.',
+            true,
+          );
+          await renderMainMenu(ctx);
+          return;
+        }
         const nextSession: UserCheckoutSession = {
           mode: 'recipient_username',
           productId: product.id,
@@ -128,17 +140,20 @@ export function registerPaymentHandlers(bot: Telegraf): void {
       return;
     }
 
-    const product = await ProductService.getProductById(productId);
+    const [product, catalogState] = await Promise.all([
+      ProductService.getProductById(productId),
+      ProductService.getValidatedBuyerPremiumCatalog(),
+    ]);
     if (
-      !product ||
-      !product.isActive ||
-      product.category !== 'premium' ||
-      !ProductService.BUYER_PREMIUM_IDS.has(product.id) ||
-      !product.durationMonths ||
-      !ProductService.ALLOWED_PREMIUM_DURATIONS.has(product.durationMonths)
+      !catalogState.allAvailable ||
+      !ProductService.isValidBuyerPremiumProduct(product)
     ) {
       clearUserCheckoutSession(ctx.from.id);
-      await safeAnswerCbQuery(ctx, 'Выбранный тариф Premium недоступен.', true);
+      await safeAnswerCbQuery(
+        ctx,
+        'Выбранный тариф или раздел Telegram Premium временно недоступен.',
+        true,
+      );
       await renderMainMenu(ctx);
       return;
     }
@@ -164,7 +179,7 @@ export function registerPaymentHandlers(bot: Telegraf): void {
     if (!selfUsername) {
       await safeAnswerCbQuery(
         ctx,
-        'У вашего Telegram-профиля не задан корректный @username (5–32 латинских символа/цифры). Введите @username получателя вручную.',
+        'У вашего Telegram-профиля не задан корректный @username (5–32 символа: латинские буквы, цифры и "_"). Введите @username получателя вручную.',
         true,
       );
       return;
@@ -185,7 +200,13 @@ export function registerPaymentHandlers(bot: Telegraf): void {
       }
 
       const product = await ProductService.getProductById(targetProductId);
-      if (!product || !product.isActive || product.category === 'gifts') {
+      if (
+        !product ||
+        !product.isActive ||
+        product.category === 'gifts' ||
+        (product.category === 'premium' &&
+          !ProductService.isValidBuyerPremiumProduct(product))
+      ) {
         clearUserCheckoutSession(ctx.from.id);
         await safeAnswerCbQuery(ctx, 'Этот товар сейчас недоступен.', true);
         await renderMainMenu(ctx);

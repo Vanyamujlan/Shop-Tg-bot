@@ -18,6 +18,7 @@ import {
 } from '../services/PaymentProviders.ts';
 import { calculateTopUpCommission } from '../services/BalanceService.ts';
 import { ProductKeyStockSummary } from '../services/DigitalKeyService.ts';
+import { ProductService } from '../services/ProductService.ts';
 import { LiveCurrencyPreviewItem } from './formatters.ts';
 import { oeBtn } from './outlineEmoji.ts';
 
@@ -271,14 +272,10 @@ export function buildCatalogCategoriesKeyboard() {
 }
 
 export function buildPremiumTariffsKeyboard(products: Product[]) {
-  const tariffOrder = ['premium_3m', 'premium_6m', 'premium_12m'];
-  const sorted = [...products]
-    .filter((p) => tariffOrder.includes(p.id))
-    .sort((a, b) => (a.durationMonths ?? 0) - (b.durationMonths ?? 0));
-
-  const rows = sorted.map((p) => {
+  const catalog = ProductService.resolveBuyerPremiumCatalog(products);
+  const rows = catalog.availableProducts.map((p) => {
     const cents = p.priceUsdCents ?? p.price;
-    const months = p.durationMonths ?? (p.id === 'premium_3m' ? 3 : p.id === 'premium_6m' ? 6 : 12);
+    const months = ProductService.resolvePremiumDurationMonths(p);
     const monthWord = months === 3 ? 'месяца' : 'месяцев';
     return [
       Markup.button.callback(

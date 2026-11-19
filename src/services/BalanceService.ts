@@ -1091,6 +1091,15 @@ export class BalanceService {
       }
 
       if (existingOrder) {
+        if (existingOrder.productId !== product.id) {
+          throw new Error('Несовпадение товара в заказе при оплате с баланса.');
+        }
+        if (
+          params.quantity !== undefined &&
+          params.quantity !== existingOrder.quantity
+        ) {
+          throw new Error('Количество при оплате существующего заказа изменить нельзя.');
+        }
         ProductService.validateOrderQuantity(product, existingOrder.quantity);
       }
 
@@ -1111,18 +1120,25 @@ export class BalanceService {
             params.quantity === undefined ? 1 : params.quantity,
           );
 
-      const resolvedDurationMonths =
-        product.category === 'premium'
-          ? (existingOrder?.durationMonths ??
-            product.durationMonths ??
-            (product.id === 'premium_3m'
-              ? 3
-              : product.id === 'premium_6m'
-                ? 6
-                : product.id === 'premium_12m'
-                  ? 12
-                  : undefined))
-          : undefined;
+      let resolvedDurationMonths: 3 | 6 | 12 | undefined;
+      if (product.category === 'premium' || existingOrder?.category === 'premium') {
+        if (product.category !== 'premium') {
+          throw new Error('Некорректная категория товара для подписки Premium.');
+        }
+        if (calc.quantity !== 1) {
+          throw new Error('Для подписки Telegram Premium количество всегда равно 1.');
+        }
+        const productDuration = ProductService.resolvePremiumDurationMonths(product);
+        if (existingOrder?.durationMonths !== undefined) {
+          const orderDuration = ProductService.assertValidPremiumDuration(
+            existingOrder.durationMonths,
+          );
+          if (orderDuration !== productDuration) {
+            throw new Error('Несоответствие срока подписки Telegram Premium в заказе.');
+          }
+        }
+        resolvedDurationMonths = productDuration;
+      }
 
       const existingRecipient =
         existingOrder?.recipientUsername !== undefined

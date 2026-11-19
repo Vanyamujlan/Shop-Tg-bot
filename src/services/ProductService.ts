@@ -16,6 +16,126 @@ export class ProductService {
     'premium_12m',
   ]);
   public static readonly ALLOWED_PREMIUM_DURATIONS = new Set<number>([3, 6, 12]);
+  public static readonly REQUIRED_PREMIUM_TARIFFS = [
+    { id: 'premium_3m', durationMonths: 3 as const, priceUsdCents: 1390 },
+    { id: 'premium_6m', durationMonths: 6 as const, priceUsdCents: 1990 },
+    { id: 'premium_12m', durationMonths: 12 as const, priceUsdCents: 3490 },
+  ] as const;
+
+  public static assertValidPremiumDuration(duration: unknown): 3 | 6 | 12 {
+    if (
+      typeof duration !== 'number' ||
+      !Number.isFinite(duration) ||
+      !Number.isInteger(duration) ||
+      !this.ALLOWED_PREMIUM_DURATIONS.has(duration)
+    ) {
+      throw new Error(
+        'Недопустимый срок подписки Telegram Premium: обязательно укажите 3, 6 или 12 (допустимы только 3, 6 или 12 месяцев).',
+      );
+    }
+    return duration as 3 | 6 | 12;
+  }
+
+  public static resolvePremiumDurationMonths(product: Product): 3 | 6 | 12 {
+    const tariffSpec = this.REQUIRED_PREMIUM_TARIFFS.find(
+      (t) => t.id === product.id,
+    );
+
+    if (product.durationMonths !== undefined) {
+      const validDuration = this.assertValidPremiumDuration(product.durationMonths);
+      if (tariffSpec && validDuration !== tariffSpec.durationMonths) {
+        throw new Error(
+          `Некорректный срок подписки у тарифа "${product.id}": ожидалось ${tariffSpec.durationMonths} мес., получено ${validDuration}.`,
+        );
+      }
+      return validDuration;
+    }
+
+    if (tariffSpec) {
+      return tariffSpec.durationMonths;
+    }
+
+    throw new Error(
+      `У товара Telegram Premium "${product.id}" не указан обязательный срок подписки (3, 6 или 12 месяцев).`,
+    );
+  }
+
+  public static isValidBuyerPremiumProduct(
+    product: Product | null | undefined,
+  ): product is Product {
+    if (!product || !product.isActive || product.category !== 'premium') {
+      return false;
+    }
+
+    const tariffSpec = this.REQUIRED_PREMIUM_TARIFFS.find(
+      (t) => t.id === product.id,
+    );
+    if (!tariffSpec) return false;
+
+    try {
+      const resolvedDuration = this.resolvePremiumDurationMonths(product);
+      if (resolvedDuration !== tariffSpec.durationMonths) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+
+    const cents = product.priceUsdCents ?? product.price;
+    if (
+      typeof cents !== 'number' ||
+      !Number.isSafeInteger(cents) ||
+      cents !== tariffSpec.priceUsdCents
+    ) {
+      return false;
+    }
+
+    if (
+      product.priceUsdCents !== undefined &&
+      product.priceUsdCents !== tariffSpec.priceUsdCents
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  public static resolveBuyerPremiumCatalog(products: Product[]): {
+    allAvailable: boolean;
+    availableProducts: Product[];
+    validProducts: Product[];
+    missingOrInvalidIds: string[];
+  } {
+    const byId = new Map<string, Product>();
+    for (const p of products) {
+      if (this.isValidBuyerPremiumProduct(p) && !byId.has(p.id)) {
+        byId.set(p.id, p);
+      }
+    }
+
+    const validProducts: Product[] = [];
+    const missingOrInvalidIds: string[] = [];
+
+    for (const spec of this.REQUIRED_PREMIUM_TARIFFS) {
+      const found = byId.get(spec.id);
+      if (found) {
+        validProducts.push(found);
+      } else {
+        missingOrInvalidIds.push(spec.id);
+      }
+    }
+
+    const allAvailable =
+      missingOrInvalidIds.length === 0 &&
+      validProducts.length === this.REQUIRED_PREMIUM_TARIFFS.length;
+
+    return {
+      allAvailable,
+      availableProducts: allAvailable ? validProducts : [],
+      validProducts,
+      missingOrInvalidIds,
+    };
+  }
 
   /**
    * Resolves effective [minQuantity, maxQuantity] bounds for a product,
@@ -71,17 +191,7 @@ export class ProductService {
     rawQuantity: number | string = 1,
   ): number {
     if (product.category === 'premium') {
-      const catalogDef = INITIAL_TEST_PRODUCTS.find((p) => p.id === product.id);
-      const effectiveDuration =
-        product.durationMonths ?? catalogDef?.durationMonths;
-      if (
-        effectiveDuration === undefined ||
-        !this.ALLOWED_PREMIUM_DURATIONS.has(effectiveDuration)
-      ) {
-        throw new Error(
-          'Недопустимый срок подписки Telegram Premium: доступны только 3, 6 или 12 месяцев.',
-        );
-      }
+      this.resolvePremiumDurationMonths(product);
     }
 
     const { minQuantity: minQ, maxQuantity: maxQ } =
@@ -176,7 +286,7 @@ export class ProductService {
     if (!product.isActive) return false;
     return (
       product.id === this.BUYER_STARS_PRODUCT_ID ||
-      this.BUYER_PREMIUM_IDS.has(product.id)
+      this.isValidBuyerPremiumProduct(product)
     );
   }
 
@@ -186,11 +296,19 @@ export class ProductService {
     return prod;
   }
 
-  public static async getBuyerPremiumProducts(): Promise<Product[]> {
+  public static async getValidatedBuyerPremiumCatalog(): Promise<{
+    allAvailable: boolean;
+    availableProducts: Product[];
+    validProducts: Product[];
+    missingOrInvalidIds: string[];
+  }> {
     const allPremium = await this.getProductsByCategory('premium', false, 20);
-    return allPremium
-      .filter((p) => this.BUYER_PREMIUM_IDS.has(p.id))
-      .sort((a, b) => (a.durationMonths ?? 0) - (b.durationMonths ?? 0));
+    return this.resolveBuyerPremiumCatalog(allPremium);
+  }
+
+  public static async getBuyerPremiumProducts(): Promise<Product[]> {
+    const state = await this.getValidatedBuyerPremiumCatalog();
+    return state.availableProducts;
   }
 
   public static async getBuyerCatalogProducts(): Promise<Product[]> {
@@ -289,15 +407,10 @@ export class ProductService {
       );
     }
 
-    if (
-      input.category === 'premium' &&
-      input.durationMonths !== undefined &&
-      !this.ALLOWED_PREMIUM_DURATIONS.has(input.durationMonths)
-    ) {
-      throw new Error(
-        'Недопустимый срок подписки Telegram Premium: доступны только 3, 6 или 12 месяцев.',
-      );
-    }
+    const validatedDuration =
+      input.category === 'premium'
+        ? this.assertValidPremiumDuration(input.durationMonths)
+        : undefined;
 
     const product: Product = {
       id,
@@ -312,8 +425,8 @@ export class ProductService {
       currency: 'USD',
       ...(minQuantity !== undefined ? { minQuantity } : {}),
       ...(maxQuantity !== undefined ? { maxQuantity } : {}),
-      ...(input.durationMonths !== undefined
-        ? { durationMonths: input.durationMonths }
+      ...(validatedDuration !== undefined
+        ? { durationMonths: validatedDuration }
         : {}),
       imageUrl: (input.imageUrl || '').trim().slice(0, 500),
       isActive: true,

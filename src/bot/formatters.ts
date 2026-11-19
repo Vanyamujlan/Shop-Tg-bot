@@ -27,6 +27,7 @@ import {
 } from '../services/PaymentProviders.ts';
 import { calculateTopUpCommission } from '../services/BalanceService.ts';
 import { ProductKeyStockSummary } from '../services/DigitalKeyService.ts';
+import { ProductService } from '../services/ProductService.ts';
 import { oe } from './outlineEmoji.ts';
 
 export interface LiveCurrencyPreviewItem {
@@ -151,23 +152,28 @@ export function formatCategoryListMessage(
 }
 
 export function formatPremiumTariffsMessage(products: Product[]): string {
-  const tariffLines = products.map((p) => {
+  const catalog = ProductService.resolveBuyerPremiumCatalog(products);
+  if (!catalog.allAvailable || catalog.availableProducts.length === 0) {
+    return [
+      `${oe('premium')} <b>Купить Telegram Premium</b>`,
+      '',
+      `${oe('warning')} <b>Раздел Telegram Premium временно недоступен.</b>`,
+      'Не все обязательные тарифы сейчас активны в каталоге. Попробуйте позже или обратитесь в поддержку (/paysupport).',
+    ].join('\n');
+  }
+
+  const tariffLines = catalog.availableProducts.map((p) => {
     const cents = p.priceUsdCents ?? p.price;
-    const months = p.durationMonths ?? '';
-    return `• <b>${months} месяцев</b> — <code>${formatUsdCents(cents)}</code>`;
+    const months = ProductService.resolvePremiumDurationMonths(p);
+    const monthWord = months === 3 ? 'месяца' : 'месяцев';
+    return `• <b>${months} ${monthWord}</b> — <code>${formatUsdCents(cents)}</code>`;
   });
 
   return [
     `${oe('premium')} <b>Купить Telegram Premium</b>`,
     '',
     'Доступные тарифы:',
-    ...(tariffLines.length > 0
-      ? tariffLines
-      : [
-          '• <b>3 месяца</b> — <code>$13.90</code>',
-          '• <b>6 месяцев</b> — <code>$19.90</code>',
-          '• <b>12 месяцев</b> — <code>$34.90</code>',
-        ]),
+    ...tariffLines,
     '',
     'Выберите подходящий срок подписки:',
   ].join('\n');

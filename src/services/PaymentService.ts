@@ -179,7 +179,24 @@ export class PaymentService {
     if (!product || !product.isActive) {
       throw new Error('Товар снят с продажи.');
     }
+    if (product.category !== order.category) {
+      throw new Error('Несоответствие категории товара в заказе.');
+    }
     ProductService.validateOrderQuantity(product, order.quantity);
+    if (product.category === 'premium' || order.category === 'premium') {
+      if (order.quantity !== 1) {
+        throw new Error('Для подписки Telegram Premium количество всегда равно 1.');
+      }
+      const productDuration = ProductService.resolvePremiumDurationMonths(product);
+      if (order.durationMonths !== undefined) {
+        const orderDuration = ProductService.assertValidPremiumDuration(
+          order.durationMonths,
+        );
+        if (orderDuration !== productDuration) {
+          throw new Error('Несоответствие срока подписки Telegram Premium в заказе.');
+        }
+      }
+    }
     const normalizedRecipient =
       order.recipientUsername !== undefined
         ? normalizeRecipientUsername(order.recipientUsername)
@@ -754,7 +771,10 @@ export class PaymentService {
           );
         }
 
-        const existingUser = await tx.get<StoreUser>('users', freshOrder.userId);
+        const [existingUser, freshProduct] = await Promise.all([
+          tx.get<StoreUser>('users', freshOrder.userId),
+          tx.get<Product>('products', freshOrder.productId),
+        ]);
 
         if (
           freshPayment.status === 'paid' ||
@@ -792,6 +812,20 @@ export class PaymentService {
           throw new Error(
             `Заказ #${freshOrder.orderId} уже имеет статус оплаты "${freshOrder.paymentStatus}" и не может быть повторно оплачен другим платежом.`,
           );
+        }
+
+        if (freshOrder.category === 'premium') {
+          if (freshOrder.quantity !== 1) {
+            throw new Error(
+              'Для подписки Telegram Premium количество всегда равно 1.',
+            );
+          }
+          if (freshOrder.durationMonths !== undefined) {
+            ProductService.assertValidPremiumDuration(freshOrder.durationMonths);
+          }
+          if (freshProduct) {
+            ProductService.validateOrderQuantity(freshProduct, freshOrder.quantity);
+          }
         }
 
         const now = new Date().toISOString();
