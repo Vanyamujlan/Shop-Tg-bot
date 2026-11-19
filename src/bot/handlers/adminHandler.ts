@@ -38,6 +38,7 @@ import {
   buildAdminOrderActionKeyboard,
   buildAdminOrderBalanceRefundConfirmKeyboard,
   buildAdminOrdersKeyboard,
+  buildAdminPremiumDurationPickKeyboard,
   buildAdminProductManageKeyboard,
   buildAdminProductsKeyboard,
   buildAdminTopUpDetailKeyboard,
@@ -50,6 +51,7 @@ import {
 } from '../keyboards.ts';
 import {
   escapeHtml,
+  formatAdminCatalogDiagnosticsSummary,
   formatAdminOrderCard,
   formatAdminStatsMessage,
   formatAdminTopUpCard,
@@ -64,6 +66,7 @@ import {
 } from '../formatters.ts';
 import {
   isDuplicateCallbackClick,
+  registerSessionCleanupHook,
   safeAnswerCbQuery,
   safeRespondOrEdit,
 } from './userHandler.ts';
@@ -172,6 +175,8 @@ export function registerAdminHandlers(
   bot: Telegraf,
   getBotStatus: () => BotConnectionStatus,
 ): void {
+  registerSessionCleanupHook(clearAdminSession);
+
   // Команда /admin
   bot.command('admin', async (ctx) => {
     if (!(await ensureAdmin(ctx))) return;
@@ -860,24 +865,80 @@ export function registerAdminHandlers(
   });
 
   // 3. Управление товарами
-  bot.action('adm:products', async (ctx) => {
-    if (!(await ensureAdmin(ctx))) return;
-    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:products')) return;
-    clearAdminSession(ctx.from!.id);
-    const products = await ProductService.getAllProducts(true);
+  const renderAdminProductsScreen = async (ctx: Context, notice?: string) => {
+    const [products, diag] = await Promise.all([
+      ProductService.getAllProducts(true),
+      ProductService.diagnoseBuyerCatalog(),
+    ]);
+
     await safeRespondOrEdit(
       ctx,
       [
         `🛍 <b>Управление товарами (всего: ${products.length})</b>`,
+        notice ? `\n${notice}` : '',
         '',
         '🟢 — товар активен и виден покупателям',
         '🔴 — товар временно скрыт из каталога',
         '',
+        formatAdminCatalogDiagnosticsSummary(diag),
+        '',
         'Выберите товар для изменения цены, описания или статуса:',
-      ].join('\n'),
-      buildAdminProductsKeyboard(products),
+      ]
+        .filter((line, idx, arr) => !(line === '' && arr[idx - 1] === ''))
+        .join('\n'),
+      buildAdminProductsKeyboard(products, diag.hasMissing),
     );
+  };
+
+  bot.action('adm:products', async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:products')) return;
+    clearAdminSession(ctx.from!.id);
+    await renderAdminProductsScreen(ctx);
   });
+
+  // Безопасное создание только отсутствующих канонических тарифов Stars/Premium
+  bot.action('adm:restore_canonical', async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    if (isDuplicateCallbackClick(ctx.from!.id, 'adm:restore_canonical', 1500)) {
+      return;
+    }
+
+    const res = await ProductService.ensureMissingCanonicalBuyerProducts();
+    if (res.createdIds.length > 0) {
+      await logAdminAudit(
+        ctx.from!.id,
+        'canonical_catalog',
+        0,
+        `Создал недостающие обязательные тарифы: ${res.createdIds.join(', ')}`,
+      );
+      await safeAnswerCbQuery(
+        ctx,
+        `Создано недостающих тарифов: ${res.createdIds.length}`,
+        true,
+      );
+    } else {
+      await safeAnswerCbQuery(
+        ctx,
+        'Все обязательные документы уже присутствуют в БД (перезапись не выполнялась).',
+        true,
+      );
+    }
+
+    const notice =
+      res.createdIds.length > 0
+        ? `✅ Созданы недостающие тарифы: <code>${escapeHtml(res.createdIds.join(', '))}</code> (существующие товары и цены не изменены).`
+        : 'ℹ️ Отсутствующих документов Stars/Premium не найдено; существующие товары не перезаписывались.';
+
+    await renderAdminProductsScreen(ctx, notice);
+  });
+
+  const formatCanonicalProductWarning = async (productId: string): Promise<string> => {
+    const diag = await ProductService.diagnoseBuyerCatalog();
+    const entry = diag.items.find((i) => i.id === productId);
+    if (!entry || entry.status === 'ok') return '';
+    return `⚠️ <b>Предупреждение каталога:</b> ${escapeHtml(entry.reason || entry.status)}`;
+  };
 
   // Карточка управления конкретным товаром
   bot.action(/^adm:prod:([a-zA-Z0-9_-]+)$/, async (ctx) => {
@@ -891,14 +952,18 @@ export function registerAdminHandlers(
       return;
     }
 
+    const warning = await formatCanonicalProductWarning(product.id);
     await safeRespondOrEdit(
       ctx,
       [
         `⚙️ <b>Редактирование товара</b> (ID: <code>${escapeHtml(product.id)}</code>)`,
         `Статус: ${product.isActive ? '🟢 Активен' : '🔴 Отключён'}`,
+        warning,
         '',
         formatProductCardMessage(product),
-      ].join('\n'),
+      ]
+        .filter((line, idx, arr) => !(line === '' && arr[idx - 1] === '') && (idx === 3 || line !== ''))
+        .join('\n'),
       buildAdminProductManageKeyboard(product),
     );
   });
@@ -928,14 +993,18 @@ export function registerAdminHandlers(
       ctx,
       updated.isActive ? 'Товар включён в каталоге!' : 'Товар скрыт из каталога.',
     );
+    const warning = await formatCanonicalProductWarning(updated.id);
     await safeRespondOrEdit(
       ctx,
       [
         `⚙️ <b>Редактирование товара</b> (ID: <code>${escapeHtml(updated.id)}</code>)`,
         `Статус: ${updated.isActive ? '🟢 Активен' : '🔴 Отключён'}`,
+        warning,
         '',
         formatProductCardMessage(updated),
-      ].join('\n'),
+      ]
+        .filter((line, idx, arr) => !(line === '' && arr[idx - 1] === '') && (idx === 3 || line !== ''))
+        .join('\n'),
       buildAdminProductManageKeyboard(updated),
     );
   });
@@ -951,12 +1020,7 @@ export function registerAdminHandlers(
     await ProductService.deleteProduct(productId);
     await logAdminAudit(ctx.from!.id, productId, 0, `Удалил товар ${productId}`);
     await safeAnswerCbQuery(ctx, 'Товар удалён из каталога.');
-    const products = await ProductService.getAllProducts(true);
-    await safeRespondOrEdit(
-      ctx,
-      `🛍 <b>Управление товарами (всего: ${products.length})</b>\n\nТовар успешно удалён.`,
-      buildAdminProductsKeyboard(products),
-    );
+    await renderAdminProductsScreen(ctx, '🗑 Товар успешно удалён.');
   });
 
   // Запрос ввода новой цены товара
@@ -1046,6 +1110,20 @@ export function registerAdminHandlers(
     if (!(await ensureAdmin(ctx))) return;
     const category = ctx.match[1] as ProductCategory;
 
+    if (category === 'premium') {
+      clearAdminSession(ctx.from!.id);
+      await safeRespondOrEdit(
+        ctx,
+        [
+          `➕ <b>Добавление товара в категорию ${CATEGORY_LABELS.premium}</b>`,
+          '',
+          'Шаг 2: Выберите фиксированный срок подписки (допустимы только 3, 6 или 12 месяцев):',
+        ].join('\n'),
+        buildAdminPremiumDurationPickKeyboard(),
+      );
+      return;
+    }
+
     setAdminSession(ctx.from!.id, {
       action: 'add_product_name',
       draftProduct: { category },
@@ -1058,6 +1136,32 @@ export function registerAdminHandlers(
         `➕ <b>Добавление товара в категорию ${CATEGORY_LABELS[category]}</b>`,
         '',
         'Шаг 2 из 4: Отправьте в чат <b>название</b> нового товара:',
+      ].join('\n'),
+      Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Отмена', 'adm:products')],
+      ]),
+    );
+  });
+
+  bot.action(/^adm:addprem_dur:(3|6|12)$/, async (ctx) => {
+    if (!(await ensureAdmin(ctx))) return;
+    const durationMonths = Number(ctx.match[1]) as 3 | 6 | 12;
+
+    setAdminSession(ctx.from!.id, {
+      action: 'add_product_name',
+      draftProduct: {
+        category: 'premium',
+        durationMonths,
+      },
+      createdAt: Date.now(),
+    });
+
+    await safeRespondOrEdit(
+      ctx,
+      [
+        `➕ <b>Добавление товара: ${CATEGORY_LABELS.premium} (${durationMonths} мес.)</b>`,
+        '',
+        'Отправьте в чат <b>название</b> нового товара:',
       ].join('\n'),
       Markup.inlineKeyboard([
         [Markup.button.callback('❌ Отмена', 'adm:products')],
@@ -1650,6 +1754,9 @@ export function registerAdminHandlers(
         const priceUsdCents = usdInputToCents(text);
         const created = await ProductService.createProduct({
           category: session.draftProduct.category,
+          ...(session.draftProduct.durationMonths !== undefined
+            ? { durationMonths: session.draftProduct.durationMonths }
+            : {}),
           name: session.draftProduct.name || 'Новый товар',
           description: session.draftProduct.description || 'Цифровой товар Telegram',
           priceUsdCents,

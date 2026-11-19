@@ -747,7 +747,89 @@ export class FirestoreRepository {
       console.log(
         `[Firestore] Загружено ${INITIAL_TEST_PRODUCTS.length} стартовых товаров в каталог.`,
       );
+      return;
     }
+
+    // 4. Safe non-overwriting migration: ensure canonical Stars & Premium docs exist
+    // even when production Firestore already contains legacy products.
+    await this.ensureMissingCanonicalCatalogProducts();
+  }
+
+  /**
+   * Safely creates ONLY missing canonical buyer products (stars_custom, premium_3m,
+   * premium_6m, premium_12m). NEVER overwrites existing product documents or modifies
+   * existing prices/settings.
+   */
+  public async ensureMissingCanonicalCatalogProducts(): Promise<{
+    createdIds: string[];
+    existingProblems: Array<{ id: string; reason: string }>;
+  }> {
+    const canonicalIds = new Set([
+      'stars_custom',
+      'premium_3m',
+      'premium_6m',
+      'premium_12m',
+    ]);
+    const now = new Date().toISOString();
+    const createdIds: string[] = [];
+    const existingProblems: Array<{ id: string; reason: string }> = [];
+
+    for (const item of INITIAL_TEST_PRODUCTS) {
+      if (!canonicalIds.has(item.id)) continue;
+
+      const existing = await this.getDoc<Product>('products', item.id);
+      if (!existing) {
+        const product: Product = {
+          ...item,
+          createdAt: now,
+          updatedAt: now,
+        };
+        await this.setDoc<Product>('products', item.id, product);
+        createdIds.push(item.id);
+        console.log(
+          `[Firestore] Безопасная миграция каталога: создан недостающий обязательный товар "${item.id}".`,
+        );
+        continue;
+      }
+
+      if (!existing.isActive) {
+        existingProblems.push({
+          id: item.id,
+          reason: 'отключён (isActive = false)',
+        });
+      } else if (existing.category !== item.category) {
+        existingProblems.push({
+          id: item.id,
+          reason: `неверная категория "${String(existing.category)}" вместо "${item.category}"`,
+        });
+      } else if (item.category === 'premium') {
+        const currentCents = existing.priceUsdCents ?? existing.price;
+        if (
+          existing.durationMonths !== undefined &&
+          existing.durationMonths !== item.durationMonths
+        ) {
+          existingProblems.push({
+            id: item.id,
+            reason: `неверный срок durationMonths (${String(existing.durationMonths)} вместо ${item.durationMonths})`,
+          });
+        } else if (currentCents !== item.priceUsdCents) {
+          existingProblems.push({
+            id: item.id,
+            reason: `несоответствие цены (${currentCents} центов вместо ${item.priceUsdCents})`,
+          });
+        }
+      }
+    }
+
+    if (existingProblems.length > 0) {
+      console.warn(
+        `[Firestore] Диагностика каталога Stars/Premium: обнаружены проблемы у существующих товаров (не перезаписаны автоматически): ${existingProblems
+          .map((p) => `${p.id}: ${p.reason}`)
+          .join('; ')}`,
+      );
+    }
+
+    return { createdIds, existingProblems };
   }
 
   /**

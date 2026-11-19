@@ -26,7 +26,7 @@ import {
   verifyWebhookSecretToken,
   isValidTelegramUpdatePayload,
 } from '../bot/bot.ts';
-import { ensureAdmin, ensureOwner } from '../bot/handlers/adminHandler.ts';
+import { ensureAdmin, ensureOwner, registerAdminHandlers } from '../bot/handlers/adminHandler.ts';
 import {
   clearAllUserInteractiveSessions,
   clearCallbackDebounceMap,
@@ -160,7 +160,7 @@ interface CapturedBotCall {
   callbacks: string[];
 }
 
-function createWiredBotHarness() {
+function createWiredBotHarness(includeAdmin = false) {
   const bot = new Telegraf('000000:TEST_HARNESS_TOKEN');
   (bot as unknown as { botInfo: Record<string, unknown> }).botInfo = {
     id: 999000111,
@@ -216,6 +216,15 @@ function createWiredBotHarness() {
 
   registerUserHandlers(bot);
   registerPaymentHandlers(bot);
+  if (includeAdmin) {
+    registerAdminHandlers(bot, () => ({
+      connected: true,
+      mode: 'polling',
+      pollingActive: true,
+      botUsername: 'quizystars_bot',
+      lastCheckedAt: new Date().toISOString(),
+    }));
+  }
 
   return {
     bot,
@@ -6568,6 +6577,282 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.equal((await OrderService.getOrderById(prem12Order.orderId))?.paymentStatus, 'cancelled');
 
       return 'Регрессия Stage 4.2.2 пройдена: меню, Stars ($0.02), Premium ($13.90/$19.90/$34.90), единый экран оплаты, отмена и БД-совместимость без сбоев.';
+    },
+  );
+
+  // =========================================================================
+  // STAGE 4.2.4: STARS & PREMIUM UX + SAFE FIRESTORE MIGRATION + /paysupport
+  // =========================================================================
+
+  await runTest(
+    'S424-01',
+    'Payments',
+    'Улучшенный выбор Stars: быстрые кнопки, произвольное количество 50..100000, $0.02/Star, авторасчёт и защита ввода',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+
+      // 1. Экран выбора Stars показывает $0.02, свободный ввод 50..100000 и быстрые пресеты stars:qty:*
+      await harness.sendCallback(buyer1, 'cat:stars');
+      const qtyPrompt = harness.lastUiCall()!;
+      assert.ok(qtyPrompt.text.includes('Введите количество Stars'));
+      assert.ok(qtyPrompt.text.includes('$0.02'));
+      assert.ok(qtyPrompt.callbacks.includes('stars:qty:50'));
+      assert.ok(qtyPrompt.callbacks.includes('stars:qty:100'));
+      assert.ok(qtyPrompt.callbacks.includes('stars:qty:250'));
+      assert.ok(qtyPrompt.callbacks.includes('stars:qty:500'));
+      assert.ok(qtyPrompt.callbacks.includes('stars:qty:1000'));
+      assert.ok(qtyPrompt.callbacks.includes('stars:qty:5000'));
+      assert.equal(qtyPrompt.callbacks.some((c) => c.startsWith('prod:stars_pack_')), false);
+
+      // 2. Нажатие быстрого пресета stars:qty:250 сразу рассчитывает $5.00 и предлагает купить себе или другому
+      await harness.sendCallback(buyer1, 'stars:qty:250');
+      const presetRcpt = harness.lastUiCall()!;
+      assert.ok(presetRcpt.text.includes('250 ⭐'));
+      assert.ok(presetRcpt.text.includes('$0.02'));
+      assert.ok(presetRcpt.text.includes('$5.00'));
+      assert.ok(presetRcpt.callbacks.includes('rcpt_self'));
+
+      // 3. Возврат назад к вводу количества и проверка отклонения невалидных значений (включая запятую и текст с числами)
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'stars:edit_qty');
+      for (const bad of ['49', '100001', '0', '-50', '50.5', '50,5', 'abc', '100 stars']) {
+        await harness.sendText(buyer1, bad);
+        assert.ok(
+          harness.lastUiCall()!.text.includes('Некорректное количество'),
+          `Ожидался отказ для ввода ${JSON.stringify(bad)}`,
+        );
+      }
+
+      // 4. Граничный и произвольный ввод: 333 Stars ($6.66) и редактирование на 100000 ($2000.00)
+      await harness.sendText(buyer1, '333');
+      assert.ok(harness.lastUiCall()!.text.includes('333 ⭐'));
+      assert.ok(harness.lastUiCall()!.text.includes('$6.66'));
+
+      await harness.sendText(buyer1, '@Friend_Star');
+      const confirmCard = harness.lastUiCall()!;
+      assert.ok(confirmCard.text.includes('Подтверждение заказа'));
+      assert.ok(confirmCard.text.includes('333 ⭐'));
+      assert.ok(confirmCard.text.includes('$0.02'));
+      assert.ok(confirmCard.text.includes('@friend_star'));
+      assert.ok(confirmCard.text.includes('$6.66'));
+
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'checkout:edit_qty');
+      await harness.sendCallback(buyer1, 'stars:qty:50');
+      const confirmMin = harness.lastUiCall()!;
+      assert.ok(confirmMin.text.includes('50 ⭐'));
+      assert.ok(confirmMin.text.includes('$1.00'));
+      assert.ok(confirmMin.text.includes('@friend_star'));
+
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'checkout:edit_qty');
+      await harness.sendText(buyer1, '100000');
+      const confirmMax = harness.lastUiCall()!;
+      assert.ok(confirmMax.text.includes('100000 ⭐'));
+      assert.ok(confirmMax.text.includes('$2000.00'));
+
+      // 5. Подменённый callback быстрого пресета (stars:qty:10) отклоняется и не создаёт заказ
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'stars:qty:10');
+      assert.ok(harness.lastAnswer()?.text?.includes('Некорректное количество'));
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      return 'Быстрые пресеты Stars, произвольный ввод 50..100000 ($0.02/Star), отказ некорректного ввода и подтверждение до создания заказа подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S424-02',
+    'Payments',
+    'Улучшенный выбор Telegram Premium: 3 тарифа, quantity=1, покупка себе/другому, отказ некорректных сроков',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+
+      await harness.sendCallback(buyer1, 'cat:premium');
+      const premList = harness.lastUiCall()!;
+      assert.ok(premList.text.includes('3 месяца') && premList.text.includes('$13.90'));
+      assert.ok(premList.text.includes('6 месяцев') && premList.text.includes('$19.90'));
+      assert.ok(premList.text.includes('12 месяцев') && premList.text.includes('$34.90'));
+
+      // Выбор 3 месяца ($13.90) -> явно показывает срок, quantity=1, сумму и кнопки «Купить себе» / Назад
+      await harness.sendCallback(buyer1, 'prem:select:premium_3m');
+      const rcptUi = harness.lastUiCall()!;
+      assert.ok(rcptUi.text.includes('Telegram Premium — 3 мес.'));
+      assert.ok(rcptUi.text.includes('Количество: <b>1</b>'));
+      assert.ok(rcptUi.text.includes('$13.90'));
+      assert.ok(rcptUi.callbacks.includes('rcpt_self'));
+
+      await harness.sendCallback(buyer1, 'rcpt_self');
+      const confirmUi = harness.lastUiCall()!;
+      assert.ok(confirmUi.text.includes('Подтверждение заказа'));
+      assert.ok(confirmUi.text.includes('3 мес.'));
+      assert.ok(confirmUi.text.includes('Количество: <b>1</b>'));
+      assert.ok(confirmUi.text.includes('$13.90'));
+      assert.ok(confirmUi.text.includes(`@${buyer1.username!.toLowerCase()}`));
+      assert.equal((await OrderService.getUserOrders(buyer1.id)).length, 0);
+
+      // Попытка выбрать несуществующие/некорректные сроки отклоняется
+      for (const badId of ['prem:select:premium_9m', 'prem:select:premium_24m', 'prem:select:gift_star_box']) {
+        clearCallbackDebounceMap();
+        await harness.sendCallback(buyer1, badId);
+        assert.ok(harness.lastAnswer()?.text?.includes('временно недоступен'));
+      }
+
+      return 'Выбор 3/6/12 месяцев Premium ($13.90/$19.90/$34.90), quantity=1 и блокировка некорректных сроков подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S424-03',
+    'Database',
+    'Безопасная неперезаписывающая миграция Firestore при непустом каталоге и диагностика/восстановление в админке',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+
+      // 1. Симулируем живую БД с уже существующими старыми товарами, где отсутствуют premium_3m/6m/12m и stars_custom
+      await firestoreRepo.deleteDoc('products', 'stars_custom');
+      await firestoreRepo.deleteDoc('products', 'premium_3m');
+      await firestoreRepo.deleteDoc('products', 'premium_6m');
+      await firestoreRepo.deleteDoc('products', 'premium_12m');
+      await firestoreRepo.updateDoc<Product>('products', 'stars_pack_50', {
+        name: 'Legacy Custom Pack 50',
+        priceUsdCents: 111,
+        price: 111,
+      });
+      const legacySnapshotBefore = await ProductService.getProductById('stars_pack_50');
+
+      const buyerHarness = createWiredBotHarness(false);
+      await buyerHarness.sendCallback(buyer1, 'cat:premium');
+      assert.ok(buyerHarness.lastUiCall()!.text.includes('временно недоступен'));
+
+      // 2. Запуск безопасной миграции создаёт ТОЛЬКО отсутствующие канонические товары и НЕ трогает legacy товары
+      const migrationRes = await firestoreRepo.ensureMissingCanonicalCatalogProducts();
+      assert.deepEqual(migrationRes.createdIds, [
+        'stars_custom',
+        'premium_3m',
+        'premium_6m',
+        'premium_12m',
+      ]);
+      const legacySnapshotAfter = await ProductService.getProductById('stars_pack_50');
+      assert.equal(legacySnapshotAfter?.name, 'Legacy Custom Pack 50');
+      assert.equal(legacySnapshotAfter?.priceUsdCents, 111);
+      assert.equal(legacySnapshotAfter?.updatedAt, legacySnapshotBefore?.updatedAt);
+
+      // Теперь Premium у покупателя сразу работает!
+      clearCallbackDebounceMap();
+      await buyerHarness.sendCallback(buyer1, 'cat:premium');
+      const premActiveUi = buyerHarness.lastUiCall()!;
+      assert.deepEqual(premActiveUi.callbacks, [
+        'prem:select:premium_3m',
+        'prem:select:premium_6m',
+        'prem:select:premium_12m',
+        'menu:home',
+      ]);
+
+      // 3. Проверка админ-панели: если один тариф отключён (isActive=false), а другой удалён:
+      //    adm:restore_canonical создаёт ТОЛЬКО удалённый документ и НЕ перезаписывает существующий отключённый!
+      await firestoreRepo.updateDoc<Product>('products', 'premium_6m', { isActive: false });
+      await firestoreRepo.deleteDoc('products', 'premium_12m');
+
+      const adminUser = { id: 777000111, username: 'quizystars_admin', first_name: 'Admin' };
+      const adminHarness = createWiredBotHarness(true);
+      await adminHarness.sendCallback(adminUser, 'adm:products');
+      const admProductsUi = adminHarness.lastUiCall()!;
+      assert.ok(admProductsUi.callbacks.includes('adm:restore_canonical'));
+      assert.ok(admProductsUi.text.includes('premium_6m'));
+      assert.ok(admProductsUi.text.includes('premium_12m'));
+
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:restore_canonical');
+      const restored12 = await ProductService.getProductById('premium_12m');
+      const untouched6 = await ProductService.getProductById('premium_6m');
+      assert.ok(restored12 && restored12.isActive && restored12.durationMonths === 12 && restored12.priceUsdCents === 3490);
+      assert.equal(untouched6?.isActive, false); // Не перезаписан!
+
+      // Включаем premium_6m в админ-панели через adm:prod -> adm:ptoggle -> покупатель снова видит все 3 тарифа
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:prod:premium_6m');
+      assert.ok(adminHarness.lastUiCall()!.text.includes('Предупреждение каталога'));
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:ptoggle:premium_6m');
+      assert.equal((await ProductService.getProductById('premium_6m'))?.isActive, true);
+
+      clearCallbackDebounceMap();
+      await buyerHarness.sendCallback(buyer1, 'cat:premium');
+      assert.deepEqual(buyerHarness.lastUiCall()!.callbacks, [
+        'prem:select:premium_3m',
+        'prem:select:premium_6m',
+        'prem:select:premium_12m',
+        'menu:home',
+      ]);
+
+      // 4. Создание нового Premium-товара через админский мастер с выбором фиксированного срока
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:addcat:premium');
+      assert.deepEqual(adminHarness.lastUiCall()!.callbacks, [
+        'adm:addprem_dur:3',
+        'adm:addprem_dur:6',
+        'adm:addprem_dur:12',
+        'adm:products',
+      ]);
+      await adminHarness.sendCallback(adminUser, 'adm:addprem_dur:6');
+      await adminHarness.sendText(adminUser, 'Promo Premium 6M');
+      await adminHarness.sendText(adminUser, 'Описание промо тарифа');
+      await adminHarness.sendText(adminUser, '19.90');
+      assert.ok(adminHarness.lastUiCall()!.text.includes('Promo Premium 6M'));
+      assert.ok(adminHarness.lastUiCall()!.text.includes('6 мес.'));
+
+      return 'Безопасная миграция отсутствующих документов, сохранение существующих товаров/цен, админ-диагностика и мастер создания Premium подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S424-04',
+    'Fulfillment',
+    'Команда /paysupport и кнопка menu:paysupport открывают поддержку по платежам и сбрасывают активные сессии',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      clearCallbackDebounceMap();
+      clearAllUserInteractiveSessions(buyer1.id);
+      const harness = createWiredBotHarness();
+
+      await harness.sendCallback(buyer1, 'cat:stars');
+      assert.equal(getUserCheckoutSession(buyer1.id)?.mode, 'stars_qty');
+
+      await harness.sendText(buyer1, '/paysupport');
+      assert.equal(getUserCheckoutSession(buyer1.id), undefined);
+      const supportUi = harness.lastUiCall()!;
+      assert.ok(supportUi.text.includes('Поддержка по платежам QuizyStars'));
+      assert.ok(supportUi.text.includes('/orders'));
+      assert.deepEqual(supportUi.callbacks, ['menu:orders', 'menu:home']);
+
+      // Переход через меню «Поддержка» -> «Поддержка по платежам»
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'menu:support');
+      assert.deepEqual(harness.lastUiCall()!.callbacks, ['menu:paysupport', 'menu:home']);
+
+      clearCallbackDebounceMap();
+      await harness.sendCallback(buyer1, 'menu:paysupport');
+      assert.ok(harness.lastUiCall()!.text.includes('Поддержка по платежам QuizyStars'));
+      assert.deepEqual(harness.lastUiCall()!.callbacks, ['menu:orders', 'menu:home']);
+
+      // Активная админская текстовая сессия также сбрасывается при /paysupport
+      const adminUser = { id: 777000111, username: 'quizystars_admin', first_name: 'Admin' };
+      const adminHarness = createWiredBotHarness(true);
+      clearCallbackDebounceMap();
+      await adminHarness.sendCallback(adminUser, 'adm:pprice:premium_3m');
+      await adminHarness.sendText(adminUser, '/paysupport');
+      assert.ok(adminHarness.lastUiCall()!.text.includes('Поддержка по платежам QuizyStars'));
+
+      return 'Команда /paysupport и переход menu:support -> menu:paysupport открывают поддержку и корректно сбрасывают пользовательскую и админскую сессии.';
     },
   );
 

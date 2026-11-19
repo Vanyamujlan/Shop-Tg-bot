@@ -348,8 +348,21 @@ export function buildProductDetailKeyboard(product: Product) {
   return Markup.inlineKeyboard(rows);
 }
 
-export function buildPromptStarsQuantityKeyboard(canReturnToConfirm = false) {
-  const rows = [];
+export function buildPromptStarsQuantityKeyboard(
+  canReturnToConfirm = false,
+  unitPriceUsdCents = 2,
+) {
+  const safeUnit = Number.isInteger(unitPriceUsdCents) && unitPriceUsdCents > 0 ? unitPriceUsdCents : 2;
+  const presetButton = (qty: number) =>
+    Markup.button.callback(
+      `${qty} ⭐ (${formatUsdCents(qty * safeUnit)})`,
+      `stars:qty:${qty}`,
+    );
+
+  const rows = [
+    [presetButton(50), presetButton(100), presetButton(250)],
+    [presetButton(500), presetButton(1000), presetButton(5000)],
+  ];
   if (canReturnToConfirm) {
     rows.push([Markup.button.callback('⬅️ Назад', 'checkout:back_confirm')]);
   } else {
@@ -559,6 +572,20 @@ export function buildBackToMenuKeyboard() {
   ]);
 }
 
+export function buildSupportKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('💳 Поддержка по платежам', 'menu:paysupport')],
+    [Markup.button.callback('🏠 Главное меню', 'menu:home')],
+  ]);
+}
+
+export function buildPaySupportKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('📦 Мои заказы', 'menu:orders')],
+    [Markup.button.callback('🏠 Главное меню', 'menu:home')],
+  ]);
+}
+
 export function buildAdminMainKeyboard(isOwner = false) {
   const rows = [
     [
@@ -733,7 +760,10 @@ export function buildAdminTopUpDetailKeyboard(topUp: BalanceTopUpRecord) {
   return Markup.inlineKeyboard(rows);
 }
 
-export function buildAdminProductsKeyboard(products: Product[]) {
+export function buildAdminProductsKeyboard(
+  products: Product[],
+  hasMissingCanonical = false,
+) {
   const rows = products.map((p) => {
     const cents = p.priceUsdCents ?? p.price;
     const priceLabel = p.currency === 'XTR' ? `${p.price} ⭐` : formatUsdCents(cents);
@@ -744,6 +774,15 @@ export function buildAdminProductsKeyboard(products: Product[]) {
       ),
     ];
   });
+
+  if (hasMissingCanonical) {
+    rows.push([
+      Markup.button.callback(
+        '🔄 Создать недостающие тарифы (Stars/Premium)',
+        'adm:restore_canonical',
+      ),
+    ]);
+  }
 
   rows.push([
     Markup.button.callback('➕ Добавить товар', 'adm:prod_add_start'),
@@ -775,6 +814,15 @@ export function buildAdminCategoryPickKeyboard() {
     [Markup.button.callback('⭐ Telegram Stars', 'adm:addcat:stars')],
     [Markup.button.callback('💎 Telegram Premium', 'adm:addcat:premium')],
     [Markup.button.callback('🎁 Telegram Gifts', 'adm:addcat:gifts')],
+    [Markup.button.callback('❌ Отмена', 'adm:products')],
+  ]);
+}
+
+export function buildAdminPremiumDurationPickKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback('💎 3 месяца', 'adm:addprem_dur:3')],
+    [Markup.button.callback('💎 6 месяцев', 'adm:addprem_dur:6')],
+    [Markup.button.callback('💎 12 месяцев', 'adm:addprem_dur:12')],
     [Markup.button.callback('❌ Отмена', 'adm:products')],
   ]);
 }

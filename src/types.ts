@@ -388,6 +388,7 @@ export interface AdminInteractiveSession {
     | 'edit_price'
     | 'edit_name'
     | 'edit_description'
+    | 'add_product_duration'
     | 'add_product_name'
     | 'add_product_description'
     | 'add_product_price'
@@ -398,6 +399,7 @@ export interface AdminInteractiveSession {
   targetId?: string;
   draftProduct?: {
     category: ProductCategory;
+    durationMonths?: 3 | 6 | 12;
     name?: string;
     description?: string;
     price?: number;

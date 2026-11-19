@@ -291,8 +291,10 @@ export class ProductService {
   }
 
   public static async getBuyerStarsProduct(): Promise<Product | null> {
-    const prod = await this.getProductById(this.BUYER_STARS_PRODUCT_ID);
-    if (!prod || !prod.isActive) return null;
+    const raw = await this.getProductById(this.BUYER_STARS_PRODUCT_ID);
+    if (!raw) return null;
+    const prod: Product = { ...raw, id: raw.id || this.BUYER_STARS_PRODUCT_ID };
+    if (!prod.isActive || prod.category !== 'stars') return null;
     return prod;
   }
 
@@ -302,8 +304,87 @@ export class ProductService {
     validProducts: Product[];
     missingOrInvalidIds: string[];
   }> {
-    const allPremium = await this.getProductsByCategory('premium', false, 20);
-    return this.resolveBuyerPremiumCatalog(allPremium);
+    const fetched = await Promise.all(
+      this.REQUIRED_PREMIUM_TARIFFS.map(async (spec) => {
+        const doc = await this.getProductById(spec.id);
+        return doc ? ({ ...doc, id: doc.id || spec.id } as Product) : null;
+      }),
+    );
+    const foundProducts = fetched.filter((p): p is Product => Boolean(p));
+    return this.resolveBuyerPremiumCatalog(foundProducts);
+  }
+
+  public static async diagnoseBuyerCatalog(): Promise<{
+    allHealthy: boolean;
+    hasMissing: boolean;
+    items: Array<{
+      id: string;
+      status: 'ok' | 'missing' | 'inactive' | 'invalid';
+      reason?: string;
+    }>;
+  }> {
+    const targetIds = [
+      this.BUYER_STARS_PRODUCT_ID,
+      ...this.REQUIRED_PREMIUM_TARIFFS.map((t) => t.id),
+    ];
+    const fetched = await Promise.all(
+      targetIds.map(async (id) => {
+        const doc = await this.getProductById(id);
+        return doc ? ({ ...doc, id: doc.id || id } as Product) : null;
+      }),
+    );
+    const items: Array<{
+      id: string;
+      status: 'ok' | 'missing' | 'inactive' | 'invalid';
+      reason?: string;
+    }> = [];
+
+    for (let i = 0; i < targetIds.length; i += 1) {
+      const id = targetIds[i];
+      const doc = fetched[i];
+      if (!doc) {
+        items.push({ id, status: 'missing', reason: 'документ отсутствует в Firestore' });
+        continue;
+      }
+      if (!doc.isActive) {
+        items.push({ id, status: 'inactive', reason: 'товар отключён (isActive = false)' });
+        continue;
+      }
+      if (id === this.BUYER_STARS_PRODUCT_ID) {
+        if (doc.category !== 'stars') {
+          items.push({ id, status: 'invalid', reason: `неверная категория "${doc.category}"` });
+        } else {
+          items.push({ id, status: 'ok' });
+        }
+        continue;
+      }
+
+      const rawProduct: Product = doc;
+      if (this.isValidBuyerPremiumProduct(doc)) {
+        items.push({ id, status: 'ok' });
+      } else {
+        const spec = this.REQUIRED_PREMIUM_TARIFFS.find((t) => t.id === id);
+        const cents = rawProduct.priceUsdCents ?? rawProduct.price;
+        items.push({
+          id,
+          status: 'invalid',
+          reason: `некорректная категория (${rawProduct.category}), срок (${String(rawProduct.durationMonths)} вместо ${spec?.durationMonths}) или цена (${cents} вместо ${spec?.priceUsdCents} центов)`,
+        });
+      }
+    }
+
+    return {
+      allHealthy: items.every((i) => i.status === 'ok'),
+      hasMissing: items.some((i) => i.status === 'missing'),
+      items,
+    };
+  }
+
+  public static async ensureMissingCanonicalBuyerProducts(): Promise<{
+    createdIds: string[];
+    existingProblems: Array<{ id: string; reason: string }>;
+  }> {
+    return firestoreRepo.ensureMissingCanonicalCatalogProducts();
   }
 
   public static async getBuyerPremiumProducts(): Promise<Product[]> {

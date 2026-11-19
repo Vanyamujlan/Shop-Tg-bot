@@ -30,9 +30,11 @@ import {
   buildMainMenuKeyboard,
   buildOrderCheckoutChooserKeyboard,
   buildOrderConfirmationKeyboard,
+  buildPaySupportKeyboard,
   buildPremiumTariffsKeyboard,
   buildPromptRecipientKeyboard,
   buildPromptStarsQuantityKeyboard,
+  buildSupportKeyboard,
   buildTopUpInvoiceKeyboard,
   buildTopUpStep1ProviderKeyboard,
   buildTopUpStep2AmountKeyboard,
@@ -152,9 +154,20 @@ export function clearUserCheckoutSession(telegramId: number): void {
   userCheckoutSessions.delete(telegramId);
 }
 
+const extraSessionCleanupHooks = new Set<(telegramId: number) => void>();
+
+export function registerSessionCleanupHook(
+  hook: (telegramId: number) => void,
+): void {
+  extraSessionCleanupHooks.add(hook);
+}
+
 export function clearAllUserInteractiveSessions(telegramId: number): void {
   userTopUpSessions.delete(telegramId);
   userCheckoutSessions.delete(telegramId);
+  for (const hook of extraSessionCleanupHooks) {
+    hook(telegramId);
+  }
 }
 
 const callbackDebounceMap = new Map<string, number>();
@@ -357,6 +370,10 @@ export async function renderCheckoutStarsQuantityPrompt(
   }
 
   const prev = getUserCheckoutSession(ctx.from.id);
+  const unitCents =
+    starsProduct.unitPriceUsdCents ??
+    starsProduct.priceUsdCents ??
+    starsProduct.price;
   setUserCheckoutSession(ctx.from.id, {
     mode: 'stars_qty',
     productId: starsProduct.id,
@@ -369,7 +386,7 @@ export async function renderCheckoutStarsQuantityPrompt(
   await safeRespondOrEdit(
     ctx,
     formatPromptCustomQuantityMessage(starsProduct),
-    buildPromptStarsQuantityKeyboard(canReturnToConfirm),
+    buildPromptStarsQuantityKeyboard(canReturnToConfirm, unitCents),
   );
 }
 
@@ -406,6 +423,7 @@ export async function renderCheckoutRecipientPrompt(
     formatPromptRecipientUsernameMessage({
       productName: product.name,
       quantity: calc.quantity,
+      unitPriceUsdCents: calc.unitPriceUsdCents,
       totalPriceUsdCents: calc.totalPriceUsdCents,
       category: product.category,
       durationMonths: resolvedDuration,
@@ -619,20 +637,23 @@ export function registerUserHandlers(bot: Telegraf): void {
 
   // /help — Помощь
   bot.command('help', async (ctx) => {
-    await safeRespondOrEdit(ctx, formatHelpMessage(), buildBackToMenuKeyboard());
+    if (ctx.from) clearAllUserInteractiveSessions(ctx.from.id);
+    await safeRespondOrEdit(ctx, formatHelpMessage(), buildSupportKeyboard());
   });
 
   // /terms — Правила магазина
   bot.command('terms', async (ctx) => {
+    if (ctx.from) clearAllUserInteractiveSessions(ctx.from.id);
     await safeRespondOrEdit(ctx, formatTermsMessage(), buildBackToMenuKeyboard());
   });
 
   // /paysupport — Поддержка по платежам
   bot.command('paysupport', async (ctx) => {
+    if (ctx.from) clearAllUserInteractiveSessions(ctx.from.id);
     await safeRespondOrEdit(
       ctx,
       formatPaySupportMessage(),
-      buildBackToMenuKeyboard(),
+      buildPaySupportKeyboard(),
     );
   });
 
@@ -977,7 +998,21 @@ export function registerUserHandlers(bot: Telegraf): void {
   // Callback: Поддержка
   bot.action('menu:support', async (ctx) => {
     if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:support')) return;
-    await safeRespondOrEdit(ctx, formatHelpMessage(), buildBackToMenuKeyboard());
+    clearAllUserInteractiveSessions(ctx.from.id);
+    await safeRespondOrEdit(ctx, formatHelpMessage(), buildSupportKeyboard());
+  });
+
+  // Callback: Поддержка по платежам
+  bot.action('menu:paysupport', async (ctx) => {
+    if (!ctx.from || isDuplicateCallbackClick(ctx.from.id, 'menu:paysupport')) {
+      return;
+    }
+    clearAllUserInteractiveSessions(ctx.from.id);
+    await safeRespondOrEdit(
+      ctx,
+      formatPaySupportMessage(),
+      buildPaySupportKeyboard(),
+    );
   });
 
   // Callback: Выбор категории (Gifts скрыт/отключён для покупателей)
@@ -1165,7 +1200,13 @@ export function registerUserHandlers(bot: Telegraf): void {
     if (checkoutSession) {
       try {
         const product = await ProductService.getProductById(checkoutSession.productId);
-        if (!product || !product.isActive || product.category === 'gifts') {
+        if (
+          !product ||
+          !product.isActive ||
+          product.category === 'gifts' ||
+          (product.category === 'premium' &&
+            !ProductService.isValidBuyerPremiumProduct(product))
+        ) {
           clearUserCheckoutSession(ctx.from.id);
           await ctx.reply('❌ Товар больше недоступен для покупки.', {
             parse_mode: 'HTML',

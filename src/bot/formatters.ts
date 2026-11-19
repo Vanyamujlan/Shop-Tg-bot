@@ -184,10 +184,14 @@ export function formatProductCardMessage(product: Product): string {
     product.category === 'stars' || product.category === 'premium'
       ? `\n${oe('profile')} <b>Получатель:</b> указывается Telegram <code>@username</code> при оформлении.`
       : '';
+  const durationLine =
+    product.category === 'premium'
+      ? `\n⏳ Срок подписки: <b>${product.durationMonths ? `${product.durationMonths} мес.` : '⚠️ не задан'}</b>`
+      : '';
 
   return [
     `${oe('catalog')} <b>${escapeHtml(product.name)}</b>`,
-    `${oe('info')} Категория: <b>${CATEGORY_LABELS[product.category]}</b>`,
+    `${oe('info')} Категория: <b>${CATEGORY_LABELS[product.category]}</b>${durationLine}`,
     '',
     `${escapeHtml(product.description)}`,
     '',
@@ -202,8 +206,8 @@ export function formatPromptCustomQuantityMessage(product: Product): string {
   return [
     `${oe('stars')} <b>Купить Telegram Stars</b>`,
     '',
-    `Введите количество Stars от <b>${minQ}</b> до <b>${maxQ.toLocaleString('en-US').replace(/,/g, ' ')}</b>.`,
-    `Цена: <code>${formatUsdCents(unitCents)}</code> за 1 ⭐ (например: <code>100</code> = <code>${formatUsdCents(unitCents * 100)}</code>).`,
+    `Введите количество Stars от <b>${minQ}</b> до <b>${maxQ.toLocaleString('en-US').replace(/,/g, ' ')}</b> (целое число) или выберите быстрый вариант ниже.`,
+    `Цена за 1 ⭐: <b><code>${formatUsdCents(unitCents)}</code></b> — итоговая стоимость рассчитается автоматически (например: <code>100</code> ⭐ = <code>${formatUsdCents(unitCents * 100)}</code>).`,
   ].join('\n');
 }
 
@@ -211,6 +215,7 @@ export function formatPromptRecipientUsernameMessage(params: {
   productName: string;
   quantity: number;
   totalPriceUsdCents: number;
+  unitPriceUsdCents?: number;
   category?: ProductCategory;
   durationMonths?: 3 | 6 | 12;
 }): string {
@@ -221,14 +226,24 @@ export function formatPromptRecipientUsernameMessage(params: {
         ? `${oe('premium')} Тариф: <b>Telegram Premium — ${params.durationMonths} мес.</b>`
         : `${oe('catalog')} Товар: <b>${escapeHtml(params.productName)}</b> (x${params.quantity})`;
 
+  const detailLine =
+    params.category === 'stars' && params.unitPriceUsdCents !== undefined
+      ? `💵 Цена за 1 ⭐: <code>${formatUsdCents(params.unitPriceUsdCents)}</code>`
+      : params.category === 'premium'
+        ? `🔢 Количество: <b>${params.quantity}</b>`
+        : '';
+
   return [
     `${oe('profile')} <b>Получатель заказа</b>`,
     '',
     itemLine,
+    detailLine,
     `${oe('amount')} Итого: <b><code>${formatUsdCents(params.totalPriceUsdCents)}</code></b>`,
     '',
     'Отправьте Telegram <code>@username</code> получателя или нажмите кнопку ниже:',
-  ].join('\n');
+  ]
+    .filter((line, idx, arr) => !(line === '' && arr[idx - 1] === '') && (idx === 1 || line !== ''))
+    .join('\n');
 }
 
 export function formatOrderConfirmationCardMessage(params: {
@@ -255,11 +270,18 @@ export function formatOrderConfirmationCardMessage(params: {
       : isPremium && params.product.durationMonths
         ? `⏳ Срок подписки: <b>${params.product.durationMonths} мес.</b>`
         : `🔢 Количество: <b>${params.quantity}</b>`,
+    isStars
+      ? `💵 Цена за 1 ⭐: <code>${formatUsdCents(params.unitPriceUsdCents)}</code>`
+      : isPremium
+        ? `🔢 Количество: <b>${params.quantity}</b>`
+        : '',
     `${oe('profile')} Получатель: <b>@${escapeHtml(cleanRecipient)}</b>`,
     `${oe('amount')} Итого: <b><code>${formatUsdCents(params.totalPriceUsdCents)}</code></b>`,
     '',
     'Проверьте данные перед переходом к оплате:',
-  ].join('\n');
+  ]
+    .filter((line, idx, arr) => !(line === '' && arr[idx - 1] === '') && (idx === 1 || idx === 6 || line !== ''))
+    .join('\n');
 }
 
 export function formatOrderCheckoutChooserMessage(
@@ -997,4 +1019,30 @@ export function formatAdminStatsMessage(params: {
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+export function formatAdminCatalogDiagnosticsSummary(diagnostics: {
+  allHealthy: boolean;
+  hasMissing: boolean;
+  items: Array<{
+    id: string;
+    status: 'ok' | 'missing' | 'inactive' | 'invalid';
+    reason?: string;
+  }>;
+}): string {
+  if (diagnostics.allHealthy) {
+    return '✅ Обязательный каталог (Stars + Premium 3/6/12 мес.) полностью активен.';
+  }
+
+  const issueLines = diagnostics.items
+    .filter((i) => i.status !== 'ok')
+    .map(
+      (i) =>
+        `• <code>${escapeHtml(i.id)}</code>: ${escapeHtml(i.reason || i.status)}`,
+    );
+
+  return [
+    '⚠️ <b>Проблемы обязательных тарифов (Stars/Premium):</b>',
+    ...issueLines,
+  ].join('\n');
 }
