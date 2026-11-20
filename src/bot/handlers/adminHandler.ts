@@ -1330,13 +1330,9 @@ export function registerAdminHandlers(
       )}</code> (recovery worker: ${
         FulfillmentService.isRecoveryWorkerActive() ? 'активен' : 'остановлен'
       })`,
-      `⭐ <b>Поставщик MyStars FaaS v1:</b> ${
+      `⭐ <b>Поставщик MyStars FaaS v1 (Polling):</b> ${
         mystarsDiag.configured
-          ? `✅ Настроен (ключ: <code>${escapeHtml(mystarsDiag.maskedApiKey)}</code>, webhook: ${
-              mystarsDiag.webhookConfigured
-                ? `✅ <code>${escapeHtml(mystarsDiag.maskedWebhookSecret)}</code>`
-                : '⚠️ не задан'
-            }, валюта: <code>${escapeHtml(mystarsDiag.paymentCurrency)}</code>)`
+          ? `✅ Настроен (ключ: <code>${escapeHtml(mystarsDiag.maskedApiKey)}</code>, режим: <code>polling</code>, интервал: <code>${Math.round(mystarsDiag.pollIntervalMs / 1000)}с</code>, валюта: <code>${escapeHtml(mystarsDiag.paymentCurrency)}</code>)`
           : '⚠️ Не настроен (MYSTARS_API_KEY не задан — активен режим ручной выдачи)'
       }`,
       `👑 <b>Администраторов в ADMIN_IDS:</b> ${envConfig.adminIds.length}`,

@@ -144,19 +144,12 @@ export interface MyStarsCancelResult {
   status: string;
 }
 
-export interface MyStarsWebhookEvent {
-  order_id: string;
-  status: 'delivered' | 'failed' | 'reversed' | 'expired' | string;
-  failure_reason?: string | null;
-  purchase_tx?: string | null;
-}
-
 export interface MyStarsCredentialsOverride {
   apiBaseUrl?: string;
   apiKey?: string;
-  webhookSecret?: string;
-  callbackUrl?: string;
   paymentCurrency?: 'usdt_ton' | 'ton';
+  pollIntervalMs?: number;
+  requestTimeoutMs?: number;
 }
 
 export class MyStarsApiError extends Error {
@@ -164,6 +157,7 @@ export class MyStarsApiError extends Error {
   public readonly code: string;
   public readonly telegramMessage?: string;
   public readonly retryable: boolean;
+  public readonly mystarsStatus?: string;
 
   constructor(params: {
     message: string;
@@ -171,6 +165,7 @@ export class MyStarsApiError extends Error {
     code?: string;
     telegramMessage?: string;
     retryable?: boolean;
+    mystarsStatus?: string;
   }) {
     super(params.message);
     this.name = 'MyStarsApiError';
@@ -178,6 +173,7 @@ export class MyStarsApiError extends Error {
     this.code = params.code || `http_${params.httpStatus}`;
     this.telegramMessage = params.telegramMessage;
     this.retryable = Boolean(params.retryable);
+    this.mystarsStatus = params.mystarsStatus;
   }
 }
 
@@ -227,11 +223,32 @@ export class MyStarsRateLimitError extends MyStarsApiError {
 
 export class MyStarsTransportError extends Error {
   public readonly retryable = true;
+  public readonly isTimeout: boolean;
 
-  constructor(message: string) {
+  constructor(message: string, isTimeout = false) {
     super(message);
     this.name = 'MyStarsTransportError';
+    this.isTimeout = isTimeout;
   }
+}
+
+/**
+ * Parses an HTTP Retry-After header (numeric seconds or RFC 7231 HTTP-date).
+ */
+export function parseRetryAfterSeconds(raw: string | number | undefined): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const str = String(raw).trim();
+  if (!str) return undefined;
+  const asNum = Number(str);
+  if (Number.isFinite(asNum) && asNum >= 0) {
+    return asNum;
+  }
+  const asDateMs = Date.parse(str);
+  if (Number.isFinite(asDateMs)) {
+    const diffSec = (asDateMs - Date.now()) / 1000;
+    return diffSec > 0 ? Math.ceil(diffSec) : 0;
+  }
+  return undefined;
 }
 
 /**
@@ -322,54 +339,8 @@ export function usdtDecimalToUsdCents(usdtStr: string | undefined | null): numbe
   return Math.ceil(num * 100 - 1e-9);
 }
 
-/**
- * Computes lowercase-hex HMAC-SHA256 signature of the raw UTF-8 webhook body
- * as specified by MyStars FaaS v1 (`X-Faas-Signature`).
- */
-export function computeMyStarsWebhookSignature(rawBody: string, secret: string): string {
-  return crypto.createHmac('sha256', Buffer.from(secret, 'utf8')).update(rawBody, 'utf8').digest('hex');
-}
-
-function safeTimingEqualUtf8(a: string, b: string): boolean {
-  if (!a || !b) return false;
-  const bufA = Buffer.from(a, 'utf8');
-  const bufB = Buffer.from(b, 'utf8');
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
-}
-
-/**
- * Verifies the `X-Faas-Signature` header on incoming MyStars FaaS v1 webhooks.
- * Supports the 24-hour secret rotation window where `X-Faas-Signature` contains
- * comma-separated hex digests (`"currentSig,previousSig"`).
- */
-export function verifyMyStarsWebhookSignature(
-  rawBody: string,
-  signatureHeader: string | undefined,
-  secretOverride?: string,
-): boolean {
-  const rawSecret = (secretOverride ?? getEnvConfig().mystarsWebhookSecret).trim();
-  if (!rawSecret || !signatureHeader) return false;
-
-  const secrets = rawSecret
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const candidates = signatureHeader
-    .split(',')
-    .map((part) => part.trim().toLowerCase())
-    .filter(Boolean);
-
-  for (const secret of secrets) {
-    const expected = computeMyStarsWebhookSignature(rawBody, secret).toLowerCase();
-    for (const candidate of candidates) {
-      if (safeTimingEqualUtf8(expected, candidate)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
+// MyStars FaaS v1 integration operates exclusively in Polling mode (GET /v1/orders/{order_id}).
+// MYSTARS_WEBHOOK_SECRET and MYSTARS_CALLBACK_URL are strictly optional and unused.
 
 /**
  * Formats a clear Russian buyer-facing error message from a MyStars recipient check result.
@@ -402,8 +373,9 @@ export function formatBuyerRecipientIneligibleMessage(params: {
 async function defaultMyStarsHttpTransport(
   req: HttpTransportRequest,
 ): Promise<HttpTransportResponse> {
+  const timeoutMs = getEnvConfig().mystarsRequestTimeoutMs || 15_000;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(req.url, {
       method: req.method,
@@ -431,9 +403,17 @@ async function defaultMyStarsHttpTransport(
       headers: headersObj,
     };
   } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
+    const isAbort =
+      error instanceof Error &&
+      (error.name === 'AbortError' || error.message.toLowerCase().includes('aborted'));
+    const msg = isAbort
+      ? `Таймаут запроса к MyStars API (${timeoutMs} мс)`
+      : error instanceof Error
+        ? error.message
+        : String(error);
     throw new MyStarsTransportError(
       redactSecretsFromText(`Ошибка сети при обращении к MyStars API: ${msg}`),
+      isAbort,
     );
   } finally {
     clearTimeout(timeout);
@@ -443,6 +423,8 @@ async function defaultMyStarsHttpTransport(
 export class MyStarsClient {
   private transport: ProviderHttpTransport = defaultMyStarsHttpTransport;
   private credentialsOverride: MyStarsCredentialsOverride | null = null;
+  public maxTransientGetRetries = 1;
+  public retryBaseDelayMs = 250;
 
   public setHttpTransport(transport: ProviderHttpTransport): void {
     this.transport = transport;
@@ -459,18 +441,20 @@ export class MyStarsClient {
   public getCredentials(): {
     apiBaseUrl: string;
     apiKey: string;
-    webhookSecret: string;
-    callbackUrl: string;
     paymentCurrency: 'usdt_ton' | 'ton';
+    pollIntervalMs: number;
+    requestTimeoutMs: number;
   } {
     const cfg = getEnvConfig();
     return {
       apiBaseUrl: (this.credentialsOverride?.apiBaseUrl ?? cfg.mystarsApiBaseUrl).trim(),
       apiKey: (this.credentialsOverride?.apiKey ?? cfg.mystarsApiKey).trim(),
-      webhookSecret: (this.credentialsOverride?.webhookSecret ?? cfg.mystarsWebhookSecret).trim(),
-      callbackUrl: (this.credentialsOverride?.callbackUrl ?? cfg.mystarsCallbackUrl).trim(),
       paymentCurrency:
         this.credentialsOverride?.paymentCurrency ?? cfg.mystarsPaymentCurrency ?? 'usdt_ton',
+      pollIntervalMs:
+        this.credentialsOverride?.pollIntervalMs ?? cfg.mystarsPollIntervalMs ?? 15_000,
+      requestTimeoutMs:
+        this.credentialsOverride?.requestTimeoutMs ?? cfg.mystarsRequestTimeoutMs ?? 15_000,
     };
   }
 
@@ -479,29 +463,24 @@ export class MyStarsClient {
     return Boolean(creds.apiKey && creds.apiKey.length >= 6);
   }
 
-  public isWebhookConfigured(): boolean {
-    const creds = this.getCredentials();
-    return Boolean(creds.webhookSecret && creds.webhookSecret.length >= 6);
-  }
-
   public getStatusSummary(): {
     configured: boolean;
-    webhookConfigured: boolean;
+    mode: 'polling';
     apiBaseUrl: string;
     paymentCurrency: string;
+    pollIntervalMs: number;
+    requestTimeoutMs: number;
     maskedApiKey: string;
-    maskedWebhookSecret: string;
-    callbackUrl: string;
   } {
     const creds = this.getCredentials();
     return {
       configured: this.isConfigured(),
-      webhookConfigured: this.isWebhookConfigured(),
+      mode: 'polling',
       apiBaseUrl: buildMyStarsApiV1Url(creds.apiBaseUrl, ''),
       paymentCurrency: creds.paymentCurrency,
+      pollIntervalMs: creds.pollIntervalMs,
+      requestTimeoutMs: creds.requestTimeoutMs,
       maskedApiKey: maskSecret(creds.apiKey),
-      maskedWebhookSecret: maskSecret(creds.webhookSecret),
-      callbackUrl: creds.callbackUrl || '[NOT_SET]',
     };
   }
 
@@ -577,98 +556,146 @@ export class MyStarsClient {
       headers['Idempotency-Key'] = params.idempotencyKey;
     }
 
-    const response = await this.transport({
-      url,
-      method: params.method,
-      headers,
-      body: params.body !== undefined ? JSON.stringify(params.body) : undefined,
-    });
+    const maxAttempts =
+      params.method === 'GET' ? Math.max(1, 1 + this.maxTransientGetRetries) : 1;
 
-    const isOk =
-      typeof response.ok === 'boolean'
-        ? response.ok
-        : response.status >= 200 && response.status < 300;
-    let parsedJson: unknown = response.json;
-    if (parsedJson === undefined && typeof (response as { bodyText?: string }).bodyText === 'string') {
-      const rawText = (response as { bodyText?: string }).bodyText || '';
-      if (rawText.trim()) {
-        try {
-          parsedJson = JSON.parse(rawText);
-        } catch {
-          parsedJson = { message: rawText };
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      let response: HttpTransportResponse;
+      try {
+        response = await this.transport({
+          url,
+          method: params.method,
+          headers,
+          body: params.body !== undefined ? JSON.stringify(params.body) : undefined,
+        });
+      } catch (transportErr) {
+        const wrapped =
+          transportErr instanceof MyStarsTransportError
+            ? transportErr
+            : new MyStarsTransportError(
+                redactSecretsFromText(
+                  `Ошибка сети при обращении к MyStars API: ${
+                    transportErr instanceof Error ? transportErr.message : String(transportErr)
+                  }`,
+                ),
+                transportErr instanceof Error &&
+                  (transportErr.name === 'AbortError' ||
+                    transportErr.message.toLowerCase().includes('timeout')),
+              );
+        lastError = wrapped;
+        if (attempt < maxAttempts) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, Math.max(0, this.retryBaseDelayMs * attempt)),
+          );
+          continue;
+        }
+        throw wrapped;
+      }
+
+      const isOk =
+        typeof response.ok === 'boolean'
+          ? response.ok
+          : response.status >= 200 && response.status < 300;
+      let parsedJson: unknown = response.json;
+      if (
+        parsedJson === undefined &&
+        typeof (response as { bodyText?: string }).bodyText === 'string'
+      ) {
+        const rawText = (response as { bodyText?: string }).bodyText || '';
+        if (rawText.trim()) {
+          try {
+            parsedJson = JSON.parse(rawText);
+          } catch {
+            parsedJson = { message: rawText };
+          }
         }
       }
-    }
 
-    if (isOk) {
-      return parsedJson as T;
-    }
+      if (isOk) {
+        return parsedJson as T;
+      }
 
-    const { code, message, telegramMessage } = this.parseErrorEnvelope(parsedJson);
-    const safeMsg = redactSecretsFromText(
-      message || `HTTP ${response.status} от MyStars API (${params.path})`,
-    );
+      const { code, message, telegramMessage } = this.parseErrorEnvelope(parsedJson);
+      const safeMsg = redactSecretsFromText(
+        message || `HTTP ${response.status} от MyStars API (${params.path})`,
+      );
 
-    if (response.status === 422) {
-      throw new MyStarsRecipientIneligibleError({
-        message: safeMsg,
-        httpStatus: 422,
-        code: code || 'recipient_ineligible',
-        reason: code || 'recipient_ineligible',
-        telegramMessage,
-      });
-    }
+      if (response.status === 422) {
+        throw new MyStarsRecipientIneligibleError({
+          message: safeMsg,
+          httpStatus: 422,
+          code: code || 'recipient_ineligible',
+          reason: code || 'recipient_ineligible',
+          telegramMessage,
+        });
+      }
 
-    if (response.status === 429) {
-      const respHeaders = response.headers || {};
-      const bodyRec =
-        parsedJson && typeof parsedJson === 'object' ? (parsedJson as Record<string, unknown>) : {};
-      const explicitLimitType =
-        typeof bodyRec.limit_type === 'string' ? bodyRec.limit_type.toLowerCase() : '';
-      const hasRateLimitHeader =
-        'ratelimit-limit' in respHeaders ||
-        'RateLimit-Limit' in respHeaders ||
-        'retry-after' in respHeaders ||
-        'Retry-After' in respHeaders;
-      const retryAfterRaw =
-        respHeaders['retry-after'] ??
-        respHeaders['Retry-After'] ??
-        (typeof bodyRec.retry_after === 'number' || typeof bodyRec.retry_after === 'string'
-          ? String(bodyRec.retry_after)
-          : undefined);
-      const retryAfterSeconds = retryAfterRaw ? Number(retryAfterRaw) : undefined;
-      const kind: 'general' | 'order_cap' =
-        explicitLimitType === 'order_cap'
-          ? 'order_cap'
-          : explicitLimitType === 'general'
-            ? 'general'
-            : hasRateLimitHeader
+      if (response.status === 429) {
+        const respHeaders = response.headers || {};
+        const bodyRec =
+          parsedJson && typeof parsedJson === 'object'
+            ? (parsedJson as Record<string, unknown>)
+            : {};
+        const explicitLimitType =
+          typeof bodyRec.limit_type === 'string' ? bodyRec.limit_type.toLowerCase() : '';
+        const hasRateLimitHeader =
+          'ratelimit-limit' in respHeaders ||
+          'RateLimit-Limit' in respHeaders ||
+          'retry-after' in respHeaders ||
+          'Retry-After' in respHeaders;
+        const retryAfterRaw =
+          respHeaders['retry-after'] ??
+          respHeaders['Retry-After'] ??
+          (typeof bodyRec.retry_after === 'number' || typeof bodyRec.retry_after === 'string'
+            ? bodyRec.retry_after
+            : undefined);
+        const retryAfterSeconds = parseRetryAfterSeconds(retryAfterRaw);
+        const kind: 'general' | 'order_cap' =
+          explicitLimitType === 'order_cap'
+            ? 'order_cap'
+            : explicitLimitType === 'general'
               ? 'general'
-              : 'order_cap';
-      throw new MyStarsRateLimitError({
-        message:
-          kind === 'order_cap'
-            ? `Превышен лимит неоплаченных заказов MyStars (order_cap / awaiting_payment): ${safeMsg}`
-            : `Превышен лимит запросов к MyStars API (429): ${safeMsg}`,
-        kind,
-        retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
+              : hasRateLimitHeader
+                ? 'general'
+                : 'order_cap';
+        throw new MyStarsRateLimitError({
+          message:
+            kind === 'order_cap'
+              ? `Превышен лимит неоплаченных заказов MyStars (order_cap / awaiting_payment): ${safeMsg}`
+              : `Превышен лимит запросов к MyStars API (429): ${safeMsg}`,
+          kind,
+          retryAfterSeconds,
+          code,
+        });
+      }
+
+      const retryable =
+        response.status === 500 ||
+        response.status === 502 ||
+        response.status === 503 ||
+        response.status === 504;
+
+      const apiErr = new MyStarsApiError({
+        message: safeMsg,
+        httpStatus: response.status,
         code,
+        telegramMessage,
+        retryable,
       });
+
+      lastError = apiErr;
+      if (retryable && attempt < maxAttempts) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.max(0, this.retryBaseDelayMs * attempt)),
+        );
+        continue;
+      }
+
+      throw apiErr;
     }
 
-    const retryable =
-      response.status === 500 ||
-      response.status === 502 ||
-      response.status === 503 ||
-      response.status === 504;
-
-    throw new MyStarsApiError({
-      message: safeMsg,
-      httpStatus: response.status,
-      code,
-      telegramMessage,
-      retryable,
-    });
+    throw lastError;
   }
 
   public async getCurrencies(): Promise<MyStarsCurrencyInfo[]> {
@@ -734,7 +761,6 @@ export class MyStarsClient {
     quantity?: number;
     months?: number;
     paymentCurrency?: MyStarsPaymentCurrency;
-    callbackUrl?: string;
     idempotencyKey?: string;
   }): Promise<MyStarsCreateOrderResult> {
     const creds = this.getCredentials();
@@ -751,11 +777,8 @@ export class MyStarsClient {
       body.months = validateMyStarsMonths(params.months);
     }
 
-    const cbUrl = (params.callbackUrl ?? creds.callbackUrl).trim();
-    if (cbUrl) {
-      body.callback_url = cbUrl;
-    }
-
+    // Polling-only mode: callback_url is intentionally omitted so MyStars order tracking
+    // relies exclusively on GET /v1/orders/{order_id} without requiring public webhook URLs.
     return this.requestJson<MyStarsCreateOrderResult>({
       method: 'POST',
       path: '/orders',
@@ -931,20 +954,20 @@ export class MyStarsClient {
 export const myStarsClient = new MyStarsClient();
 
 /**
- * Production FulfillmentProviderAdapter for MyStars FaaS v1 (`https://api.mystars.tg/v1`).
+ * Production FulfillmentProviderAdapter for MyStars FaaS v1 (`https://api.mystars.tg/v1`)
+ * operating exclusively via Polling.
  *
- * Architectural contract of MyStars FaaS v1:
- * - `POST /v1/orders` creates a non-custodial fulfilment order on MyStars with an `Idempotency-Key`.
+ * Architectural contract of MyStars FaaS v1 (Polling-Only):
+ * - `POST /v1/orders` creates an idempotent fulfillment order (`Idempotency-Key`, no `callback_url`).
  * - MyStars returns `{ order_id, status, payment: { pay_to_address, memo, amount, currency }, expires_at }`.
  * - When `status` is `"delivered"` or `"completed"`, the adapter marks the order completed automatically.
  * - When `status` is `"awaiting_payment"` or an active processing state (`"paid"`, `"purchasing"`, `"fulfilling"`, etc.),
- *   the adapter persists `mystarsOrderId`, payment instructions (`pay_to_address`, `memo`, `amount`),
- *   and wholesale P&L on the Firestore `Order`, and returns `{ handledAutomatically: false, status: 'processing' }`
- *   so that `POST /webhook/mystars` or background polling (`checkExternalStatus`) transitions the order
- *   to `completed` as soon as MyStars confirms `status === "delivered"`.
+ *   the adapter persists `mystarsOrderId`, status, payment instructions, and wholesale P&L on the Firestore `Order`,
+ *   and returns `{ handledAutomatically: false, status: 'processing' }` so that the background polling worker
+ *   (`GET /v1/orders/{order_id}`) tracks status transitions until terminal completion or failure — including across restarts.
  */
 export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
-  public readonly providerName = 'MyStarsFaaS (Автовыдача Stars & Premium v1)';
+  public readonly providerName = 'MyStarsFaaS (Автовыдача Stars & Premium v1, Polling)';
   public readonly name = 'mystars-faas-v1';
   public readonly supportsIdempotency = true;
   private readonly client: MyStarsClient;
@@ -1010,7 +1033,9 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
 
     const mystarsOrderId =
       order.mystarsOrderId ||
-      (order.externalExecutionReference?.startsWith('ord_')
+      (order.externalExecutionReference &&
+      (order.externalExecutionReference.startsWith('ord_') ||
+        order.externalExecutionReference.startsWith('ms_'))
         ? order.externalExecutionReference
         : undefined);
 
@@ -1025,9 +1050,34 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       (typeof remoteRec.id === 'string' ? remoteRec.id : mystarsOrderId);
     const status = (remoteOrder.status || '').toLowerCase();
 
+    const remotePayment = remoteRec.payment as MyStarsPaymentInstruction | undefined;
+    const wholesaleTotalUsdt =
+      remotePayment?.fee?.total ||
+      remotePayment?.amount ||
+      (typeof remoteRec.payment_amount === 'string' ? remoteRec.payment_amount : undefined);
+    const processingFeeUsdt =
+      remotePayment?.fee?.processing_fee ||
+      (typeof remoteRec.service_fee_usdt === 'string' ? remoteRec.service_fee_usdt : undefined);
+    const remoteCurrency: 'usdt_ton' | 'ton' =
+      remoteRec.currency === 'ton' || remotePayment?.currency === 'ton' ? 'ton' : 'usdt_ton';
+
+    const pnlUpdates = wholesaleTotalUsdt
+      ? this.computeOrderPnLUpdates({
+          order,
+          wholesaleTotalUsdt,
+          processingFeeUsdt,
+          currency: remoteCurrency,
+        })
+      : {};
+
+    const nowIso = new Date().toISOString();
     await this.persistMyStarsOrderMetadata(order, {
+      ...pnlUpdates,
       mystarsOrderId: resolvedOrderId,
       mystarsOrderStatus: status,
+      mystarsLastPolledAt: nowIso,
+      mystarsPollAttempts: (order.mystarsPollAttempts ?? 0) + 1,
+      mystarsLastPollError: undefined,
       ...(remoteOrder.purchase_tx ? { mystarsPurchaseTx: remoteOrder.purchase_tx } : {}),
       ...(remoteOrder.failure_reason ? { mystarsFailureReason: remoteOrder.failure_reason } : {}),
     });
@@ -1052,6 +1102,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
         code: `mystars_${status}`,
         telegramMessage: remoteOrder.telegram_message || undefined,
         retryable: false,
+        mystarsStatus: status,
       });
     }
 
@@ -1098,7 +1149,9 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
     // 1. If a MyStars order ID already exists on the order, check its current status first
     const existingMyStarsId =
       order.mystarsOrderId ||
-      (order.externalExecutionReference?.startsWith('ord_')
+      (order.externalExecutionReference &&
+      (order.externalExecutionReference.startsWith('ord_') ||
+        order.externalExecutionReference.startsWith('ms_'))
         ? order.externalExecutionReference
         : undefined);
     if (existingMyStarsId) {
@@ -1148,7 +1201,7 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       });
     }
 
-    // 3. Create idempotent MyStars FaaS v1 order via POST /v1/orders
+    // 3. Create idempotent MyStars FaaS v1 order via POST /v1/orders (Polling-only, no callback_url)
     const idempotencyKey =
       context?.idempotencyKey ||
       order.fulfillmentIdempotencyKey ||
@@ -1194,10 +1247,14 @@ export class MyStarsFulfillmentAdapter implements FulfillmentProviderAdapter {
       currency: flatCurrency,
     });
 
+    const nowIso = new Date().toISOString();
     await this.persistMyStarsOrderMetadata(order, {
       ...pnlUpdates,
       mystarsOrderId: resolvedOrderId,
       mystarsOrderStatus: status,
+      mystarsLastPolledAt: nowIso,
+      mystarsPollAttempts: order.mystarsPollAttempts ?? 0,
+      mystarsLastPollError: undefined,
       mystarsPayToAddress: payment?.pay_to_address || flatPayToAddress || undefined,
       mystarsPaymentMemo: payment?.memo || flatPaymentMemo || resolvedOrderId,
       mystarsPaymentAmountUsdt: payment?.amount || flatPaymentAmount || wholesaleTotalUsdt,

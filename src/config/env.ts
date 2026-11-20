@@ -82,8 +82,11 @@ export interface AppConfig {
   mystarsPaymentCurrency: 'usdt_ton';
   mystarsApiBaseUrl: string;
   mystarsApiKey: string;
-  mystarsWebhookSecret: string;
-  mystarsCallbackUrl: string;
+  mystarsPollIntervalMs: number;
+  mystarsRequestTimeoutMs: number;
+  /** Optional legacy fields — not required and unused in Polling-only mode */
+  mystarsWebhookSecret?: string;
+  mystarsCallbackUrl?: string;
   tonWalletAddress: string;
 }
 
@@ -225,14 +228,29 @@ export function getEnvConfig(): AppConfig {
       cleanEnvValue('MYSTARS_API_BASE_URL', process.env.MYSTARS_API_BASE_URL) ||
       'https://api.mystars.tg',
     mystarsApiKey: cleanEnvValue('MYSTARS_API_KEY', process.env.MYSTARS_API_KEY),
-    mystarsWebhookSecret: cleanEnvValue(
-      'MYSTARS_WEBHOOK_SECRET',
-      process.env.MYSTARS_WEBHOOK_SECRET,
-    ),
-    mystarsCallbackUrl: cleanEnvValue(
-      'MYSTARS_CALLBACK_URL',
-      process.env.MYSTARS_CALLBACK_URL,
-    ),
+    mystarsPollIntervalMs: (() => {
+      const raw = Number(
+        cleanEnvValue('MYSTARS_POLL_INTERVAL_MS', process.env.MYSTARS_POLL_INTERVAL_MS),
+      );
+      if (!Number.isFinite(raw) || raw <= 0) return 15_000;
+      return Math.min(Math.max(Math.round(raw), 5_000), 300_000);
+    })(),
+    mystarsRequestTimeoutMs: (() => {
+      const raw = Number(
+        cleanEnvValue(
+          'MYSTARS_REQUEST_TIMEOUT_MS',
+          process.env.MYSTARS_REQUEST_TIMEOUT_MS,
+        ),
+      );
+      if (!Number.isFinite(raw) || raw <= 0) return 15_000;
+      return Math.min(Math.max(Math.round(raw), 3_000), 60_000);
+    })(),
+    mystarsWebhookSecret:
+      cleanEnvValue('MYSTARS_WEBHOOK_SECRET', process.env.MYSTARS_WEBHOOK_SECRET) ||
+      undefined,
+    mystarsCallbackUrl:
+      cleanEnvValue('MYSTARS_CALLBACK_URL', process.env.MYSTARS_CALLBACK_URL) ||
+      undefined,
     tonWalletAddress: cleanEnvValue(
       'TON_WALLET_ADDRESS',
       process.env.TON_WALLET_ADDRESS,

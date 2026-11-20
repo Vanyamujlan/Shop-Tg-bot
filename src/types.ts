@@ -252,6 +252,9 @@ export interface Order {
   mystarsPurchaseTx?: string;
   mystarsFailureReason?: string;
   mystarsExpiresAt?: string;
+  mystarsLastPolledAt?: string;
+  mystarsPollAttempts?: number;
+  mystarsLastPollError?: string;
   fulfillmentNote?: string;
   fulfillmentStartedAt?: string;
   fulfillmentAttempts?: number;

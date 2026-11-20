@@ -112,7 +112,6 @@ import {
   UnsupportedKeyGeneratorError,
 } from '../services/DigitalKeyService.ts';
 import {
-  handleMyStarsWebhookRequest,
   handleProviderWebhookRequest,
   handleTopUpCalculateRequest,
   renderPlainTextStatus,
@@ -123,14 +122,14 @@ import {
   MyStarsFulfillmentAdapter,
   MyStarsRateLimitError,
   MyStarsRecipientIneligibleError,
+  MyStarsTransportError,
   buildMyStarsApiV1Url,
-  computeMyStarsWebhookSignature,
   myStarsClient,
+  parseRetryAfterSeconds,
   usdtDecimalToUsdCents,
   validateMyStarsMonths,
   validateMyStarsQuantity,
   validateMyStarsUsername,
-  verifyMyStarsWebhookSignature,
 } from '../services/MyStarsService.ts';
 import type { Order, PaymentRecord, Product, StoreUser } from '../types.ts';
 
@@ -6905,13 +6904,17 @@ async function runFullAuditTestSuite(): Promise<void> {
               json: {
                 type: 'stars',
                 quantity: 100,
-                fragment_cost_ton: '0.25',
-                fragment_cost_usdt: '1.35',
-                service_fee_usdt: '0.02',
-                total_ton: '0.255',
-                total_usdt: '1.37',
-                ton_usdt_rate: '5.37',
-                fee_bps: 150,
+                amount: '1.37',
+                currency: 'usdt_ton',
+                fee: {
+                  subtotal: '1.35',
+                  processing_fee: '0.02',
+                  total: '1.37',
+                  description: 'TON swap + network fee',
+                  currency: 'usdt_ton',
+                  kind: 'swap',
+                },
+                usdt_per_ton: '5.37',
               },
             };
           }
@@ -6977,7 +6980,8 @@ async function runFullAuditTestSuite(): Promise<void> {
         });
 
         const quote = await myStarsClient.getPricing({ type: 'stars', quantity: 100 });
-        assert.equal(quote.total_usdt, '1.37');
+        assert.equal(quote.amount, '1.37');
+        assert.equal(quote.fee?.total, '1.37');
 
         // 1. Несуществующий получатель блокируется ДО создания заказа в OrderService.createOrder
         await assert.rejects(
@@ -7047,8 +7051,9 @@ async function runFullAuditTestSuite(): Promise<void> {
       myStarsClient.setCredentialsOverride({
         apiKey: 'ms_live_test_key_4402',
         apiBaseUrl: 'https://api.mystars.tg/v1',
-        callbackUrl: 'https://quizystars.example.com/webhook/mystars',
       });
+      assert.equal(myStarsClient.isConfigured(), true);
+      assert.equal(myStarsClient.getStatusSummary().mode, 'polling');
 
       try {
         myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
@@ -7172,7 +7177,8 @@ async function runFullAuditTestSuite(): Promise<void> {
         assert.equal(completedStarsOrder.totalPriceUsdCents, 200);
         assert.equal(completedStarsOrder.netProfitUsdCents, 60);
         assert.equal(orderCalls[0].idempotencyKey, `fulfill_${completedStarsOrder.orderId}`);
-        assert.equal(orderCalls[0].body.callback_url, 'https://quizystars.example.com/webhook/mystars');
+        // В режиме Polling-Only callback_url не передаётся в POST /v1/orders
+        assert.equal('callback_url' in orderCalls[0].body, false);
 
         // 2. Покупка Premium 3 мес. -> MyStars возвращает status: "awaiting_payment" -> заказ остаётся в processing
         const premPurchase = await bs.purchaseWithInternalBalance({
@@ -7210,80 +7216,81 @@ async function runFullAuditTestSuite(): Promise<void> {
 
   await runTest(
     'S44-03',
-    'Security',
-    'MyStars FaaS v1 Webhook (POST /webhook/mystars): проверка X-Faas-Signature HMAC-SHA256, ротация секретов "current,previous", защита от подделки и идемпотентное завершение/ошибка заказа',
+    'Fulfillment',
+    'MyStars FaaS v1 (Polling-Only): работа без MYSTARS_WEBHOOK_SECRET и MYSTARS_CALLBACK_URL, автопроверка статусов GET /v1/orders/{id}, защита от дублей и продолжение polling после перезапуска',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
       FulfillmentService.resetAdapterToDefault();
+      FulfillmentService.resetMyStarsPollingState();
+
+      const prevWebhookSecret = process.env.MYSTARS_WEBHOOK_SECRET;
+      const prevCallbackUrl = process.env.MYSTARS_CALLBACK_URL;
+      delete process.env.MYSTARS_WEBHOOK_SECRET;
+      delete process.env.MYSTARS_CALLBACK_URL;
 
       const sentMessages: Array<{ chatId: number | string; text: string }> = [];
       const mockBot = createMockBot(sentMessages);
 
-      const currentSecret = 'whsec_current_secret_4403';
-      const previousSecret = 'whsec_previous_secret_4403';
-      const rotatedSecrets = `${currentSecret},${previousSecret}`;
-
-      const sampleRawBody = JSON.stringify({
-        order_id: 'ms_ord_webhook_1',
-        status: 'delivered',
-        type: 'premium',
-        recipient_username: 'webhook_buyer',
-        months: 6,
-        payment_amount: '18.50',
-        currency: 'usdt_ton',
-        purchase_tx: 'tx_webhook_delivered_777',
-        timestamp: new Date().toISOString(),
-      });
-
-      // Проверка подписи и новым, и старым ключом при ротации "current,previous"
-      const sigWithCurrent = computeMyStarsWebhookSignature(sampleRawBody, currentSecret);
-      const sigWithPrevious = computeMyStarsWebhookSignature(sampleRawBody, previousSecret);
-      assert.equal(verifyMyStarsWebhookSignature(sampleRawBody, sigWithCurrent, rotatedSecrets), true);
-      assert.equal(verifyMyStarsWebhookSignature(sampleRawBody, sigWithPrevious, rotatedSecrets), true);
-      assert.equal(verifyMyStarsWebhookSignature(sampleRawBody, 'deadbeef'.repeat(8), rotatedSecrets), false);
+      // Проверка, что конфигурация и статус сервера не зависят от MYSTARS_WEBHOOK_SECRET и MYSTARS_CALLBACK_URL
+      const envCfg = getEnvConfig();
+      assert.equal(envCfg.mystarsWebhookSecret, undefined);
+      assert.equal(envCfg.mystarsCallbackUrl, undefined);
 
       myStarsClient.setCredentialsOverride({
         apiKey: 'ms_live_test_key_4403',
         apiBaseUrl: 'https://api.mystars.tg/v1',
-        webhookSecret: rotatedSecrets,
       });
+      const prevRetries = myStarsClient.maxTransientGetRetries;
+      myStarsClient.maxTransientGetRetries = 0;
 
-      let remoteStatus: 'delivered' | 'failed' = 'delivered';
+      let order1PollCount = 0;
+      let order2PollCount = 0;
+      let order3PollCount = 0;
+
       try {
+        const statusText = renderPlainTextStatus();
+        assert.ok(statusText.includes('MyStars FaaS v1 (Polling)'));
+        assert.equal(statusText.includes('/webhook/mystars'), false);
+
         myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
           if (req.url.endsWith('/v1/recipients/check')) {
             return {
               status: 200,
               ok: true,
-              json: { username: 'webhook_buyer', type: 'premium', resolved: true, eligible: true },
+              json: { username: 'poll_buyer', type: 'premium', resolved: true, eligible: true },
             };
           }
-          if (req.url.endsWith('/v1/orders/ms_ord_webhook_1') && req.method === 'GET') {
+          if (req.url.endsWith('/v1/orders/ms_ord_poll_1') && req.method === 'GET') {
+            order1PollCount += 1;
+            const currentStatus =
+              order1PollCount === 1
+                ? 'purchasing'
+                : 'delivered';
             return {
               status: 200,
               ok: true,
               json: {
-                id: 'ms_ord_webhook_1',
+                id: 'ms_ord_poll_1',
                 type: 'premium',
-                recipient_username: 'webhook_buyer',
+                recipient_username: 'poll_buyer',
                 months: 6,
                 currency: 'usdt_ton',
                 payment_amount: '18.50',
-                status: remoteStatus,
-                purchase_tx: remoteStatus === 'delivered' ? 'tx_webhook_delivered_777' : null,
-                failure_reason: remoteStatus === 'failed' ? 'fragment_rejected_recipient' : null,
+                status: currentStatus,
+                purchase_tx: currentStatus === 'delivered' ? 'tx_poll_delivered_777' : null,
                 created_at: new Date().toISOString(),
               },
             };
           }
-          if (req.url.endsWith('/v1/orders/ms_ord_webhook_fail_2') && req.method === 'GET') {
+          if (req.url.endsWith('/v1/orders/ms_ord_poll_fail_2') && req.method === 'GET') {
+            order2PollCount += 1;
             return {
               status: 200,
               ok: true,
               json: {
-                id: 'ms_ord_webhook_fail_2',
+                id: 'ms_ord_poll_fail_2',
                 type: 'stars',
-                recipient_username: 'webhook_buyer',
+                recipient_username: 'poll_buyer',
                 quantity: 500,
                 currency: 'usdt_ton',
                 payment_amount: '6.80',
@@ -7293,146 +7300,175 @@ async function runFullAuditTestSuite(): Promise<void> {
               },
             };
           }
-          throw new Error(`Unexpected URL in S44-03: ${req.url}`);
+          if (req.url.endsWith('/v1/orders/ms_ord_restart_3') && req.method === 'GET') {
+            order3PollCount += 1;
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'ms_ord_restart_3',
+                type: 'stars',
+                recipient_username: 'poll_buyer',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.36',
+                status: 'delivered',
+                purchase_tx: 'tx_after_restart_333',
+                created_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected URL in S44-03: ${req.method} ${req.url}`);
         });
 
-        // Создаём заказ в статусе paid / processing с привязанным mystarsOrderId
+        // 1. Заказ 1 (awaiting_payment -> purchasing -> delivered)
         const order1 = await OrderService.createOrder({
           telegramUser: buyer1,
-          recipientUsername: 'webhook_buyer',
+          recipientUsername: 'poll_buyer',
           productId: 'premium_6m',
         });
         await firestoreRepo.updateDoc<Order>('orders', order1.orderId, {
           paymentStatus: 'paid',
           fulfillmentStatus: 'processing',
-          mystarsOrderId: 'ms_ord_webhook_1',
+          mystarsOrderId: 'ms_ord_poll_1',
           mystarsOrderStatus: 'awaiting_payment',
         });
 
-        // 1. Запрос с неверной подписью отклоняется с HTTP 401
-        let statusCode = 0;
-        let responseJson: Record<string, unknown> = {};
-        const badReq = {
-          headers: { 'x-faas-signature': '00'.repeat(32) },
-          rawBody: Buffer.from(sampleRawBody, 'utf8'),
-          body: JSON.parse(sampleRawBody),
-        } as unknown as Request;
-        const badRes = {
-          status(code: number) {
-            statusCode = code;
-            return this;
-          },
-          json(payload: Record<string, unknown>) {
-            responseJson = payload;
-            return this;
-          },
-        } as unknown as Response;
+        // Первый проход polling: статус обновился на purchasing, заказ всё ещё processing
+        const pass1 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(pass1.polled, 1);
+        assert.equal(pass1.stillProcessing, 1);
+        assert.equal(pass1.completed, 0);
+        const midOrder1 = (await OrderService.getOrderById(order1.orderId))!;
+        assert.equal(midOrder1.fulfillmentStatus, 'processing');
+        assert.equal(midOrder1.mystarsOrderStatus, 'purchasing');
+        assert.ok(midOrder1.mystarsLastPolledAt);
+        assert.equal(midOrder1.mystarsPollAttempts, 1);
 
-        await handleMyStarsWebhookRequest(badReq, badRes, mockBot);
-        assert.equal(statusCode, 401);
-        assert.equal(responseJson.ok, false);
-        assert.equal((await OrderService.getOrderById(order1.orderId))?.fulfillmentStatus, 'processing');
+        // Второй проход polling: статус стал delivered -> завершение, расчёт P&L и уведомление покупателю
+        const pass2 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(pass2.polled, 1);
+        assert.equal(pass2.completed, 1);
+        const completedOrder1 = (await OrderService.getOrderById(order1.orderId))!;
+        assert.equal(completedOrder1.fulfillmentStatus, 'completed');
+        assert.equal(completedOrder1.mystarsOrderStatus, 'delivered');
+        assert.equal(completedOrder1.mystarsPurchaseTx, 'tx_poll_delivered_777');
+        assert.equal(completedOrder1.mystarsCostUsdCents, 1850);
+        assert.equal(
+          completedOrder1.netProfitUsdCents,
+          (completedOrder1.totalPriceUsdCents ?? completedOrder1.totalPrice) - 1850,
+        );
+        const buyerMsgsAfterFirstComplete = sentMessages.filter(
+          (m) => Number(m.chatId) === buyer1.id && m.text.includes('выполнен!'),
+        ).length;
+        assert.equal(buyerMsgsAfterFirstComplete, 1);
 
-        // 2. Валидный вебхук (подписанный previousSecret) верифицирует заказ через GET /v1/orders/{id} и переводит в completed
-        const goodReq = {
-          headers: { 'x-faas-signature': sigWithPrevious },
-          rawBody: Buffer.from(sampleRawBody, 'utf8'),
-          body: JSON.parse(sampleRawBody),
-        } as unknown as Request;
-        const goodRes = {
-          status(code: number) {
-            statusCode = code;
-            return this;
-          },
-          json(payload: Record<string, unknown>) {
-            responseJson = payload;
-            return this;
-          },
-        } as unknown as Response;
+        // Третий проход polling + повторный completeOrder: защита от повторной обработки и повторной выдачи
+        const pollCountBeforeDup = order1PollCount;
+        const pass3 = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(pass3.polled, 0);
+        assert.equal(order1PollCount, pollCountBeforeDup);
+        await FulfillmentService.completeOrder({ orderId: order1.orderId, bot: mockBot });
+        const buyerMsgsAfterDup = sentMessages.filter(
+          (m) => Number(m.chatId) === buyer1.id && m.text.includes('выполнен!'),
+        ).length;
+        assert.equal(buyerMsgsAfterDup, 1);
 
-        await handleMyStarsWebhookRequest(goodReq, goodRes, mockBot);
-        assert.equal(statusCode, 200);
-        assert.equal(responseJson.action, 'completed');
-
-        const updatedOrder1 = (await OrderService.getOrderById(order1.orderId))!;
-        assert.equal(updatedOrder1.fulfillmentStatus, 'completed');
-        assert.equal(updatedOrder1.mystarsOrderStatus, 'delivered');
-        assert.equal(updatedOrder1.mystarsPurchaseTx, 'tx_webhook_delivered_777');
-        assert.equal(updatedOrder1.mystarsCostUsdCents, 1850);
-        assert.equal(updatedOrder1.netProfitUsdCents, (updatedOrder1.totalPriceUsdCents ?? updatedOrder1.totalPrice) - 1850);
-        assert.ok(sentMessages.some((m) => Number(m.chatId) === buyer1.id && m.text.includes('успешно выполнен')));
-
-        // Повторная доставка того же вебхука идемпотентна (duplicate: true)
-        const msgCountBeforeDuplicate = sentMessages.length;
-        await handleMyStarsWebhookRequest(goodReq, goodRes, mockBot);
-        assert.equal(statusCode, 200);
-        assert.equal(responseJson.duplicate, true);
-        assert.equal(sentMessages.length, msgCountBeforeDuplicate);
-
-        // 3. Вебхук с терминальной ошибкой (reversed / failed) переводит заказ в failed + needsManualReconciliation и уведомляет админа
+        // 2. Заказ 2 (терминальный статус reversed -> failed + needsManualReconciliation + алерт админу 1 раз)
         const order2 = await OrderService.createOrder({
           telegramUser: buyer2,
-          recipientUsername: 'webhook_buyer',
+          recipientUsername: 'poll_buyer',
           productId: 'stars_custom',
           quantity: 500,
         });
         await firestoreRepo.updateDoc<Order>('orders', order2.orderId, {
           paymentStatus: 'paid',
           fulfillmentStatus: 'processing',
-          mystarsOrderId: 'ms_ord_webhook_fail_2',
+          mystarsOrderId: 'ms_ord_poll_fail_2',
           mystarsOrderStatus: 'fulfilling',
         });
 
-        const failBody = JSON.stringify({
-          order_id: 'ms_ord_webhook_fail_2',
-          status: 'reversed',
-          type: 'stars',
-          recipient_username: 'webhook_buyer',
-          quantity: 500,
-          failure_reason: 'payment_reversed_by_fragment',
-        });
-        const failSig = computeMyStarsWebhookSignature(failBody, currentSecret);
-        const failReq = {
-          headers: { 'x-faas-signature': failSig },
-          rawBody: Buffer.from(failBody, 'utf8'),
-          body: JSON.parse(failBody),
-        } as unknown as Request;
-
-        await handleMyStarsWebhookRequest(failReq, goodRes, mockBot);
-        assert.equal(statusCode, 200);
-        assert.equal(responseJson.action, 'failed');
-
+        const failPass = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(failPass.failed, 1);
         const failedOrder2 = (await OrderService.getOrderById(order2.orderId))!;
         assert.equal(failedOrder2.fulfillmentStatus, 'failed');
         assert.equal(failedOrder2.needsManualReconciliation, true);
         assert.equal(failedOrder2.mystarsOrderStatus, 'reversed');
-        assert.ok(sentMessages.some((m) => String(m.chatId) === '777000111' && m.text.includes('СБОЙ АВТОВЫДАЧИ MYSTARS')));
+        const adminAlerts = sentMessages.filter(
+          (m) => String(m.chatId) === '777000111' && m.text.includes('СБОЙ АВТОВЫДАЧИ MYSTARS'),
+        );
+        assert.equal(adminAlerts.length, 1);
+
+        // Повторный проход не обрабатывает failed заказ повторно
+        await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(order2PollCount, 1);
+
+        // 3. Имитация перезапуска бота: в БД остался незавершённый заказ в processing,
+        // внутренние in-memory состояния воркера сброшены -> стартовый проход recoverPendingFulfillments завершает заказ
+        const order3 = await OrderService.createOrder({
+          telegramUser: buyer2,
+          recipientUsername: 'poll_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', order3.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ms_ord_restart_3',
+          mystarsOrderStatus: 'awaiting_payment',
+        });
+
+        FulfillmentService.stopRecoveryWorker();
+        FulfillmentService.resetMyStarsPollingState();
+
+        const recoveredAfterRestart = await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.ok(recoveredAfterRestart.some((o) => o.orderId === order3.orderId));
+        assert.equal(order3PollCount, 1);
+        const finalOrder3 = (await OrderService.getOrderById(order3.orderId))!;
+        assert.equal(finalOrder3.fulfillmentStatus, 'completed');
+        assert.equal(finalOrder3.mystarsOrderStatus, 'delivered');
+        assert.equal(finalOrder3.mystarsPurchaseTx, 'tx_after_restart_333');
       } finally {
+        myStarsClient.maxTransientGetRetries = prevRetries;
         myStarsClient.setCredentialsOverride(null);
         myStarsClient.resetHttpTransport();
         FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
+        if (prevWebhookSecret !== undefined) process.env.MYSTARS_WEBHOOK_SECRET = prevWebhookSecret;
+        if (prevCallbackUrl !== undefined) process.env.MYSTARS_CALLBACK_URL = prevCallbackUrl;
       }
 
-      return 'Webhook POST /webhook/mystars: HMAC-SHA256, ротация секретов, идемпотентность и обработка delivered/reversed подтверждены.';
+      return 'MyStars Polling-Only: работа без webhook-переменных, многошаговый polling, анти-дубликат и продолжение после перезапуска подтверждены.';
     },
   );
 
   await runTest(
     'S44-04',
     'Fulfillment',
-    'Обработка лимитов MyStars 429 (general с Retry-After vs order_cap) и фоновая сверка recoverPendingFulfillments (MyStars + CryptoBot + xRocket)',
+    'Устойчивость MyStars Polling: обработка 429 (general с Retry-After cooldown vs order_cap), таймаутов сети и HTTP 5xx без потери заказа',
     async () => {
       firestoreRepo.enableIsolatedTestMode(true);
       FulfillmentService.resetAdapterToDefault();
+      FulfillmentService.resetMyStarsPollingState();
 
       const sentMessages: Array<{ chatId: number | string; text: string }> = [];
       const mockBot = createMockBot(sentMessages);
 
+      // Проверка парсера Retry-After (секунды и HTTP-date)
+      assert.equal(parseRetryAfterSeconds('12'), 12);
+      assert.equal(parseRetryAfterSeconds('0.05'), 0.05);
+      const futureHttpDate = new Date(Date.now() + 10_000).toUTCString();
+      const parsedDateSec = parseRetryAfterSeconds(futureHttpDate);
+      assert.ok(parsedDateSec !== undefined && parsedDateSec >= 8 && parsedDateSec <= 12);
+
       let postAttempt = 0;
+      let pollGetAttempt = 0;
       myStarsClient.setCredentialsOverride({
         apiKey: 'ms_live_test_key_4404',
         apiBaseUrl: 'https://api.mystars.tg/v1',
       });
+      const prevRetries = myStarsClient.maxTransientGetRetries;
+      myStarsClient.maxTransientGetRetries = 0;
 
       try {
         myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
@@ -7446,19 +7482,19 @@ async function runFullAuditTestSuite(): Promise<void> {
           if (req.url.endsWith('/v1/orders') && req.method === 'POST') {
             postAttempt += 1;
             if (postAttempt === 1) {
-              // 429 general rate limit -> retryable inside MyStarsFulfillmentAdapter / FulfillmentService
+              // 429 general rate limit -> retryable
               return {
                 status: 429,
                 ok: false,
-                headers: { 'retry-after': '0.01' },
+                headers: { 'retry-after': '0.02' },
                 json: {
                   error: 'rate limit exceeded',
                   limit_type: 'general',
-                  retry_after: 0.01,
+                  retry_after: 0.02,
                 },
               };
             }
-            // 429 order_cap (10 active unpaid orders) -> non-retryable permanent error for this attempt
+            // 429 order_cap (10 active unpaid orders) -> non-retryable permanent error
             return {
               status: 429,
               ok: false,
@@ -7469,27 +7505,54 @@ async function runFullAuditTestSuite(): Promise<void> {
               },
             };
           }
-          if (req.url.endsWith('/v1/orders/ms_ord_inflight_recover_1') && req.method === 'GET') {
+          if (req.url.endsWith('/v1/orders/ms_ord_resilient_poll_1') && req.method === 'GET') {
+            pollGetAttempt += 1;
+            if (pollGetAttempt === 1) {
+              // 1-я попытка polling: сетевой таймаут
+              throw new MyStarsTransportError('Таймаут запроса к MyStars API (15000 мс)', true);
+            }
+            if (pollGetAttempt === 2) {
+              // 2-я попытка polling: временная ошибка сервера 503
+              return {
+                status: 503,
+                ok: false,
+                json: { error: 'upstream temporarily unavailable' },
+              };
+            }
+            if (pollGetAttempt === 3) {
+              // 3-я попытка polling: 429 general с Retry-After 0.06с -> включает cooldown
+              return {
+                status: 429,
+                ok: false,
+                headers: { 'retry-after': '0.06' },
+                json: {
+                  error: 'too many requests',
+                  limit_type: 'general',
+                  retry_after: 0.06,
+                },
+              };
+            }
+            // 4-я попытка после окончания cooldown: заказ успешно доставлен
             return {
               status: 200,
               ok: true,
               json: {
-                id: 'ms_ord_inflight_recover_1',
+                id: 'ms_ord_resilient_poll_1',
                 type: 'stars',
                 recipient_username: 'cap_buyer',
                 quantity: 100,
                 currency: 'usdt_ton',
                 payment_amount: '1.38',
                 status: 'delivered',
-                purchase_tx: 'tx_recovered_after_restart_999',
+                purchase_tx: 'tx_resilient_poll_recovered_999',
                 created_at: new Date().toISOString(),
               },
             };
           }
-          throw new Error(`Unexpected URL in S44-04: ${req.url}`);
+          throw new Error(`Unexpected URL in S44-04: ${req.method} ${req.url}`);
         });
 
-        // 1. Проверка retry при 429 general -> затем немедленный фейл без 3 бесполезных повторов при 429 order_cap
+        // 1. Проверка 429 general (retryable) -> затем 429 order_cap (non-retryable) при POST /v1/orders
         const capOrder = await OrderService.createOrder({
           telegramUser: buyer1,
           recipientUsername: 'cap_buyer',
@@ -7500,53 +7563,86 @@ async function runFullAuditTestSuite(): Promise<void> {
           paymentStatus: 'paid',
           fulfillmentStatus: 'paid',
         });
-        const paidCapOrder = (await OrderService.getOrderById(capOrder.orderId))!;
 
-        await FulfillmentService.initiateFulfillment(paidCapOrder, mockBot);
-        // 1-й запрос вернул 429 general (retryable: true), 2-й вызов initiateFulfillment (или фоновый retry) вернёт 429 order_cap (retryable: false)
-        const afterFirstTry = (await OrderService.getOrderById(capOrder.orderId))!;
-        if (afterFirstTry.fulfillmentStatus !== 'failed') {
-          await firestoreRepo.updateDoc<Order>('orders', capOrder.orderId, {
-            fulfillmentNextRetryAt: new Date(Date.now() - 1000).toISOString(),
-          });
-          await FulfillmentService.initiateFulfillment(
-            (await OrderService.getOrderById(capOrder.orderId))!,
-            mockBot,
-          );
-        }
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(capOrder, mockBot),
+          (err: unknown) => err instanceof MyStarsRateLimitError && err.kind === 'general' && err.retryable === true,
+        );
+        const afterGeneral429 = (await OrderService.getOrderById(capOrder.orderId))!;
+        assert.equal(afterGeneral429.needsManualReconciliation, false);
+        assert.ok(afterGeneral429.fulfillmentNextRetryAt);
+
+        // Повторный вызов после короткого backoff получает 429 order_cap (retryable: false)
+        await firestoreRepo.updateDoc<Order>('orders', capOrder.orderId, {
+          fulfillmentNextRetryAt: new Date(Date.now() - 1000).toISOString(),
+        });
+        await assert.rejects(
+          () => FulfillmentService.initiateFulfillment(afterGeneral429, mockBot),
+          (err: unknown) => err instanceof MyStarsRateLimitError && err.kind === 'order_cap' && err.retryable === false,
+        );
         assert.equal(postAttempt, 2);
         const failedCapOrder = (await OrderService.getOrderById(capOrder.orderId))!;
         assert.equal(failedCapOrder.fulfillmentStatus, 'failed');
         assert.equal(failedCapOrder.needsManualReconciliation, true);
         assert.ok(failedCapOrder.fulfillmentLastError?.includes('order_cap'));
 
-        // 2. Проверка фонового опроса in-flight заказа MyStars в recoverPendingFulfillments
-        const inflightOrder = await OrderService.createOrder({
+        // 2. Проверка устойчивости polling к таймауту, HTTP 503 и 429 general с Retry-After cooldown
+        const resilientOrder = await OrderService.createOrder({
           telegramUser: buyer2,
           recipientUsername: 'cap_buyer',
           productId: 'stars_custom',
           quantity: 100,
         });
-        await firestoreRepo.updateDoc<Order>('orders', inflightOrder.orderId, {
+        await firestoreRepo.updateDoc<Order>('orders', resilientOrder.orderId, {
           paymentStatus: 'paid',
           fulfillmentStatus: 'processing',
-          mystarsOrderId: 'ms_ord_inflight_recover_1',
+          mystarsOrderId: 'ms_ord_resilient_poll_1',
           mystarsOrderStatus: 'fulfilling',
         });
 
-        const recoveredCount = await FulfillmentService.recoverPendingFulfillments(mockBot);
-        assert.ok(recoveredCount >= 1);
-        const recoveredOrder = (await OrderService.getOrderById(inflightOrder.orderId))!;
+        // Попытка 1: таймаут -> заказ НЕ падает, остаётся в processing
+        const timeoutPass = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(timeoutPass.transientErrors, 1);
+        assert.equal((await OrderService.getOrderById(resilientOrder.orderId))?.fulfillmentStatus, 'processing');
+        assert.ok((await OrderService.getOrderById(resilientOrder.orderId))?.mystarsLastPollError?.includes('Таймаут'));
+
+        // Попытка 2: HTTP 503 -> заказ остаётся в processing
+        const serverErrPass = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(serverErrPass.transientErrors, 1);
+        assert.equal((await OrderService.getOrderById(resilientOrder.orderId))?.fulfillmentStatus, 'processing');
+
+        // Попытка 3: 429 general -> включает глобальный cooldown, заказ остаётся в processing
+        const rateLimitPass = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(rateLimitPass.rateLimited, true);
+        assert.equal(FulfillmentService.getMyStarsPollingStatus().cooldownActive, true);
+        assert.equal((await OrderService.getOrderById(resilientOrder.orderId))?.fulfillmentStatus, 'processing');
+
+        // Немедленный повторный вызов во время cooldown НЕ бьёт в API
+        const deferredPass = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(deferredPass.deferredByCooldown, true);
+        assert.equal(deferredPass.polled, 0);
+        assert.equal(pollGetAttempt, 3);
+
+        // Ждём истечения Retry-After (70ms) -> polling возобновляется и завершает заказ
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        const finalPass = await FulfillmentService.pollMyStarsOrders(mockBot);
+        assert.equal(finalPass.completed, 1);
+        assert.equal(pollGetAttempt, 4);
+
+        const recoveredOrder = (await OrderService.getOrderById(resilientOrder.orderId))!;
         assert.equal(recoveredOrder.fulfillmentStatus, 'completed');
         assert.equal(recoveredOrder.mystarsOrderStatus, 'delivered');
-        assert.equal(recoveredOrder.mystarsPurchaseTx, 'tx_recovered_after_restart_999');
+        assert.equal(recoveredOrder.mystarsPurchaseTx, 'tx_resilient_poll_recovered_999');
+        assert.equal(recoveredOrder.mystarsLastPollError, undefined);
       } finally {
+        myStarsClient.maxTransientGetRetries = prevRetries;
         myStarsClient.setCredentialsOverride(null);
         myStarsClient.resetHttpTransport();
         FulfillmentService.resetAdapterToDefault();
+        FulfillmentService.resetMyStarsPollingState();
       }
 
-      return 'Лимиты MyStars 429 (general vs order_cap) и фоновое завершение in-flight заказов в recoverPendingFulfillments подтверждены.';
+      return 'Устойчивость MyStars Polling к 429 (Retry-After cooldown vs order_cap), таймаутам и HTTP 503 подтверждена.';
     },
   );
 

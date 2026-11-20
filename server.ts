@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { Express, Request, Response } from 'express';
-import type { Telegraf } from 'telegraf';
 import { formatUsd, getEnvConfig } from './src/config/env.ts';
 import { firestoreRepo } from './src/db/firestore.ts';
 import { botManager, maskSecretsInText } from './src/bot/bot.ts';
@@ -288,78 +287,12 @@ export async function handleTopUpCalculateRequest(
   }
 }
 
-export async function handleMyStarsWebhookRequest(
-  req: RawBodyRequest,
-  res: Response,
-  botOverride?: Telegraf | null,
-): Promise<void> {
-  const rawBody =
-    typeof req.rawBody === 'string'
-      ? req.rawBody
-      : Buffer.isBuffer(req.rawBody)
-        ? (req.rawBody as Buffer).toString('utf8')
-        : JSON.stringify(req.body ?? {});
-  const headers = req.headers as Record<string, string | string[] | undefined>;
-
-  try {
-    const result = await FulfillmentService.processMyStarsWebhook({
-      rawBody,
-      headers,
-      parsedBody: req.body,
-      bot: botOverride !== undefined ? botOverride : botManager.getBotInstance(),
-    });
-
-    const action = result.duplicate
-      ? 'duplicate'
-      : result.order?.fulfillmentStatus === 'completed'
-        ? 'completed'
-        : result.order?.fulfillmentStatus === 'failed'
-          ? 'failed'
-          : 'processing';
-
-    res.status(200).json({
-      ok: result.ok,
-      kind: 'mystars',
-      action,
-      duplicate: result.duplicate,
-      mystarsOrderId: result.mystarsOrderId,
-      mystarsStatus: result.mystarsStatus,
-      reason: result.reason,
-    });
-  } catch (error) {
-    const raw = error instanceof Error ? error.message : String(error);
-    if (raw.includes('[WEBHOOK_UNAUTHORIZED]')) {
-      res.status(401).json({
-        ok: false,
-        error: 'Unauthorized: invalid MyStars webhook signature',
-      });
-      return;
-    }
-    const latest = getEnvConfig();
-    console.error(
-      '[Webhook:mystars] Ошибка обработки webhook:',
-      maskSecretsInText(raw, [
-        latest.mystarsApiKey,
-        latest.mystarsWebhookSecret,
-        latest.cryptobotApiToken,
-        latest.xrocketApiKey,
-      ]),
-    );
-    res.status(400).json({
-      ok: false,
-      error: maskSecretsInText(raw, [
-        latest.mystarsApiKey,
-        latest.mystarsWebhookSecret,
-      ]),
-    });
-  }
-}
-
 export function renderPlainTextStatus(): string {
   const botStatus = botManager.getStatus();
   const dbStatus = firestoreRepo.getStatus();
   const config = getEnvConfig();
   const mystarsDiag = myStarsClient.getStatusSummary();
+  const mystarsPolling = FulfillmentService.getMyStarsPollingStatus();
   return [
     '=== QUIZYSTARS STORE SERVER ===',
     'QuizyStars — Магазин Telegram Stars, Telegram Premium и Gifts. Оплата: CryptoBot (3%), xRocket (2%), внутренний баланс (USD). XTR checkout отключён.',
@@ -374,11 +307,17 @@ export function renderPlainTextStatus(): string {
     })`,
     `База данных Firestore: проект ${dbStatus.projectId} (${dbStatus.databaseId})`,
     `Статус хранилища: ${dbStatus.degradedMode ? 'АВАРИЙНЫЙ РЕЖИМ (НЕДОСТУПНО)' : 'АКТИВНО'}`,
-    `MyStars FaaS v1: ${mystarsDiag.configured ? `НАСТРОЕН (${mystarsDiag.apiBaseUrl})` : 'РУЧНОЙ РЕЖИМ (MYSTARS_API_KEY не задан)'}`,
+    `MyStars FaaS v1 (Polling): ${
+      mystarsDiag.configured
+        ? `НАСТРОЕН (${mystarsDiag.apiBaseUrl}, интервал: ${Math.round(mystarsDiag.pollIntervalMs / 1000)}с, воркер: ${
+            mystarsPolling.workerActive ? 'активен' : 'остановлен'
+          })`
+        : 'РУЧНОЙ РЕЖИМ (MYSTARS_API_KEY не задан)'
+    }`,
     `Валюта расчётов MyStars: ${config.mystarsPaymentCurrency}`,
     `Проверка здоровья (JSON): /health`,
     `Расчёт пополнения (JSON): POST /api/topup/calculate`,
-    `Webhook endpoints: POST /webhook/telegram, /webhook/cryptobot, /webhook/xrocket, /webhook/mystars`,
+    `Webhook endpoints: POST /webhook/telegram, /webhook/cryptobot, /webhook/xrocket`,
   ].join('\n');
 }
 
@@ -406,11 +345,6 @@ export function createApp(deps?: ServerDependencies): Express {
 
   app.post('/webhook/xrocket', async (req: RawBodyRequest, res: Response) => {
     await handleProviderWebhookRequest('xrocket', req, res, deps);
-  });
-
-  // MyStars FaaS v1 terminal fulfillment webhook endpoint
-  app.post('/webhook/mystars', async (req: RawBodyRequest, res: Response) => {
-    await handleMyStarsWebhookRequest(req, res);
   });
 
   // Live server-side validation, fee, and live exchange rate calculation endpoint
@@ -442,9 +376,12 @@ export function createApp(deps?: ServerDependencies): Express {
         recoveryWorkerActive: FulfillmentService.isRecoveryWorkerActive(),
         mystars: {
           configured: mystarsDiag.configured,
-          webhookConfigured: mystarsDiag.webhookConfigured,
+          mode: mystarsDiag.mode,
           apiBaseUrl: mystarsDiag.apiBaseUrl,
           paymentCurrency: mystarsDiag.paymentCurrency,
+          pollIntervalMs: mystarsDiag.pollIntervalMs,
+          requestTimeoutMs: mystarsDiag.requestTimeoutMs,
+          polling: FulfillmentService.getMyStarsPollingStatus(),
         },
       },
       paymentProviders: {
@@ -518,7 +455,10 @@ async function bootstrap(): Promise<void> {
 
   await firestoreRepo.init();
   await botManager.start();
-  FulfillmentService.startRecoveryWorker(() => botManager.getBotInstance(), 30_000);
+  FulfillmentService.startRecoveryWorker(
+    () => botManager.getBotInstance(),
+    config.mystarsPollIntervalMs,
+  );
 
   const watcherInterval = setInterval(async () => {
     if (isShuttingDown) return;

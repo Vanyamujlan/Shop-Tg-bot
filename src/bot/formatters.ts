@@ -854,6 +854,11 @@ export function formatAdminOrderCard(order: Order): string {
             : ''
         }`
       : '',
+    order.mystarsLastPolledAt
+      ? `🔄 MyStars Polling: проверен <code>${formatDateRu(order.mystarsLastPolledAt)}</code>${
+          order.mystarsPollAttempts ? ` (проверок: ${order.mystarsPollAttempts})` : ''
+        }`
+      : '',
     order.mystarsWholesaleCostUsdt
       ? `💵 Себестоимость MyStars: <code>${escapeHtml(order.mystarsWholesaleCostUsdt)} USDT</code>${
           order.mystarsCostUsdCents !== undefined

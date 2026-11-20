@@ -7,13 +7,13 @@ import { PaymentService } from './PaymentService.ts';
 import { balanceService } from './BalanceService.ts';
 import { DigitalKeyService } from './DigitalKeyService.ts';
 import {
-  MYSTARS_FAILURE_STATUSES,
-  MYSTARS_SUCCESS_STATUSES,
+  MyStarsApiError,
   MyStarsFulfillmentAdapter,
-  MyStarsWebhookEvent,
+  MyStarsRateLimitError,
+  MyStarsTransportError,
   myStarsClient,
-  verifyMyStarsWebhookSignature,
 } from './MyStarsService.ts';
+import { redactSecretsFromText } from './PaymentProviders.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
 import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
 
@@ -84,6 +84,33 @@ export class FulfillmentService {
   private static customAdapterOverride: FulfillmentProviderAdapter | null = null;
   private static recoveryIntervalHandle: ReturnType<typeof setInterval> | null = null;
   private static isRecoveryPassRunning = false;
+  private static mystarsPollCooldownUntilMs = 0;
+  private static inFlightMyStarsPollOrders = new Set<string>();
+
+  public static resetMyStarsPollingState(): void {
+    this.mystarsPollCooldownUntilMs = 0;
+    this.inFlightMyStarsPollOrders.clear();
+  }
+
+  public static getMyStarsPollingStatus(): {
+    mode: 'polling';
+    workerActive: boolean;
+    cooldownActive: boolean;
+    cooldownUntilIso: string | null;
+    inFlightOrdersCount: number;
+  } {
+    const now = Date.now();
+    const cooldownActive = this.mystarsPollCooldownUntilMs > now;
+    return {
+      mode: 'polling',
+      workerActive: this.recoveryIntervalHandle !== null,
+      cooldownActive,
+      cooldownUntilIso: cooldownActive
+        ? new Date(this.mystarsPollCooldownUntilMs).toISOString()
+        : null,
+      inFlightOrdersCount: this.inFlightMyStarsPollOrders.size,
+    };
+  }
 
   public static setAdapter(adapter: FulfillmentProviderAdapter): void {
     if (adapter instanceof ManualAdminFulfillmentAdapter) {
@@ -479,7 +506,14 @@ export class FulfillmentService {
       const nowMs = Date.now();
       const nowIso = new Date(nowMs).toISOString();
       const canRetry = !isNonRetryable && attempt < this.MAX_FULFILLMENT_ATTEMPTS;
-      const delayMs = this.baseRetryDelayMs * Math.pow(2, Math.max(0, attempt - 1));
+      let delayMs = this.baseRetryDelayMs * Math.pow(2, Math.max(0, attempt - 1));
+      if (
+        error instanceof MyStarsRateLimitError &&
+        error.kind === 'general' &&
+        error.retryAfterSeconds !== undefined
+      ) {
+        delayMs = Math.min(Math.max(error.retryAfterSeconds * 1000, 10), 120_000);
+      }
       const nextRetryIso = canRetry ? new Date(nowMs + delayMs).toISOString() : undefined;
 
       const failedOrder = await firestoreRepo.runTransaction<Order>(async (tx) => {
@@ -697,14 +731,12 @@ export class FulfillmentService {
         }
       }
 
-      // 3. Stale 'processing' orders, in-flight MyStars orders, or orders with undelivered admin notifications
+      // 3. Stale 'processing' orders (crashed mid-call without external reference) and admin notifications
       const processingOrders = await firestoreRepo.queryDocs<Order>('orders', {
         where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
         orderBy: { field: 'createdAt', direction: 'asc' },
-        limit: 25,
+        limit: 50,
       });
-
-      const activeAdapter = this.getActiveAdapter();
 
       for (const ord of processingOrders) {
         const startedMs = ord.fulfillmentStartedAt
@@ -713,7 +745,7 @@ export class FulfillmentService {
         const isStale =
           startedMs > 0 && nowMs - startedMs >= this.staleProcessingLeaseMs;
 
-        if (!ord.externalExecutionReference && isStale) {
+        if (!ord.externalExecutionReference && !ord.mystarsOrderId && isStale) {
           try {
             const reconciled = await this.reconcileStaleProcessingOrder(ord, bot);
             recovered.push(reconciled);
@@ -726,52 +758,27 @@ export class FulfillmentService {
           continue;
         }
 
-        // Poll external status for in-flight MyStars orders (e.g. awaiting_payment -> delivered)
-        if (
-          ord.mystarsOrderId &&
-          activeAdapter.checkExternalStatus &&
-          activeAdapter.isConfigured()
-        ) {
-          try {
-            const extStatus = await activeAdapter.checkExternalStatus(
-              ord,
-              ord.fulfillmentIdempotencyKey || `fulfill_${ord.orderId}`,
-            );
-            if (extStatus.alreadyExecuted && extStatus.status === 'completed') {
-              const completed = await this.completeOrder({
-                orderId: ord.orderId,
-                adminNote:
-                  extStatus.details ||
-                  `Автоматическая выдача MyStars завершена (${ord.mystarsOrderId}).`,
-                bot,
-              });
-              recovered.push(completed);
-              continue;
-            }
-          } catch (error) {
-            const errMsg = error instanceof Error ? error.message : String(error);
-            const isPermanent =
-              (error as { retryable?: boolean })?.retryable === false;
-            if (isPermanent) {
-              const failedOrd = await this.markOrderFulfillmentFailedPermanent(
-                ord.orderId,
-                errMsg,
-                bot,
-              );
-              if (failedOrd) {
-                recovered.push(failedOrd);
-                continue;
-              }
-            }
-          }
-        }
-
-        if (!ord.adminNotifiedAt) {
+        if (!ord.adminNotifiedAt && !ord.mystarsOrderId) {
           const notified = await this.ensureAdminNotified(ord, bot);
           if (notified.adminNotifiedAt) {
             recovered.push(notified);
           }
         }
+      }
+
+      // 3b. Dedicated MyStars FaaS v1 Polling Pass (GET /v1/orders/{order_id})
+      // Automatically resumes for all unfinished processing orders after restarts,
+      // handles 429 Retry-After cooldowns, timeouts, and terminal success/failure states.
+      try {
+        const pollSummary = await this.pollMyStarsOrders(bot);
+        for (const polledOrder of pollSummary.orders) {
+          recovered.push(polledOrder);
+        }
+      } catch (error) {
+        console.error(
+          '[FulfillmentService] Ошибка фонового polling MyStars:',
+          redactSecretsFromText(error instanceof Error ? error.message : String(error)),
+        );
       }
 
       // 4. AUD-016: Recover pending/interrupted refunds where Telegram succeeded before Firestore commit
@@ -817,6 +824,172 @@ export class FulfillmentService {
     }
   }
 
+  /**
+   * Dedicated MyStars FaaS v1 Polling Pass (`GET /v1/orders/{order_id}`).
+   * - Polls all unfinished `processing` orders linked to a MyStars external order ID.
+   * - Persists updated MyStars status, transaction hash, P&L, and polling timestamp.
+   * - Guarantees idempotency via per-order concurrency guard + atomic completion/failure transactions.
+   * - Respects HTTP 429 Retry-After cooldowns without marking orders as failed.
+   * - Survives timeouts / 5xx errors and automatically resumes after bot restarts.
+   */
+  public static async pollMyStarsOrders(
+    bot: Telegraf | null | undefined,
+  ): Promise<{
+    polled: number;
+    completed: number;
+    failed: number;
+    stillProcessing: number;
+    rateLimited: boolean;
+    deferredByCooldown: boolean;
+    transientErrors: number;
+    orders: Order[];
+  }> {
+    const summary = {
+      polled: 0,
+      completed: 0,
+      failed: 0,
+      stillProcessing: 0,
+      rateLimited: false,
+      deferredByCooldown: false,
+      transientErrors: 0,
+      orders: [] as Order[],
+    };
+
+    if (!firestoreRepo.isProductionStorageHealthy()) {
+      return summary;
+    }
+
+    const activeAdapter = this.getActiveAdapter();
+    if (!activeAdapter.checkExternalStatus || !activeAdapter.isConfigured()) {
+      return summary;
+    }
+
+    const nowMs = Date.now();
+    if (this.mystarsPollCooldownUntilMs > nowMs) {
+      summary.rateLimited = true;
+      summary.deferredByCooldown = true;
+      return summary;
+    }
+
+    const processingOrders = await firestoreRepo.queryDocs<Order>('orders', {
+      where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
+      orderBy: { field: 'createdAt', direction: 'asc' },
+      limit: 50,
+    });
+
+    for (const ord of processingOrders) {
+      const hasMyStarsRef = Boolean(
+        ord.mystarsOrderId ||
+          (ord.externalExecutionReference &&
+            (ord.externalExecutionReference.startsWith('ord_') ||
+              ord.externalExecutionReference.startsWith('ms_'))),
+      );
+      if (!hasMyStarsRef) {
+        continue;
+      }
+
+      if (this.inFlightMyStarsPollOrders.has(ord.orderId)) {
+        continue;
+      }
+
+      this.inFlightMyStarsPollOrders.add(ord.orderId);
+      try {
+        // Re-read authoritative state before calling upstream API to avoid duplicate processing
+        const latest = await OrderService.getOrderById(ord.orderId);
+        if (!latest || latest.fulfillmentStatus !== 'processing') {
+          continue;
+        }
+
+        summary.polled += 1;
+        const extStatus = await activeAdapter.checkExternalStatus(
+          latest,
+          latest.fulfillmentIdempotencyKey || `fulfill_${latest.orderId}`,
+        );
+
+        if (extStatus.alreadyExecuted && extStatus.status === 'completed') {
+          const completed = await this.completeOrder({
+            orderId: latest.orderId,
+            adminNote:
+              extStatus.details ||
+              `Автоматическая выдача MyStars завершена (${latest.mystarsOrderId || extStatus.externalReference}).`,
+            bot,
+          });
+          summary.completed += 1;
+          summary.orders.push(completed);
+          continue;
+        }
+
+        summary.stillProcessing += 1;
+      } catch (error) {
+        const safeErrMsg = redactSecretsFromText(
+          error instanceof Error ? error.message : String(error),
+        );
+
+        // 1. Rate-limit (HTTP 429 general): set global polling cooldown honoring Retry-After
+        if (error instanceof MyStarsRateLimitError && error.kind === 'general') {
+          const retryAfterSec = error.retryAfterSeconds ?? 15;
+          const cooldownMs = Math.min(Math.max(retryAfterSec * 1000, 10), 120_000);
+          this.mystarsPollCooldownUntilMs = Date.now() + cooldownMs;
+          summary.rateLimited = true;
+          summary.transientErrors += 1;
+          await firestoreRepo
+            .updateDoc<Order>('orders', ord.orderId, {
+              mystarsLastPolledAt: new Date().toISOString(),
+              mystarsLastPollError: safeErrMsg.slice(0, 500),
+              updatedAt: new Date().toISOString(),
+            })
+            .catch(() => {});
+          console.warn(
+            `[FulfillmentService:MyStarsPolling] HTTP 429 rate limit — пауза polling на ${Math.round(cooldownMs)} мс.`,
+          );
+          break;
+        }
+
+        // 2. Permanent terminal failure (MyStars status failed/reversed/expired/cancelled or non-retryable 4xx)
+        const isPermanent =
+          (error instanceof MyStarsApiError && !error.retryable) ||
+          (error as { retryable?: boolean })?.retryable === false;
+        if (isPermanent) {
+          const mystarsStatus =
+            error instanceof MyStarsApiError ? error.mystarsStatus : undefined;
+          const failedOrd = await this.markOrderFulfillmentFailedPermanent(
+            ord.orderId,
+            safeErrMsg,
+            bot,
+            mystarsStatus,
+          );
+          if (failedOrd) {
+            summary.failed += 1;
+            summary.orders.push(failedOrd);
+          }
+          continue;
+        }
+
+        // 3. Transient timeout / network error / HTTP 5xx: keep order in 'processing' and retry on next tick
+        summary.transientErrors += 1;
+        summary.stillProcessing += 1;
+        await firestoreRepo
+          .updateDoc<Order>('orders', ord.orderId, {
+            mystarsLastPolledAt: new Date().toISOString(),
+            mystarsLastPollError: safeErrMsg.slice(0, 500),
+            updatedAt: new Date().toISOString(),
+          })
+          .catch(() => {});
+        const kindLabel =
+          error instanceof MyStarsTransportError && error.isTimeout
+            ? 'таймаут'
+            : 'временная ошибка API';
+        console.warn(
+          `[FulfillmentService:MyStarsPolling] ${kindLabel} при проверке заказа #${ord.orderId} (${ord.mystarsOrderId}): ${safeErrMsg}`,
+        );
+      } finally {
+        this.inFlightMyStarsPollOrders.delete(ord.orderId);
+      }
+    }
+
+    return summary;
+  }
+
   private static async markOrderFulfillmentFailedPermanent(
     orderId: string,
     errorMessage: string,
@@ -824,10 +997,18 @@ export class FulfillmentService {
     mystarsStatus?: string,
   ): Promise<Order | null> {
     const nowIso = new Date().toISOString();
-    const updated = await firestoreRepo.runTransaction<Order | null>(async (tx) => {
+    const txOutcome = await firestoreRepo.runTransaction<{
+      newlyFailed: boolean;
+      order: Order | null;
+    }>(async (tx) => {
       const current = await tx.get<Order>('orders', orderId);
-      if (!current) return null;
-      if (current.fulfillmentStatus === 'completed') return current;
+      if (!current) return { newlyFailed: false, order: null };
+      if (current.fulfillmentStatus === 'completed') {
+        return { newlyFailed: false, order: current };
+      }
+      if (current.fulfillmentStatus === 'failed' && current.needsManualReconciliation) {
+        return { newlyFailed: false, order: current };
+      }
 
       const failed: Order = {
         ...current,
@@ -857,222 +1038,40 @@ export class FulfillmentService {
         createdAt: nowIso,
       });
 
-      return failed;
+      return { newlyFailed: true, order: failed };
     });
 
-    if (updated && updated.fulfillmentStatus === 'failed') {
-      return this.ensureAdminNotified(updated, bot, true);
+    const updated = txOutcome.order;
+    if (txOutcome.newlyFailed && updated && updated.fulfillmentStatus === 'failed' && bot) {
+      const { adminIds } = getEnvConfig();
+      for (const adminId of adminIds) {
+        await this.sendTelegramMessageWithRetry(
+          bot,
+          adminId,
+          `🚨 <b>СБОЙ АВТОВЫДАЧИ MYSTARS (Polling)</b>\n\n${formatAdminOrderCard(updated)}`,
+          {
+            parse_mode: 'HTML',
+            ...buildAdminOrderActionKeyboard(updated),
+          },
+        );
+      }
+      await firestoreRepo
+        .updateDoc<Order>('orders', updated.orderId, {
+          adminNotifiedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        })
+        .catch(() => {});
     }
     return updated;
   }
 
   /**
-   * Verifies and processes incoming MyStars FaaS v1 terminal webhooks (`POST /webhook/mystars`).
-   * - Validates `X-Faas-Signature` header (HMAC-SHA256 of raw UTF-8 body, supporting `"current,previous"` rotation).
-   * - Authoritatively fetches `GET /v1/orders/{order_id}` from MyStars when configured.
-   * - Transitions order to `completed` (and notifies buyer) when `status === "delivered"`.
-   * - Transitions order to `failed` (with `needsManualReconciliation: true` and admin alert) when `status` is `"failed" | "reversed" | "expired"`.
-   */
-  public static async processMyStarsWebhook(params: {
-    rawBody: string;
-    headers: Record<string, string | string[] | undefined>;
-    parsedBody?: unknown;
-    bot?: Telegraf | null;
-  }): Promise<{
-    ok: boolean;
-    duplicate: boolean;
-    mystarsOrderId: string;
-    mystarsStatus: string;
-    order?: Order;
-    reason?: string;
-  }> {
-    firestoreRepo.assertReadyForOrdersAndPayments();
-
-    let sigHeader: string | undefined;
-    for (const [k, v] of Object.entries(params.headers || {})) {
-      if (k.toLowerCase() === 'x-faas-signature') {
-        sigHeader = Array.isArray(v) ? v[0] : v;
-        break;
-      }
-    }
-
-    const secret = myStarsClient.getCredentials().webhookSecret;
-    if (!verifyMyStarsWebhookSignature(params.rawBody, sigHeader, secret)) {
-      throw new Error(
-        '[WEBHOOK_UNAUTHORIZED] Неверная подпись вебхука MyStars (X-Faas-Signature).',
-      );
-    }
-
-    let bodyObj: Record<string, unknown> | null = null;
-    if (params.parsedBody && typeof params.parsedBody === 'object') {
-      bodyObj = params.parsedBody as Record<string, unknown>;
-    } else if (params.rawBody) {
-      bodyObj = JSON.parse(params.rawBody) as Record<string, unknown>;
-    }
-
-    const mystarsOrderId =
-      typeof bodyObj?.order_id === 'string' ? bodyObj.order_id.trim() : '';
-    const webhookStatus =
-      typeof bodyObj?.status === 'string' ? bodyObj.status.trim().toLowerCase() : '';
-
-    if (!mystarsOrderId || !webhookStatus) {
-      throw new Error('Некорректный формат вебхука MyStars: отсутствуют order_id или status.');
-    }
-
-    const event: MyStarsWebhookEvent = {
-      order_id: mystarsOrderId,
-      status: webhookStatus,
-      failure_reason:
-        typeof bodyObj?.failure_reason === 'string' ? bodyObj.failure_reason : null,
-      purchase_tx:
-        typeof bodyObj?.purchase_tx === 'string' ? bodyObj.purchase_tx : null,
-    };
-
-    // Locate corresponding Order in Firestore
-    let targetOrder: Order | null = null;
-    const byMyStarsId = await firestoreRepo.queryDocs<Order>('orders', {
-      where: [{ field: 'mystarsOrderId', op: '==', value: mystarsOrderId }],
-      limit: 1,
-    });
-    if (byMyStarsId.length > 0) {
-      targetOrder = byMyStarsId[0];
-    } else {
-      const byExtRef = await firestoreRepo.queryDocs<Order>('orders', {
-        where: [
-          { field: 'externalExecutionReference', op: '==', value: mystarsOrderId },
-        ],
-        limit: 1,
-      });
-      if (byExtRef.length > 0) {
-        targetOrder = byExtRef[0];
-      }
-    }
-
-    if (!targetOrder) {
-      return {
-        ok: false,
-        duplicate: false,
-        mystarsOrderId,
-        mystarsStatus: webhookStatus,
-        reason: 'ORDER_NOT_FOUND',
-      };
-    }
-
-    if (targetOrder.fulfillmentStatus === 'completed') {
-      return {
-        ok: true,
-        duplicate: true,
-        mystarsOrderId,
-        mystarsStatus: webhookStatus,
-        order: targetOrder,
-      };
-    }
-
-    // Authoritatively re-verify via GET /v1/orders/{order_id} if MYSTARS_API_KEY is configured
-    let effectiveStatus = webhookStatus;
-    let purchaseTx = event.purchase_tx || undefined;
-    let failureReason = event.failure_reason || undefined;
-    let wholesaleTotalUsdt: string | undefined;
-
-    if (myStarsClient.isConfigured()) {
-      try {
-        const remote = await myStarsClient.getOrder(mystarsOrderId);
-        if (remote && typeof remote.status === 'string') {
-          effectiveStatus = remote.status.trim().toLowerCase();
-          purchaseTx = remote.purchase_tx || purchaseTx;
-          failureReason =
-            remote.failure_reason || remote.telegram_message || failureReason;
-          const remoteRec = remote as unknown as Record<string, unknown>;
-          wholesaleTotalUsdt =
-            remote.payment?.fee?.total ||
-            remote.payment?.amount ||
-            (typeof remoteRec.payment_amount === 'string'
-              ? remoteRec.payment_amount
-              : undefined);
-        }
-      } catch {
-        // Fallback to HMAC-verified webhook payload if upstream GET fails transiently
-      }
-    }
-
-    if (!wholesaleTotalUsdt && typeof bodyObj?.payment_amount === 'string') {
-      wholesaleTotalUsdt = bodyObj.payment_amount;
-    }
-
-    const pnlUpdates: Partial<Order> = {};
-    if (wholesaleTotalUsdt) {
-      const grossCents =
-        targetOrder.grossRevenueUsdCents ??
-        targetOrder.totalPriceUsdCents ??
-        targetOrder.totalPrice;
-      const providerFeeCents = targetOrder.providerFeeUsdCents ?? 0;
-      const costCents = Math.round(Number(wholesaleTotalUsdt) * 100);
-      if (Number.isFinite(costCents) && costCents >= 0) {
-        pnlUpdates.mystarsWholesaleCostUsdt = wholesaleTotalUsdt;
-        pnlUpdates.mystarsCostUsdCents = costCents;
-        pnlUpdates.netProfitUsdCents = grossCents - providerFeeCents - costCents;
-      }
-    }
-
-    await firestoreRepo.updateDoc<Order>('orders', targetOrder.orderId, {
-      ...pnlUpdates,
-      mystarsOrderId,
-      mystarsOrderStatus: effectiveStatus,
-      ...(purchaseTx ? { mystarsPurchaseTx: purchaseTx } : {}),
-      ...(failureReason ? { mystarsFailureReason: failureReason } : {}),
-      updatedAt: new Date().toISOString(),
-    });
-
-    if (MYSTARS_SUCCESS_STATUSES.has(effectiveStatus)) {
-      const completed = await this.completeOrder({
-        orderId: targetOrder.orderId,
-        adminNote: `Автоматическая выдача через MyStars завершена (${mystarsOrderId}${purchaseTx ? `, tx: ${purchaseTx}` : ''}).`,
-        bot: params.bot,
-      });
-      return {
-        ok: true,
-        duplicate: false,
-        mystarsOrderId,
-        mystarsStatus: effectiveStatus,
-        order: completed,
-      };
-    }
-
-    if (MYSTARS_FAILURE_STATUSES.has(effectiveStatus)) {
-      const errDetail =
-        failureReason || `Заказ MyStars ${mystarsOrderId} завершился со статусом ${effectiveStatus}`;
-      const failed = await this.markOrderFulfillmentFailedPermanent(
-        targetOrder.orderId,
-        errDetail,
-        params.bot,
-        effectiveStatus,
-      );
-      return {
-        ok: false,
-        duplicate: false,
-        mystarsOrderId,
-        mystarsStatus: effectiveStatus,
-        order: failed || targetOrder,
-        reason: `MYSTARS_${effectiveStatus.toUpperCase()}`,
-      };
-    }
-
-    return {
-      ok: true,
-      duplicate: false,
-      mystarsOrderId,
-      mystarsStatus: effectiveStatus,
-      order: (await OrderService.getOrderById(targetOrder.orderId)) || targetOrder,
-    };
-  }
-
-  /**
-   * Starts the singleton background recovery worker after DB initialization.
+   * Starts the singleton background recovery & MyStars polling worker after DB initialization.
    * Calling multiple times is safe and never creates duplicate workers.
    */
   public static startRecoveryWorker(
     getBot: () => Telegraf | null,
-    intervalMs = 30_000,
+    intervalMs = getEnvConfig().mystarsPollIntervalMs || 15_000,
   ): void {
     if (this.recoveryIntervalHandle) {
       return;
