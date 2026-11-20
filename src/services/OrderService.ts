@@ -8,6 +8,7 @@ import {
   TransactionType,
 } from '../types.ts';
 import { formatUsdCents } from './Money.ts';
+import { myStarsClient } from './MyStarsService.ts';
 import { ProductService } from './ProductService.ts';
 import { UserService } from './UserService.ts';
 
@@ -119,6 +120,17 @@ export class OrderService {
       throw new Error('Укажите @username получателя перед созданием заказа.');
     }
 
+    if (
+      normalizedRecipient &&
+      (product.category === 'stars' || product.category === 'premium')
+    ) {
+      await myStarsClient.validateRecipientBeforeCheckout({
+        category: product.category,
+        recipientUsername: normalizedRecipient,
+        durationMonths: resolvedDurationMonths,
+      });
+    }
+
     const now = new Date().toISOString();
     const orderId = sanitizeDocId(
       `ord_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -173,6 +185,18 @@ export class OrderService {
     const normalizedRecipient = normalizeRecipientUsername(rawRecipientUsername);
     if (!normalizedRecipient) {
       throw new Error('Укажите @username получателя.');
+    }
+
+    const preCheckOrder = await firestoreRepo.getDoc<Order>('orders', orderId);
+    if (
+      preCheckOrder &&
+      (preCheckOrder.category === 'stars' || preCheckOrder.category === 'premium')
+    ) {
+      await myStarsClient.validateRecipientBeforeCheckout({
+        category: preCheckOrder.category,
+        recipientUsername: normalizedRecipient,
+        durationMonths: preCheckOrder.durationMonths,
+      });
     }
 
     return firestoreRepo.runTransaction(async (tx) => {

@@ -256,6 +256,7 @@ export interface HttpTransportResponse {
   status: number;
   ok: boolean;
   json: unknown;
+  headers?: Record<string, string>;
 }
 
 export type ProviderHttpTransport = (
@@ -306,6 +307,7 @@ export function redactSecretsFromText(text: string): string {
     cfg.telegramBotToken,
     cfg.webhookSecret,
     cfg.mystarsApiKey,
+    cfg.mystarsWebhookSecret,
   ].filter((s): s is string => Boolean(s && s.trim().length >= 4));
 
   let redacted = text;

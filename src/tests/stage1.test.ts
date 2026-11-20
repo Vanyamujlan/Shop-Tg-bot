@@ -112,10 +112,26 @@ import {
   UnsupportedKeyGeneratorError,
 } from '../services/DigitalKeyService.ts';
 import {
+  handleMyStarsWebhookRequest,
   handleProviderWebhookRequest,
   handleTopUpCalculateRequest,
   renderPlainTextStatus,
 } from '../../server.ts';
+import {
+  MyStarsApiError,
+  MyStarsClient,
+  MyStarsFulfillmentAdapter,
+  MyStarsRateLimitError,
+  MyStarsRecipientIneligibleError,
+  buildMyStarsApiV1Url,
+  computeMyStarsWebhookSignature,
+  myStarsClient,
+  usdtDecimalToUsdCents,
+  validateMyStarsMonths,
+  validateMyStarsQuantity,
+  validateMyStarsUsername,
+  verifyMyStarsWebhookSignature,
+} from '../services/MyStarsService.ts';
 import type { Order, PaymentRecord, Product, StoreUser } from '../types.ts';
 
 // Force isolated test environment so production Firestore and .data/ are NEVER touched
@@ -6849,6 +6865,943 @@ async function runFullAuditTestSuite(): Promise<void> {
       assert.ok(adminHarness.lastUiCall()!.text.includes('Поддержка по платежам QuizyStars'));
 
       return 'Команда /paysupport и переход menu:support -> menu:paysupport открывают поддержку и корректно сбрасывают пользовательскую и админскую сессии.';
+    },
+  );
+
+  await runTest(
+    'S44-01',
+    'Fulfillment',
+    'MyStars FaaS v1: нормализация URL, валидация параметров, GET /v1/pricing и pre-check получателя (POST /v1/recipients/check) перед созданием заказа, счёта и списанием баланса',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+
+      assert.equal(buildMyStarsApiV1Url('https://api.mystars.tg', '/orders'), 'https://api.mystars.tg/v1/orders');
+      assert.equal(buildMyStarsApiV1Url('https://api.mystars.tg/v1/', 'pricing?type=stars&quantity=50'), 'https://api.mystars.tg/v1/pricing?type=stars&quantity=50');
+      assert.equal(validateMyStarsUsername('  @Alice_Test99  '), 'alice_test99');
+      assert.throws(() => validateMyStarsUsername('ab'), /Некорректный формат Telegram @username/);
+      assert.equal(validateMyStarsQuantity(250), 250);
+      assert.throws(() => validateMyStarsQuantity(49), /от 50 до 100000/);
+      assert.throws(() => validateMyStarsQuantity(100001), /от 50 до 100000/);
+      assert.equal(validateMyStarsMonths(6), 6);
+      assert.throws(() => validateMyStarsMonths(1), /3, 6 или 12/);
+      assert.equal(usdtDecimalToUsdCents('0.685'), 69);
+      assert.equal(usdtDecimalToUsdCents('12.50'), 1250);
+
+      const capturedRequests: HttpTransportRequest[] = [];
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_test_key_4401',
+        apiBaseUrl: 'https://api.mystars.tg',
+      });
+
+      try {
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          capturedRequests.push(req);
+          assert.equal(req.headers['X-Api-Key'], 'ms_live_test_key_4401');
+
+          if (req.url.includes('/v1/pricing')) {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                type: 'stars',
+                quantity: 100,
+                fragment_cost_ton: '0.25',
+                fragment_cost_usdt: '1.35',
+                service_fee_usdt: '0.02',
+                total_ton: '0.255',
+                total_usdt: '1.37',
+                ton_usdt_rate: '5.37',
+                fee_bps: 150,
+              },
+            };
+          }
+
+          if (req.url.endsWith('/v1/recipients/check')) {
+            const payload = JSON.parse(req.body || '{}');
+            const targetUser = payload.recipient?.username || payload.username;
+            if (targetUser === 'nonexistent_user') {
+              return {
+                status: 200,
+                ok: true,
+                json: {
+                  username: 'nonexistent_user',
+                  type: payload.type,
+                  resolved: false,
+                  eligible: false,
+                  reason: 'not_found',
+                },
+              };
+            }
+            if (targetUser === 'already_prem_user' && payload.type === 'premium') {
+              return {
+                status: 200,
+                ok: true,
+                json: {
+                  username: 'already_prem_user',
+                  type: 'premium',
+                  resolved: true,
+                  eligible: false,
+                  reason: 'already_subscribed',
+                  recipient_name: 'Already Prem',
+                },
+              };
+            }
+            if (targetUser === 'indeterminate_user') {
+              return {
+                status: 200,
+                ok: true,
+                json: {
+                  username: 'indeterminate_user',
+                  type: payload.type,
+                  resolved: false,
+                  eligible: false,
+                  indeterminate: true,
+                  reason: 'fragment_timeout',
+                },
+              };
+            }
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                username: targetUser,
+                type: payload.type,
+                resolved: true,
+                eligible: true,
+                recipient_name: 'Valid Buyer',
+              },
+            };
+          }
+
+          throw new Error(`Unexpected URL in S44-01: ${req.url}`);
+        });
+
+        const quote = await myStarsClient.getPricing({ type: 'stars', quantity: 100 });
+        assert.equal(quote.total_usdt, '1.37');
+
+        // 1. Несуществующий получатель блокируется ДО создания заказа в OrderService.createOrder
+        await assert.rejects(
+          () =>
+            OrderService.createOrder({
+              telegramUser: buyer1,
+              recipientUsername: 'nonexistent_user',
+              productId: 'stars_custom',
+              quantity: 100,
+            }),
+          (err: unknown) =>
+            err instanceof MyStarsRecipientIneligibleError &&
+            err.message.includes('@nonexistent_user не найден'),
+        );
+
+        // 2. Получатель с уже активным Premium блокируется ДО списания внутреннего баланса
+        const bs = new BalanceService(new PaymentProviderGateway());
+        await UserService.upsertFromTelegram(buyer2);
+        await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer2.id}`, {
+          balanceUsdCents: 5000,
+          balance: 50,
+        });
+
+        await assert.rejects(
+          () =>
+            bs.purchaseWithInternalBalance({
+              telegramId: buyer2.id,
+              recipientUsername: 'already_prem_user',
+              productId: 'premium_3m',
+            }),
+          (err: unknown) =>
+            err instanceof MyStarsRecipientIneligibleError &&
+            err.message.includes('уже активна подписка Telegram Premium'),
+        );
+        // Баланс не списан!
+        assert.equal(await bs.getBalanceUsdCents(buyer2.id), 5000);
+
+        // 3. При indeterminate: true pre-check fail-open разрешает создание заказа
+        const indeterminateOrder = await OrderService.createOrder({
+          telegramUser: buyer1,
+          recipientUsername: 'indeterminate_user',
+          productId: 'stars_custom',
+          quantity: 75,
+        });
+        assert.equal(indeterminateOrder.recipientUsername, 'indeterminate_user');
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+      }
+
+      return `MyStars FaaS v1 pre-check и pricing протестированы (${capturedRequests.length} HTTP-вызовов, баланс защищён от списания при ineligible получателе).`;
+    },
+  );
+
+  await runTest(
+    'S44-02',
+    'Fulfillment',
+    'Автовыдача Telegram Stars и Telegram Premium через MyStarsFulfillmentAdapter: delivered с расчётом оптовой себестоимости P&L и awaiting_payment без дубликатов',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      FulfillmentService.resetAdapterToDefault();
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      const orderCalls: Array<{ idempotencyKey: string; body: Record<string, unknown> }> = [];
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_test_key_4402',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        callbackUrl: 'https://quizystars.example.com/webhook/mystars',
+      });
+
+      try {
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          if (req.url.endsWith('/v1/recipients/check')) {
+            const body = JSON.parse(req.body || '{}');
+            const targetUser = body.recipient?.username || body.username;
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                username: targetUser,
+                type: body.type,
+                resolved: true,
+                eligible: true,
+              },
+            };
+          }
+
+          if (req.url.endsWith('/v1/orders') && req.method === 'POST') {
+            const body = JSON.parse(req.body || '{}');
+            const targetUser = body.recipient?.username || body.recipient_username;
+            orderCalls.push({
+              idempotencyKey: req.headers['Idempotency-Key'] || '',
+              body,
+            });
+
+            if (body.type === 'stars') {
+              return {
+                status: 200,
+                ok: true,
+                json: {
+                  id: 'ms_ord_stars_delivered_1',
+                  type: 'stars',
+                  recipient_username: targetUser,
+                  quantity: body.quantity,
+                  months: null,
+                  currency: 'usdt_ton',
+                  fragment_cost_ton: '0.26',
+                  fragment_cost_usdt: '1.38',
+                  service_fee_usdt: '0.02',
+                  payment_amount: '1.40',
+                  pay_to_address: 'UQMyStarsPoolAddress111',
+                  payment_memo: 'MS-STARS-1',
+                  status: 'delivered',
+                  purchase_tx: 'tx_hash_stars_delivered_001',
+                  created_at: new Date().toISOString(),
+                },
+              };
+            }
+
+            // Premium returns awaiting_payment first
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'ms_ord_prem_awaiting_1',
+                type: 'premium',
+                recipient_username: targetUser,
+                quantity: null,
+                months: body.months,
+                currency: 'usdt_ton',
+                fragment_cost_ton: '2.10',
+                fragment_cost_usdt: '11.20',
+                service_fee_usdt: '0.15',
+                payment_amount: '11.35',
+                pay_to_address: 'UQMyStarsPoolAddress222',
+                payment_memo: 'MS-PREM-2',
+                status: 'awaiting_payment',
+                expires_at: new Date(Date.now() + 900_000).toISOString(),
+                created_at: new Date().toISOString(),
+              },
+            };
+          }
+
+          if (req.url.endsWith('/v1/orders/ms_ord_prem_awaiting_1') && req.method === 'GET') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'ms_ord_prem_awaiting_1',
+                type: 'premium',
+                recipient_username: 'prem_buyer',
+                months: 3,
+                currency: 'usdt_ton',
+                payment_amount: '11.35',
+                pay_to_address: 'UQMyStarsPoolAddress222',
+                payment_memo: 'MS-PREM-2',
+                status: 'purchasing',
+                created_at: new Date().toISOString(),
+              },
+            };
+          }
+
+          throw new Error(`Unexpected MyStars request in S44-02: ${req.method} ${req.url}`);
+        });
+
+        // 1. Покупка 100 Stars с внутреннего баланса -> MyStars мгновенно возвращает status: "delivered"
+        const bs = new BalanceService(new PaymentProviderGateway());
+        await UserService.upsertFromTelegram(buyer1);
+        await firestoreRepo.updateDoc<StoreUser>('users', `tg_${buyer1.id}`, {
+          balanceUsdCents: 5000,
+          balance: 50,
+        });
+
+        const starsPurchase = await bs.purchaseWithInternalBalance({
+          telegramId: buyer1.id,
+          recipientUsername: 'stars_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+
+        await FulfillmentService.initiateFulfillment(starsPurchase.order, mockBot);
+        const completedStarsOrder = (await OrderService.getOrderById(starsPurchase.order.orderId))!;
+        assert.equal(completedStarsOrder.fulfillmentStatus, 'completed');
+        assert.equal(completedStarsOrder.mystarsOrderId, 'ms_ord_stars_delivered_1');
+        assert.equal(completedStarsOrder.mystarsOrderStatus, 'delivered');
+        assert.equal(completedStarsOrder.mystarsPurchaseTx, 'tx_hash_stars_delivered_001');
+        assert.equal(completedStarsOrder.mystarsWholesaleCostUsdt, '1.40');
+        assert.equal(completedStarsOrder.mystarsCostUsdCents, 140);
+        // Retail 100 * $0.02 = $2.00 (200 cents) - Wholesale $1.40 (140 cents) = +$0.60 (60 cents) net profit
+        assert.equal(completedStarsOrder.totalPriceUsdCents, 200);
+        assert.equal(completedStarsOrder.netProfitUsdCents, 60);
+        assert.equal(orderCalls[0].idempotencyKey, `fulfill_${completedStarsOrder.orderId}`);
+        assert.equal(orderCalls[0].body.callback_url, 'https://quizystars.example.com/webhook/mystars');
+
+        // 2. Покупка Premium 3 мес. -> MyStars возвращает status: "awaiting_payment" -> заказ остаётся в processing
+        const premPurchase = await bs.purchaseWithInternalBalance({
+          telegramId: buyer1.id,
+          recipientUsername: 'prem_buyer',
+          productId: 'premium_3m',
+        });
+
+        await FulfillmentService.initiateFulfillment(premPurchase.order, mockBot);
+        const processingPremOrder = (await OrderService.getOrderById(premPurchase.order.orderId))!;
+        assert.equal(processingPremOrder.fulfillmentStatus, 'processing');
+        assert.equal(processingPremOrder.mystarsOrderId, 'ms_ord_prem_awaiting_1');
+        assert.equal(processingPremOrder.mystarsOrderStatus, 'awaiting_payment');
+        assert.equal(processingPremOrder.mystarsPayToAddress, 'UQMyStarsPoolAddress222');
+        assert.equal(processingPremOrder.mystarsPaymentMemo, 'MS-PREM-2');
+        assert.equal(processingPremOrder.mystarsPaymentAmountUsdt, '11.35');
+        assert.equal(processingPremOrder.mystarsCostUsdCents, 1135);
+
+        // Повторный вызов адаптера с уже существующим mystarsOrderId делает GET /v1/orders/{id}, а НЕ создаёт дубль POST /v1/orders
+        const postCallsBefore = orderCalls.length;
+        const adapter = new MyStarsFulfillmentAdapter(myStarsClient);
+        const recheckRes = await adapter.requestFulfillment(processingPremOrder);
+        assert.equal(orderCalls.length, postCallsBefore);
+        assert.equal(recheckRes.handledAutomatically, false);
+        assert.equal((await OrderService.getOrderById(processingPremOrder.orderId))?.mystarsOrderStatus, 'purchasing');
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+      }
+
+      return 'Автовыдача Stars (delivered + расчёт P&L) и Premium (awaiting_payment -> purchasing без дублирования POST /v1/orders) подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S44-03',
+    'Security',
+    'MyStars FaaS v1 Webhook (POST /webhook/mystars): проверка X-Faas-Signature HMAC-SHA256, ротация секретов "current,previous", защита от подделки и идемпотентное завершение/ошибка заказа',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      FulfillmentService.resetAdapterToDefault();
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      const currentSecret = 'whsec_current_secret_4403';
+      const previousSecret = 'whsec_previous_secret_4403';
+      const rotatedSecrets = `${currentSecret},${previousSecret}`;
+
+      const sampleRawBody = JSON.stringify({
+        order_id: 'ms_ord_webhook_1',
+        status: 'delivered',
+        type: 'premium',
+        recipient_username: 'webhook_buyer',
+        months: 6,
+        payment_amount: '18.50',
+        currency: 'usdt_ton',
+        purchase_tx: 'tx_webhook_delivered_777',
+        timestamp: new Date().toISOString(),
+      });
+
+      // Проверка подписи и новым, и старым ключом при ротации "current,previous"
+      const sigWithCurrent = computeMyStarsWebhookSignature(sampleRawBody, currentSecret);
+      const sigWithPrevious = computeMyStarsWebhookSignature(sampleRawBody, previousSecret);
+      assert.equal(verifyMyStarsWebhookSignature(sampleRawBody, sigWithCurrent, rotatedSecrets), true);
+      assert.equal(verifyMyStarsWebhookSignature(sampleRawBody, sigWithPrevious, rotatedSecrets), true);
+      assert.equal(verifyMyStarsWebhookSignature(sampleRawBody, 'deadbeef'.repeat(8), rotatedSecrets), false);
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_test_key_4403',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+        webhookSecret: rotatedSecrets,
+      });
+
+      let remoteStatus: 'delivered' | 'failed' = 'delivered';
+      try {
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          if (req.url.endsWith('/v1/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              json: { username: 'webhook_buyer', type: 'premium', resolved: true, eligible: true },
+            };
+          }
+          if (req.url.endsWith('/v1/orders/ms_ord_webhook_1') && req.method === 'GET') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'ms_ord_webhook_1',
+                type: 'premium',
+                recipient_username: 'webhook_buyer',
+                months: 6,
+                currency: 'usdt_ton',
+                payment_amount: '18.50',
+                status: remoteStatus,
+                purchase_tx: remoteStatus === 'delivered' ? 'tx_webhook_delivered_777' : null,
+                failure_reason: remoteStatus === 'failed' ? 'fragment_rejected_recipient' : null,
+                created_at: new Date().toISOString(),
+              },
+            };
+          }
+          if (req.url.endsWith('/v1/orders/ms_ord_webhook_fail_2') && req.method === 'GET') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'ms_ord_webhook_fail_2',
+                type: 'stars',
+                recipient_username: 'webhook_buyer',
+                quantity: 500,
+                currency: 'usdt_ton',
+                payment_amount: '6.80',
+                status: 'reversed',
+                failure_reason: 'payment_reversed_by_fragment',
+                created_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected URL in S44-03: ${req.url}`);
+        });
+
+        // Создаём заказ в статусе paid / processing с привязанным mystarsOrderId
+        const order1 = await OrderService.createOrder({
+          telegramUser: buyer1,
+          recipientUsername: 'webhook_buyer',
+          productId: 'premium_6m',
+        });
+        await firestoreRepo.updateDoc<Order>('orders', order1.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ms_ord_webhook_1',
+          mystarsOrderStatus: 'awaiting_payment',
+        });
+
+        // 1. Запрос с неверной подписью отклоняется с HTTP 401
+        let statusCode = 0;
+        let responseJson: Record<string, unknown> = {};
+        const badReq = {
+          headers: { 'x-faas-signature': '00'.repeat(32) },
+          rawBody: Buffer.from(sampleRawBody, 'utf8'),
+          body: JSON.parse(sampleRawBody),
+        } as unknown as Request;
+        const badRes = {
+          status(code: number) {
+            statusCode = code;
+            return this;
+          },
+          json(payload: Record<string, unknown>) {
+            responseJson = payload;
+            return this;
+          },
+        } as unknown as Response;
+
+        await handleMyStarsWebhookRequest(badReq, badRes, mockBot);
+        assert.equal(statusCode, 401);
+        assert.equal(responseJson.ok, false);
+        assert.equal((await OrderService.getOrderById(order1.orderId))?.fulfillmentStatus, 'processing');
+
+        // 2. Валидный вебхук (подписанный previousSecret) верифицирует заказ через GET /v1/orders/{id} и переводит в completed
+        const goodReq = {
+          headers: { 'x-faas-signature': sigWithPrevious },
+          rawBody: Buffer.from(sampleRawBody, 'utf8'),
+          body: JSON.parse(sampleRawBody),
+        } as unknown as Request;
+        const goodRes = {
+          status(code: number) {
+            statusCode = code;
+            return this;
+          },
+          json(payload: Record<string, unknown>) {
+            responseJson = payload;
+            return this;
+          },
+        } as unknown as Response;
+
+        await handleMyStarsWebhookRequest(goodReq, goodRes, mockBot);
+        assert.equal(statusCode, 200);
+        assert.equal(responseJson.action, 'completed');
+
+        const updatedOrder1 = (await OrderService.getOrderById(order1.orderId))!;
+        assert.equal(updatedOrder1.fulfillmentStatus, 'completed');
+        assert.equal(updatedOrder1.mystarsOrderStatus, 'delivered');
+        assert.equal(updatedOrder1.mystarsPurchaseTx, 'tx_webhook_delivered_777');
+        assert.equal(updatedOrder1.mystarsCostUsdCents, 1850);
+        assert.equal(updatedOrder1.netProfitUsdCents, (updatedOrder1.totalPriceUsdCents ?? updatedOrder1.totalPrice) - 1850);
+        assert.ok(sentMessages.some((m) => Number(m.chatId) === buyer1.id && m.text.includes('успешно выполнен')));
+
+        // Повторная доставка того же вебхука идемпотентна (duplicate: true)
+        const msgCountBeforeDuplicate = sentMessages.length;
+        await handleMyStarsWebhookRequest(goodReq, goodRes, mockBot);
+        assert.equal(statusCode, 200);
+        assert.equal(responseJson.duplicate, true);
+        assert.equal(sentMessages.length, msgCountBeforeDuplicate);
+
+        // 3. Вебхук с терминальной ошибкой (reversed / failed) переводит заказ в failed + needsManualReconciliation и уведомляет админа
+        const order2 = await OrderService.createOrder({
+          telegramUser: buyer2,
+          recipientUsername: 'webhook_buyer',
+          productId: 'stars_custom',
+          quantity: 500,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', order2.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ms_ord_webhook_fail_2',
+          mystarsOrderStatus: 'fulfilling',
+        });
+
+        const failBody = JSON.stringify({
+          order_id: 'ms_ord_webhook_fail_2',
+          status: 'reversed',
+          type: 'stars',
+          recipient_username: 'webhook_buyer',
+          quantity: 500,
+          failure_reason: 'payment_reversed_by_fragment',
+        });
+        const failSig = computeMyStarsWebhookSignature(failBody, currentSecret);
+        const failReq = {
+          headers: { 'x-faas-signature': failSig },
+          rawBody: Buffer.from(failBody, 'utf8'),
+          body: JSON.parse(failBody),
+        } as unknown as Request;
+
+        await handleMyStarsWebhookRequest(failReq, goodRes, mockBot);
+        assert.equal(statusCode, 200);
+        assert.equal(responseJson.action, 'failed');
+
+        const failedOrder2 = (await OrderService.getOrderById(order2.orderId))!;
+        assert.equal(failedOrder2.fulfillmentStatus, 'failed');
+        assert.equal(failedOrder2.needsManualReconciliation, true);
+        assert.equal(failedOrder2.mystarsOrderStatus, 'reversed');
+        assert.ok(sentMessages.some((m) => String(m.chatId) === '777000111' && m.text.includes('СБОЙ АВТОВЫДАЧИ MYSTARS')));
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+      }
+
+      return 'Webhook POST /webhook/mystars: HMAC-SHA256, ротация секретов, идемпотентность и обработка delivered/reversed подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S44-04',
+    'Fulfillment',
+    'Обработка лимитов MyStars 429 (general с Retry-After vs order_cap) и фоновая сверка recoverPendingFulfillments (MyStars + CryptoBot + xRocket)',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      FulfillmentService.resetAdapterToDefault();
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      let postAttempt = 0;
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_test_key_4404',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+      });
+
+      try {
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          if (req.url.endsWith('/v1/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              json: { username: 'cap_buyer', type: 'stars', resolved: true, eligible: true },
+            };
+          }
+          if (req.url.endsWith('/v1/orders') && req.method === 'POST') {
+            postAttempt += 1;
+            if (postAttempt === 1) {
+              // 429 general rate limit -> retryable inside MyStarsFulfillmentAdapter / FulfillmentService
+              return {
+                status: 429,
+                ok: false,
+                headers: { 'retry-after': '0.01' },
+                json: {
+                  error: 'rate limit exceeded',
+                  limit_type: 'general',
+                  retry_after: 0.01,
+                },
+              };
+            }
+            // 429 order_cap (10 active unpaid orders) -> non-retryable permanent error for this attempt
+            return {
+              status: 429,
+              ok: false,
+              json: {
+                error: 'too many unpaid orders (max 10)',
+                limit_type: 'order_cap',
+                retry_after: 60,
+              },
+            };
+          }
+          if (req.url.endsWith('/v1/orders/ms_ord_inflight_recover_1') && req.method === 'GET') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'ms_ord_inflight_recover_1',
+                type: 'stars',
+                recipient_username: 'cap_buyer',
+                quantity: 100,
+                currency: 'usdt_ton',
+                payment_amount: '1.38',
+                status: 'delivered',
+                purchase_tx: 'tx_recovered_after_restart_999',
+                created_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected URL in S44-04: ${req.url}`);
+        });
+
+        // 1. Проверка retry при 429 general -> затем немедленный фейл без 3 бесполезных повторов при 429 order_cap
+        const capOrder = await OrderService.createOrder({
+          telegramUser: buyer1,
+          recipientUsername: 'cap_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', capOrder.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'paid',
+        });
+        const paidCapOrder = (await OrderService.getOrderById(capOrder.orderId))!;
+
+        await FulfillmentService.initiateFulfillment(paidCapOrder, mockBot);
+        // 1-й запрос вернул 429 general (retryable: true), 2-й вызов initiateFulfillment (или фоновый retry) вернёт 429 order_cap (retryable: false)
+        const afterFirstTry = (await OrderService.getOrderById(capOrder.orderId))!;
+        if (afterFirstTry.fulfillmentStatus !== 'failed') {
+          await firestoreRepo.updateDoc<Order>('orders', capOrder.orderId, {
+            fulfillmentNextRetryAt: new Date(Date.now() - 1000).toISOString(),
+          });
+          await FulfillmentService.initiateFulfillment(
+            (await OrderService.getOrderById(capOrder.orderId))!,
+            mockBot,
+          );
+        }
+        assert.equal(postAttempt, 2);
+        const failedCapOrder = (await OrderService.getOrderById(capOrder.orderId))!;
+        assert.equal(failedCapOrder.fulfillmentStatus, 'failed');
+        assert.equal(failedCapOrder.needsManualReconciliation, true);
+        assert.ok(failedCapOrder.fulfillmentLastError?.includes('order_cap'));
+
+        // 2. Проверка фонового опроса in-flight заказа MyStars в recoverPendingFulfillments
+        const inflightOrder = await OrderService.createOrder({
+          telegramUser: buyer2,
+          recipientUsername: 'cap_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', inflightOrder.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'processing',
+          mystarsOrderId: 'ms_ord_inflight_recover_1',
+          mystarsOrderStatus: 'fulfilling',
+        });
+
+        const recoveredCount = await FulfillmentService.recoverPendingFulfillments(mockBot);
+        assert.ok(recoveredCount >= 1);
+        const recoveredOrder = (await OrderService.getOrderById(inflightOrder.orderId))!;
+        assert.equal(recoveredOrder.fulfillmentStatus, 'completed');
+        assert.equal(recoveredOrder.mystarsOrderStatus, 'delivered');
+        assert.equal(recoveredOrder.mystarsPurchaseTx, 'tx_recovered_after_restart_999');
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+      }
+
+      return 'Лимиты MyStars 429 (general vs order_cap) и фоновое завершение in-flight заказов в recoverPendingFulfillments подтверждены.';
+    },
+  );
+
+  await runTest(
+    'S44-05',
+    'Payments',
+    'Production Go-Live CryptoBot и xRocket: фоновая сверка pending-платежей/пополнений, автовыдача MyStars и админ-компенсация на внутренний баланс с защитой от двойного возврата',
+    async () => {
+      firestoreRepo.enableIsolatedTestMode(true);
+      FulfillmentService.resetAdapterToDefault();
+
+      const sentMessages: Array<{ chatId: number | string; text: string }> = [];
+      const mockBot = createMockBot(sentMessages);
+
+      let cbPayload = '';
+      let cbAmount = '1.00';
+      let xrClientInvoiceId = '';
+      let xrAmount = '10.00';
+
+      const gateway = new PaymentProviderGateway(
+        async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          if (req.url.endsWith('/getExchangeRates')) {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                ok: true,
+                result: [
+                  { source: 'USDT', target: 'USD', rate: '1.00', is_valid: true },
+                  { source: 'TON', target: 'USD', rate: '5.50', is_valid: true },
+                ],
+              },
+            };
+          }
+          if (req.url.endsWith('/api/v1/rates')) {
+            return {
+              status: 200,
+              ok: true,
+              json: { data: { USDT: '1.00', TON: '5.50' } },
+            };
+          }
+          if (req.url.endsWith('/api/v1/currencies')) {
+            return {
+              status: 200,
+              ok: true,
+              json: [
+                { currency: 'USDT', networks: ['TON', 'TRC-20'] },
+                { currency: 'TON', networks: ['TON'] },
+              ],
+            };
+          }
+          if (req.url.endsWith('/createInvoice')) {
+            const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+            cbPayload = String(body.payload || '');
+            cbAmount = String(body.amount || '1.00');
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                ok: true,
+                result: {
+                  invoice_id: '99004405',
+                  status: 'active',
+                  amount: cbAmount,
+                  asset: 'USDT',
+                  currency_type: 'crypto',
+                  bot_invoice_url: 'https://t.me/CryptoBot?start=IV99004405',
+                  payload: cbPayload,
+                },
+              },
+            };
+          }
+          if (req.url.includes('/getInvoices')) {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                ok: true,
+                result: {
+                  items: [
+                    {
+                      invoice_id: '99004405',
+                      status: 'paid',
+                      amount: cbAmount,
+                      paid_asset: 'USDT',
+                      currency_type: 'crypto',
+                      payload: cbPayload,
+                      fee_in_usd: '0.03',
+                      paid_at: new Date().toISOString(),
+                    },
+                  ],
+                },
+              },
+            };
+          }
+          if (req.url.endsWith('/api/v1/invoices') && req.method === 'POST') {
+            const body = JSON.parse(req.body || '{}') as Record<string, unknown>;
+            xrClientInvoiceId = String(body.clientInvoiceId || '');
+            xrAmount = String(body.priceAmount || '10.00');
+            return {
+              status: 201,
+              ok: true,
+              json: {
+                id: '88004405',
+                priceAmount: xrAmount,
+                priceCurrency: 'USDT',
+                clientInvoiceId: xrClientInvoiceId,
+                status: 'PENDING',
+                links: {
+                  telegramBotLink: 'https://t.me/xrocket?start=inv_88004405',
+                },
+              },
+            };
+          }
+          if (req.url.includes('/api/v1/invoices?ids=')) {
+            return {
+              status: 200,
+              ok: true,
+              json: [
+                {
+                  id: '88004405',
+                  priceAmount: xrAmount,
+                  priceCurrency: 'USDT',
+                  clientInvoiceId: xrClientInvoiceId,
+                  status: 'PAID',
+                  paidAt: new Date().toISOString(),
+                },
+              ],
+            };
+          }
+          throw new Error(`Unexpected payment gateway URL in S44-05: ${req.url}`);
+        },
+        TEST_MOCK_CREDS,
+      );
+
+      myStarsClient.setCredentialsOverride({
+        apiKey: 'ms_live_test_key_4405',
+        apiBaseUrl: 'https://api.mystars.tg/v1',
+      });
+
+      try {
+        myStarsClient.setHttpTransport(async (req: HttpTransportRequest): Promise<HttpTransportResponse> => {
+          if (req.url.endsWith('/v1/recipients/check')) {
+            return {
+              status: 200,
+              ok: true,
+              json: { username: 'live_crypto_buyer', type: 'stars', resolved: true, eligible: true },
+            };
+          }
+          if (req.url.endsWith('/v1/orders') && req.method === 'POST') {
+            return {
+              status: 200,
+              ok: true,
+              json: {
+                id: 'ms_ord_cryptobot_4405',
+                type: 'stars',
+                recipient_username: 'live_crypto_buyer',
+                quantity: 50,
+                currency: 'usdt_ton',
+                payment_amount: '0.68',
+                status: 'delivered',
+                purchase_tx: 'tx_cb_mystars_4405',
+                created_at: new Date().toISOString(),
+              },
+            };
+          }
+          throw new Error(`Unexpected MyStars URL in S44-05: ${req.url}`);
+        });
+
+        const ps = new PaymentService('test-s44-05', gateway);
+        const bs = new BalanceService(gateway);
+
+        // 1. Прямой заказ через CryptoBot ($1.00 за 50 Stars) -> фоновая сверка reconcilePendingOrderPayments обнаруживает оплату и запускает MyStars
+        const cbOrder = await OrderService.createOrder({
+          telegramUser: buyer1,
+          recipientUsername: 'live_crypto_buyer',
+          productId: 'stars_custom',
+          quantity: 50,
+        });
+        await ps.createOrReuseOrderPayment({
+          orderId: cbOrder.orderId,
+          callerTelegramId: buyer1.id,
+          provider: 'cryptobot',
+          currency: 'USDT',
+        });
+
+        const reconciledOrders = await ps.reconcilePendingOrderPayments();
+        assert.equal(reconciledOrders.length, 1);
+        assert.equal(reconciledOrders[0].ok, true);
+
+        const paidCbOrder = (await OrderService.getOrderById(cbOrder.orderId))!;
+        await FulfillmentService.initiateFulfillment(paidCbOrder, mockBot);
+        const completedCbOrder = (await OrderService.getOrderById(cbOrder.orderId))!;
+        assert.equal(completedCbOrder.paymentStatus, 'completed');
+        assert.equal(completedCbOrder.fulfillmentStatus, 'completed');
+        assert.equal(completedCbOrder.mystarsOrderId, 'ms_ord_cryptobot_4405');
+        assert.equal(completedCbOrder.mystarsPurchaseTx, 'tx_cb_mystars_4405');
+
+        // 2. Пополнение баланса через xRocket ($10.00, комиссия 2% = $0.20, к зачислению $9.80 = 980 центов) -> фоновая сверка reconcilePendingTopUps
+        const topUpRecord = await bs.createTopUp({
+          telegramId: buyer2.id,
+          provider: 'xrocket',
+          amountUsdCents: 1000,
+          currency: 'USDT',
+          network: 'TON',
+        });
+        assert.equal(topUpRecord.feePercent, 2);
+        assert.equal(topUpRecord.amountCreditedUsdCents, 980);
+
+        const reconciledTopUps = await bs.reconcilePendingTopUps();
+        assert.equal(reconciledTopUps.length, 1);
+        assert.equal(reconciledTopUps[0].ok, true);
+        assert.equal(await bs.getBalanceUsdCents(buyer2.id), 980);
+
+        // 3. Если крипто-заказ упал при выдаче, админ может компенсировать его на внутренний баланс с флагом allowExternalGatewayCompensation: true
+        const failedCryptoOrder = await OrderService.createOrder({
+          telegramUser: buyer1,
+          recipientUsername: 'live_crypto_buyer',
+          productId: 'stars_custom',
+          quantity: 100,
+        });
+        await firestoreRepo.updateDoc<Order>('orders', failedCryptoOrder.orderId, {
+          paymentStatus: 'paid',
+          fulfillmentStatus: 'failed',
+          paymentMethod: 'xrocket',
+          fulfillmentLastError: 'MyStars temporary failure',
+          needsManualReconciliation: true,
+        });
+
+        const refundRes = await bs.refundOrderToInternalBalance({
+          orderId: failedCryptoOrder.orderId,
+          adminTelegramId: 777000111,
+          reason: 'Компенсация крипто-заказа на баланс',
+          allowExternalGatewayCompensation: true,
+        });
+        assert.equal(refundRes.alreadyRefunded, false);
+        assert.equal(refundRes.newBalanceUsdCents, 200);
+        assert.equal((await OrderService.getOrderById(failedCryptoOrder.orderId))?.balanceRefunded, true);
+
+        // Повторный возврат того же заказа идемпотентен (alreadyRefunded: true, баланс не удваивается)
+        const dupRefundRes = await bs.refundOrderToInternalBalance({
+          orderId: failedCryptoOrder.orderId,
+          adminTelegramId: 777000111,
+          reason: 'Повторная попытка возврата',
+          allowExternalGatewayCompensation: true,
+        });
+        assert.equal(dupRefundRes.alreadyRefunded, true);
+        assert.equal(await bs.getBalanceUsdCents(buyer1.id), 200);
+      } finally {
+        myStarsClient.setCredentialsOverride(null);
+        myStarsClient.resetHttpTransport();
+        FulfillmentService.resetAdapterToDefault();
+      }
+
+      return 'Фоновая сверка CryptoBot/xRocket, автовыдача MyStars и админ-компенсация на внутренний баланс с защитой от двойного возврата подтверждены.';
     },
   );
 

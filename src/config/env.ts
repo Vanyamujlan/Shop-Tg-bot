@@ -52,6 +52,9 @@ export function cleanEnvValue(key: string, raw: string | undefined): string {
   ) {
     val = val.slice(1, -1).trim();
   }
+  if (val.toLowerCase() === 'undefined' || val.toLowerCase() === 'null') {
+    return '';
+  }
   return val;
 }
 
@@ -79,6 +82,8 @@ export interface AppConfig {
   mystarsPaymentCurrency: 'usdt_ton';
   mystarsApiBaseUrl: string;
   mystarsApiKey: string;
+  mystarsWebhookSecret: string;
+  mystarsCallbackUrl: string;
   tonWalletAddress: string;
 }
 
@@ -220,6 +225,14 @@ export function getEnvConfig(): AppConfig {
       cleanEnvValue('MYSTARS_API_BASE_URL', process.env.MYSTARS_API_BASE_URL) ||
       'https://api.mystars.tg',
     mystarsApiKey: cleanEnvValue('MYSTARS_API_KEY', process.env.MYSTARS_API_KEY),
+    mystarsWebhookSecret: cleanEnvValue(
+      'MYSTARS_WEBHOOK_SECRET',
+      process.env.MYSTARS_WEBHOOK_SECRET,
+    ),
+    mystarsCallbackUrl: cleanEnvValue(
+      'MYSTARS_CALLBACK_URL',
+      process.env.MYSTARS_CALLBACK_URL,
+    ),
     tonWalletAddress: cleanEnvValue(
       'TON_WALLET_ADDRESS',
       process.env.TON_WALLET_ADDRESS,

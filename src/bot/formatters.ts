@@ -847,6 +847,29 @@ export function formatAdminOrderCard(order: Order): string {
     `${oe('amount')} Сумма: <code>${formatOrderAmountLabel(order)}</code>`,
     `📌 Оплата: ${ORDER_STATUS_LABELS[order.paymentStatus]}`,
     `🚚 Выдача: ${ORDER_STATUS_LABELS[order.fulfillmentStatus]}`,
+    order.mystarsOrderId
+      ? `⭐ MyStars ID: <code>${escapeHtml(order.mystarsOrderId)}</code>${
+          order.mystarsOrderStatus
+            ? ` (статус: <b>${escapeHtml(order.mystarsOrderStatus)}</b>)`
+            : ''
+        }`
+      : '',
+    order.mystarsWholesaleCostUsdt
+      ? `💵 Себестоимость MyStars: <code>${escapeHtml(order.mystarsWholesaleCostUsdt)} USDT</code>${
+          order.mystarsCostUsdCents !== undefined
+            ? ` (~<code>${formatUsdCents(order.mystarsCostUsdCents)}</code>)`
+            : ''
+        }`
+      : '',
+    order.mystarsPayToAddress
+      ? `🏦 Адрес оплаты MyStars: <code>${escapeHtml(order.mystarsPayToAddress)}</code> (MEMO: <code>${escapeHtml(order.mystarsPaymentMemo || order.mystarsOrderId || '')}</code>)`
+      : '',
+    order.mystarsPurchaseTx
+      ? `🔗 MyStars Purchase TX: <code>${escapeHtml(order.mystarsPurchaseTx)}</code>`
+      : '',
+    order.mystarsFailureReason
+      ? `${oe('warning')} Ошибка MyStars: ${escapeHtml(order.mystarsFailureReason)}`
+      : '',
     order.mystarsCurrency
       ? `📊 Учёт MyStars: <code>${escapeHtml(order.mystarsCurrency)}</code> | Выручка: <code>${formatUsdCents(order.grossRevenueUsdCents ?? order.totalPriceUsdCents ?? order.totalPrice)}</code>${
           order.netProfitUsdCents !== undefined

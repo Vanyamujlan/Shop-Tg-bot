@@ -22,6 +22,7 @@ import {
   OrderService,
   normalizeRecipientUsername,
 } from './OrderService.ts';
+import { myStarsClient } from './MyStarsService.ts';
 import { ProductService } from './ProductService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
@@ -207,6 +208,20 @@ export class PaymentService {
       !normalizedRecipient
     ) {
       throw new Error('Укажите @username получателя перед оплатой заказа.');
+    }
+
+    if (
+      normalizedRecipient &&
+      (product.category === 'stars' || product.category === 'premium')
+    ) {
+      await myStarsClient.validateRecipientBeforeCheckout({
+        category: product.category,
+        recipientUsername: normalizedRecipient,
+        durationMonths:
+          product.category === 'premium'
+            ? ProductService.resolvePremiumDurationMonths(product)
+            : undefined,
+      });
     }
 
     const { currency: normalizedCurr, network: normalizedNet } =
@@ -1541,5 +1556,49 @@ export class PaymentService {
       offset: isLegacyOffset ? startAfterCursor : undefined,
       limit,
     });
+  }
+
+  /**
+   * Background reconciliation pass for pending CryptoBot / xRocket order invoices.
+   * Ensures orders are marked paid (and ready for fulfillment) even if a provider webhook was missed.
+   */
+  public async reconcilePendingOrderPayments(
+    limit = 20,
+  ): Promise<ProcessOrderPaymentVerificationResult[]> {
+    if (!firestoreRepo.isProductionStorageHealthy()) {
+      return [];
+    }
+
+    const pendingPayments = await firestoreRepo.queryDocs<PaymentRecord>('payments', {
+      where: [{ field: 'status', op: '==', value: 'pending' }],
+      limit: Math.max(limit * 2, 30),
+    });
+
+    const settled: ProcessOrderPaymentVerificationResult[] = [];
+    for (const p of pendingPayments.slice(0, limit)) {
+      if (p.kind && p.kind !== 'order') continue;
+      if (p.provider !== 'cryptobot' && p.provider !== 'xrocket') continue;
+      if (!p.providerPaymentId) continue;
+      if (!this.gateway.isProviderConfigured(p.provider)) continue;
+
+      try {
+        const res = await this.verifyAndProcessOrderPayment(p.paymentId);
+        if (res.ok || res.status !== 'pending') {
+          settled.push(res);
+        }
+      } catch (error) {
+        console.warn(
+          `[PaymentService] Ошибка фоновой сверки платежа заказа ${p.paymentId}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+    return settled;
+  }
+
+  public static async reconcilePendingOrderPayments(
+    limit = 20,
+  ): Promise<ProcessOrderPaymentVerificationResult[]> {
+    return this.defaultInstance.reconcilePendingOrderPayments(limit);
   }
 }

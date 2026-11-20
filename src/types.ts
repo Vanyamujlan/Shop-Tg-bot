@@ -235,15 +235,23 @@ export interface Order {
   fulfillmentStatus: OrderStatus;
   telegramPaymentChargeId?: string;
   providerPaymentChargeId?: string;
-  /** MyStars Stage 4.3 P&L & wholesale accounting fields */
+  /** MyStars Stage 4.3/4.4 P&L, wholesale accounting & FaaS v1 order fields */
   grossRevenueUsdCents?: number;
   providerFeeUsdCents?: number;
-  mystarsCurrency?: 'usdt_ton';
+  mystarsCurrency?: 'usdt_ton' | 'ton';
   mystarsWholesaleCostUsdt?: string;
   mystarsCostUsdCents?: number;
   tonNetworkFeeTon?: string;
   tonNetworkFeeUsdCents?: number;
   netProfitUsdCents?: number;
+  mystarsOrderId?: string;
+  mystarsOrderStatus?: string;
+  mystarsPayToAddress?: string;
+  mystarsPaymentMemo?: string;
+  mystarsPaymentAmountUsdt?: string;
+  mystarsPurchaseTx?: string;
+  mystarsFailureReason?: string;
+  mystarsExpiresAt?: string;
   fulfillmentNote?: string;
   fulfillmentStartedAt?: string;
   fulfillmentAttempts?: number;

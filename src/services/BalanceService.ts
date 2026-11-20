@@ -25,6 +25,7 @@ import {
   usdInputToCents,
 } from './Money.ts';
 import { normalizeRecipientUsername } from './OrderService.ts';
+import { myStarsClient } from './MyStarsService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
   PaymentProviderGateway,
@@ -1043,6 +1044,53 @@ export class BalanceService {
       params.orderId ||
       `ord_bal_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
 
+    const [preExistingOrder, preProduct] = await Promise.all([
+      params.orderId
+        ? firestoreRepo.getDoc<Order>('orders', resolvedOrderId)
+        : Promise.resolve(null),
+      firestoreRepo.getDoc<Product>('products', params.productId),
+    ]);
+
+    const isAlreadySettled =
+      preExistingOrder &&
+      (preExistingOrder.paymentStatus === 'paid' ||
+        preExistingOrder.paymentStatus === 'processing' ||
+        preExistingOrder.paymentStatus === 'completed');
+
+    if (
+      !isAlreadySettled &&
+      myStarsClient.isConfigured() &&
+      preProduct &&
+      preProduct.isActive
+    ) {
+      if (preExistingOrder) {
+        ProductService.validateOrderQuantity(preProduct, preExistingOrder.quantity);
+      } else {
+        ProductService.calculateOrderPriceUsdCents(
+          preProduct,
+          params.quantity === undefined ? 1 : params.quantity,
+        );
+      }
+      const preEffectiveRecipient =
+        normalizedRecipient ||
+        (preExistingOrder?.recipientUsername !== undefined
+          ? normalizeRecipientUsername(preExistingOrder.recipientUsername)
+          : undefined);
+      if (
+        preEffectiveRecipient &&
+        (preProduct.category === 'stars' || preProduct.category === 'premium')
+      ) {
+        await myStarsClient.validateRecipientBeforeCheckout({
+          category: preProduct.category,
+          recipientUsername: preEffectiveRecipient,
+          durationMonths:
+            preProduct.category === 'premium'
+              ? ProductService.resolvePremiumDurationMonths(preProduct)
+              : undefined,
+        });
+      }
+    }
+
     return firestoreRepo.runTransaction(async (tx) => {
       const [existingOrder, product, userSnap] = await Promise.all([
         tx.get<Order>('orders', resolvedOrderId),
@@ -1310,6 +1358,7 @@ export class BalanceService {
     orderId: string;
     reason: string;
     adminTelegramId?: number;
+    allowExternalGatewayCompensation?: boolean;
   }): Promise<{
     refunded: boolean;
     alreadyRefunded: boolean;
@@ -1327,6 +1376,7 @@ export class BalanceService {
       }
 
       if (
+        !params.allowExternalGatewayCompensation &&
         order.paymentMethod !== 'balance' &&
         order.paymentMethod !== 'internal_balance'
       ) {
@@ -1335,10 +1385,11 @@ export class BalanceService {
         );
       }
 
+      const paymentDocId = order.balancePaymentId || order.activePaymentId;
       const [userSnap, existingPayment] = await Promise.all([
         tx.get<StoreUser>('users', order.userId),
-        order.balancePaymentId
-          ? tx.get<PaymentRecord>('payments', order.balancePaymentId)
+        paymentDocId
+          ? tx.get<PaymentRecord>('payments', paymentDocId)
           : Promise.resolve(null),
       ]);
 
@@ -1407,6 +1458,7 @@ export class BalanceService {
         refundState: 'refunded',
         refundStatsAdjusted: true,
         refundLastError: undefined,
+        needsManualReconciliation: false,
         fulfillmentNote: params.reason,
         updatedAt: now,
       };
@@ -1448,6 +1500,64 @@ export class BalanceService {
         message: `Заказ ${order.orderId} успешно возвращён на внутренний баланс (+${formatUsdCents(refundCents)}, новый баланс: ${formatUsdCents(newBalanceCents)}).`,
       };
     });
+  }
+
+  /**
+   * Background reconciliation pass for pending CryptoBot / xRocket balance top-ups.
+   * Ensures user balance is credited even if a provider webhook was delayed or dropped.
+   */
+  public async reconcilePendingTopUps(limit = 20): Promise<
+    Array<{
+      ok: boolean;
+      duplicate: boolean;
+      status: BalanceTopUpStatus;
+      topUp?: BalanceTopUpRecord;
+      newBalance?: number;
+      newBalanceUsdCents?: number;
+      reason?: string;
+    }>
+  > {
+    if (!firestoreRepo.isProductionStorageHealthy()) {
+      return [];
+    }
+
+    const pendingTopUps = await firestoreRepo.queryDocs<BalanceTopUpRecord>(
+      'balance_topups',
+      {
+        where: [{ field: 'paymentStatus', op: '==', value: 'pending' }],
+        limit: Math.max(limit * 2, 30),
+      },
+    );
+
+    const settled: Array<{
+      ok: boolean;
+      duplicate: boolean;
+      status: BalanceTopUpStatus;
+      topUp?: BalanceTopUpRecord;
+      newBalance?: number;
+      newBalanceUsdCents?: number;
+      reason?: string;
+    }> = [];
+
+    for (const topUp of pendingTopUps.slice(0, limit)) {
+      if (topUp.provider !== 'cryptobot' && topUp.provider !== 'xrocket') continue;
+      if (!topUp.externalInvoiceId) continue;
+      if (!this.gateway.isProviderConfigured(topUp.provider)) continue;
+
+      try {
+        const res = await this.verifyAndProcessTopUp(topUp.paymentId);
+        if (res.ok || res.status !== 'pending') {
+          settled.push(res);
+        }
+      } catch (error) {
+        console.warn(
+          `[BalanceService] Ошибка фоновой сверки пополнения баланса ${topUp.paymentId}:`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+
+    return settled;
   }
 }
 

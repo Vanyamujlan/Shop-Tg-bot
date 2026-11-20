@@ -11,6 +11,7 @@ import { UserService } from '../../services/UserService.ts';
 import { ProductService } from '../../services/ProductService.ts';
 import { OrderService } from '../../services/OrderService.ts';
 import { FulfillmentService } from '../../services/FulfillmentService.ts';
+import { myStarsClient } from '../../services/MyStarsService.ts';
 import { balanceService } from '../../services/BalanceService.ts';
 import {
   PAYMENT_PROVIDER_CATALOG,
@@ -1301,6 +1302,8 @@ export function registerAdminHandlers(
           )
         : ['• Ошибок платежей или выдачи не зафиксировано ✅'];
 
+    const mystarsDiag = myStarsClient.getStatusSummary();
+
     const text = [
       '🔌 <b>Статус интеграций и системный монитор</b>',
       '',
@@ -1327,9 +1330,18 @@ export function registerAdminHandlers(
       )}</code> (recovery worker: ${
         FulfillmentService.isRecoveryWorkerActive() ? 'активен' : 'остановлен'
       })`,
+      `⭐ <b>Поставщик MyStars FaaS v1:</b> ${
+        mystarsDiag.configured
+          ? `✅ Настроен (ключ: <code>${escapeHtml(mystarsDiag.maskedApiKey)}</code>, webhook: ${
+              mystarsDiag.webhookConfigured
+                ? `✅ <code>${escapeHtml(mystarsDiag.maskedWebhookSecret)}</code>`
+                : '⚠️ не задан'
+            }, валюта: <code>${escapeHtml(mystarsDiag.paymentCurrency)}</code>)`
+          : '⚠️ Не настроен (MYSTARS_API_KEY не задан — активен режим ручной выдачи)'
+      }`,
       `👑 <b>Администраторов в ADMIN_IDS:</b> ${envConfig.adminIds.length}`,
       '',
-      '💳 <b>Платёжные провайдеры пополнения баланса:</b>',
+      '💳 <b>Платёжные провайдеры (заказы и пополнение баланса):</b>',
       ...(['cryptobot', 'xrocket'] as const).map((p) => {
         const meta = PAYMENT_PROVIDER_CATALOG[p];
         const st = paymentProviderGateway.getProviderStatusSummary()[p];

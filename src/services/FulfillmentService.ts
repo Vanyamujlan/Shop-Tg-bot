@@ -4,7 +4,16 @@ import { firestoreRepo, sanitizeDocId } from '../db/firestore.ts';
 import { Order, StoreTransaction } from '../types.ts';
 import { OrderService } from './OrderService.ts';
 import { PaymentService } from './PaymentService.ts';
+import { balanceService } from './BalanceService.ts';
 import { DigitalKeyService } from './DigitalKeyService.ts';
+import {
+  MYSTARS_FAILURE_STATUSES,
+  MYSTARS_SUCCESS_STATUSES,
+  MyStarsFulfillmentAdapter,
+  MyStarsWebhookEvent,
+  myStarsClient,
+  verifyMyStarsWebhookSignature,
+} from './MyStarsService.ts';
 import { buildAdminOrderActionKeyboard } from '../bot/keyboards.ts';
 import { formatAdminOrderCard, formatOrderCompletedUserNotice } from '../bot/formatters.ts';
 
@@ -70,19 +79,40 @@ export class FulfillmentService {
   public static baseRetryDelayMs = 2000;
   public static staleProcessingLeaseMs = 60_000;
 
-  private static adapter: FulfillmentProviderAdapter =
-    new ManualAdminFulfillmentAdapter();
+  private static manualAdapter = new ManualAdminFulfillmentAdapter();
+  private static myStarsAdapter = new MyStarsFulfillmentAdapter(myStarsClient);
+  private static customAdapterOverride: FulfillmentProviderAdapter | null = null;
   private static recoveryIntervalHandle: ReturnType<typeof setInterval> | null = null;
   private static isRecoveryPassRunning = false;
 
   public static setAdapter(adapter: FulfillmentProviderAdapter): void {
-    this.adapter = adapter;
+    if (adapter instanceof ManualAdminFulfillmentAdapter) {
+      this.customAdapterOverride = null;
+      this.manualAdapter = adapter;
+      return;
+    }
+    this.customAdapterOverride = adapter;
+  }
+
+  public static resetAdapterToDefault(): void {
+    this.customAdapterOverride = null;
+  }
+
+  public static getActiveAdapter(): FulfillmentProviderAdapter {
+    if (this.customAdapterOverride) {
+      return this.customAdapterOverride;
+    }
+    if (myStarsClient.isConfigured()) {
+      return this.myStarsAdapter;
+    }
+    return this.manualAdapter;
   }
 
   public static getAdapterInfo(): { name: string; configured: boolean } {
+    const active = this.getActiveAdapter();
     return {
-      name: this.adapter.providerName,
-      configured: this.adapter.isConfigured(),
+      name: active.providerName,
+      configured: active.isConfigured(),
     };
   }
 
@@ -243,10 +273,13 @@ export class FulfillmentService {
   ): Promise<Order> {
     const idempotencyKey =
       orderInput.fulfillmentIdempotencyKey || `fulfill_${orderInput.orderId}`;
+    const activeAdapter = this.getActiveAdapter();
 
-    // Stage 3.3: If default ManualAdminFulfillmentAdapter is active, check if digital keys
-    // are available for this product and atomically fulfill from DigitalKeyService.
-    if (this.adapter instanceof ManualAdminFulfillmentAdapter) {
+    // Stage 3.3: Check if digital keys are available for this product (for ManualAdminFulfillmentAdapter or gifts category)
+    if (
+      activeAdapter instanceof ManualAdminFulfillmentAdapter ||
+      orderInput.category === 'gifts'
+    ) {
       const candidateKeyIds = await DigitalKeyService.getAvailableCandidateKeyIds(
         orderInput.productId,
         orderInput.quantity,
@@ -374,7 +407,7 @@ export class FulfillmentService {
     // =========================================================================
     const { order: claimedOrder, attempt } = claim;
     try {
-      const adapterResult = await this.adapter.requestFulfillment(claimedOrder, {
+      const adapterResult = await activeAdapter.requestFulfillment(claimedOrder, {
         idempotencyKey: claimedOrder.fulfillmentIdempotencyKey || idempotencyKey,
         attempt,
       });
@@ -399,7 +432,7 @@ export class FulfillmentService {
           fulfillmentNote: adapterResult.details.slice(0, 500),
           externalExecutionReference:
             adapterResult.externalReference ||
-            `${this.adapter.providerName}:${idempotencyKey}`,
+            `${activeAdapter.providerName}:${idempotencyKey}`,
           fulfillmentLastError: undefined,
           fulfillmentNextRetryAt: undefined,
           completedAt: isAutoCompleted ? latest.completedAt || nowIso : latest.completedAt,
@@ -441,15 +474,17 @@ export class FulfillmentService {
       return notifiedOrder;
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
+      const isNonRetryable =
+        (error as { retryable?: boolean })?.retryable === false;
       const nowMs = Date.now();
       const nowIso = new Date(nowMs).toISOString();
-      const canRetry = attempt < this.MAX_FULFILLMENT_ATTEMPTS;
+      const canRetry = !isNonRetryable && attempt < this.MAX_FULFILLMENT_ATTEMPTS;
       const delayMs = this.baseRetryDelayMs * Math.pow(2, Math.max(0, attempt - 1));
       const nextRetryIso = canRetry ? new Date(nowMs + delayMs).toISOString() : undefined;
 
-      await firestoreRepo.runTransaction<Order>(async (tx) => {
+      const failedOrder = await firestoreRepo.runTransaction<Order>(async (tx) => {
         const latest = (await tx.get<Order>('orders', claimedOrder.orderId)) || claimedOrder;
-        const failedOrder: Order = {
+        const failed: Order = {
           ...latest,
           fulfillmentStatus: 'failed',
           fulfillmentLastError: errMsg.slice(0, 500),
@@ -457,22 +492,24 @@ export class FulfillmentService {
           needsManualReconciliation: !canRetry,
           fulfillmentNote: canRetry
             ? `Ошибка попытки выдачи #${attempt}: ${errMsg}. Запланирован повтор.`
-            : `Выдача остановлена после ${attempt} попыток: ${errMsg}. Требуется ручная выдача админом.`,
+            : isNonRetryable
+              ? `Выдача отклонена провайдером (неповторяемая ошибка): ${errMsg}. Требуется проверка администратором.`
+              : `Выдача остановлена после ${attempt} попыток: ${errMsg}. Требуется ручная выдача админом.`,
           updatedAt: nowIso,
         };
-        tx.set<Order>('orders', failedOrder.orderId, failedOrder);
+        tx.set<Order>('orders', failed.orderId, failed);
 
         const txId = sanitizeDocId(
           `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
         );
         tx.set<StoreTransaction>('transactions', txId, {
           transactionId: txId,
-          orderId: failedOrder.orderId,
-          userId: failedOrder.userId,
+          orderId: failed.orderId,
+          userId: failed.userId,
           type: 'fulfillment_failed',
-          amount: failedOrder.totalPriceUsdCents ?? failedOrder.totalPrice,
-          amountUsdCents: failedOrder.totalPriceUsdCents ?? failedOrder.totalPrice,
-          currency: failedOrder.currency || 'USD',
+          amount: failed.totalPriceUsdCents ?? failed.totalPrice,
+          amountUsdCents: failed.totalPriceUsdCents ?? failed.totalPrice,
+          currency: failed.currency || 'USD',
           details: `Ошибка выдачи (попытка ${attempt}/${this.MAX_FULFILLMENT_ATTEMPTS}): ${errMsg}`.slice(
             0,
             500,
@@ -480,8 +517,12 @@ export class FulfillmentService {
           createdAt: nowIso,
         });
 
-        return failedOrder;
+        return failed;
       });
+
+      if (!canRetry) {
+        await this.ensureAdminNotified(failedOrder, bot);
+      }
 
       throw error;
     }
@@ -501,9 +542,10 @@ export class FulfillmentService {
   ): Promise<Order> {
     const idempotencyKey =
       staleOrder.fulfillmentIdempotencyKey || `fulfill_${staleOrder.orderId}`;
+    const activeAdapter = this.getActiveAdapter();
 
-    if (this.adapter.checkExternalStatus) {
-      const extStatus = await this.adapter.checkExternalStatus(
+    if (activeAdapter.checkExternalStatus) {
+      const extStatus = await activeAdapter.checkExternalStatus(
         staleOrder,
         idempotencyKey,
       );
@@ -544,7 +586,7 @@ export class FulfillmentService {
 
     // If provider does not support idempotency and we cannot verify external status,
     // NEVER re-execute automatically to prevent double fulfillment!
-    if (!this.adapter.supportsIdempotency && !this.adapter.checkExternalStatus) {
+    if (!activeAdapter.supportsIdempotency && !activeAdapter.checkExternalStatus) {
       const nowIso = new Date().toISOString();
       const quarantined = await firestoreRepo.runTransaction<Order>(async (tx) => {
         const current = (await tx.get<Order>('orders', staleOrder.orderId)) || staleOrder;
@@ -655,12 +697,14 @@ export class FulfillmentService {
         }
       }
 
-      // 3. Stale 'processing' orders or orders with undelivered admin notifications
+      // 3. Stale 'processing' orders, in-flight MyStars orders, or orders with undelivered admin notifications
       const processingOrders = await firestoreRepo.queryDocs<Order>('orders', {
         where: [{ field: 'fulfillmentStatus', op: '==', value: 'processing' }],
         orderBy: { field: 'createdAt', direction: 'asc' },
         limit: 25,
       });
+
+      const activeAdapter = this.getActiveAdapter();
 
       for (const ord of processingOrders) {
         const startedMs = ord.fulfillmentStartedAt
@@ -679,7 +723,50 @@ export class FulfillmentService {
               error instanceof Error ? error.message : String(error),
             );
           }
-        } else if (!ord.adminNotifiedAt) {
+          continue;
+        }
+
+        // Poll external status for in-flight MyStars orders (e.g. awaiting_payment -> delivered)
+        if (
+          ord.mystarsOrderId &&
+          activeAdapter.checkExternalStatus &&
+          activeAdapter.isConfigured()
+        ) {
+          try {
+            const extStatus = await activeAdapter.checkExternalStatus(
+              ord,
+              ord.fulfillmentIdempotencyKey || `fulfill_${ord.orderId}`,
+            );
+            if (extStatus.alreadyExecuted && extStatus.status === 'completed') {
+              const completed = await this.completeOrder({
+                orderId: ord.orderId,
+                adminNote:
+                  extStatus.details ||
+                  `Автоматическая выдача MyStars завершена (${ord.mystarsOrderId}).`,
+                bot,
+              });
+              recovered.push(completed);
+              continue;
+            }
+          } catch (error) {
+            const errMsg = error instanceof Error ? error.message : String(error);
+            const isPermanent =
+              (error as { retryable?: boolean })?.retryable === false;
+            if (isPermanent) {
+              const failedOrd = await this.markOrderFulfillmentFailedPermanent(
+                ord.orderId,
+                errMsg,
+                bot,
+              );
+              if (failedOrd) {
+                recovered.push(failedOrd);
+                continue;
+              }
+            }
+          }
+        }
+
+        if (!ord.adminNotifiedAt) {
           const notified = await this.ensureAdminNotified(ord, bot);
           if (notified.adminNotifiedAt) {
             recovered.push(notified);
@@ -700,10 +787,283 @@ export class FulfillmentService {
         );
       }
 
+      // 5. Reconcile pending CryptoBot & xRocket order payments and balance top-ups
+      try {
+        const settledOrderPayments = await PaymentService.reconcilePendingOrderPayments();
+        for (const settled of settledOrderPayments) {
+          if (settled.ok && settled.order) {
+            try {
+              const fulfilled = await this.initiateFulfillment(settled.order, bot);
+              recovered.push(fulfilled);
+            } catch (err) {
+              console.error(
+                `[FulfillmentService] Ошибка выдачи после фоновой сверки платежа заказа #${settled.order.orderId}:`,
+                err instanceof Error ? err.message : String(err),
+              );
+            }
+          }
+        }
+        await balanceService.reconcilePendingTopUps();
+      } catch (error) {
+        console.error(
+          '[FulfillmentService] Ошибка фоновой сверки инвойсов CryptoBot/xRocket:',
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+
       return recovered;
     } finally {
       this.isRecoveryPassRunning = false;
     }
+  }
+
+  private static async markOrderFulfillmentFailedPermanent(
+    orderId: string,
+    errorMessage: string,
+    bot: Telegraf | null | undefined,
+    mystarsStatus?: string,
+  ): Promise<Order | null> {
+    const nowIso = new Date().toISOString();
+    const updated = await firestoreRepo.runTransaction<Order | null>(async (tx) => {
+      const current = await tx.get<Order>('orders', orderId);
+      if (!current) return null;
+      if (current.fulfillmentStatus === 'completed') return current;
+
+      const failed: Order = {
+        ...current,
+        ...(mystarsStatus ? { mystarsOrderStatus: mystarsStatus } : {}),
+        mystarsFailureReason: errorMessage.slice(0, 500),
+        fulfillmentStatus: 'failed',
+        needsManualReconciliation: true,
+        fulfillmentLastError: errorMessage.slice(0, 500),
+        fulfillmentNextRetryAt: undefined,
+        fulfillmentNote: `Ошибка выдачи MyStars: ${errorMessage}`.slice(0, 500),
+        updatedAt: nowIso,
+      };
+      tx.set<Order>('orders', failed.orderId, failed);
+
+      const txId = sanitizeDocId(
+        `tx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      );
+      tx.set<StoreTransaction>('transactions', txId, {
+        transactionId: txId,
+        orderId: failed.orderId,
+        userId: failed.userId,
+        type: 'fulfillment_failed',
+        amount: failed.totalPriceUsdCents ?? failed.totalPrice,
+        amountUsdCents: failed.totalPriceUsdCents ?? failed.totalPrice,
+        currency: failed.currency || 'USD',
+        details: `Постоянная ошибка выдачи MyStars: ${errorMessage}`.slice(0, 500),
+        createdAt: nowIso,
+      });
+
+      return failed;
+    });
+
+    if (updated && updated.fulfillmentStatus === 'failed') {
+      return this.ensureAdminNotified(updated, bot, true);
+    }
+    return updated;
+  }
+
+  /**
+   * Verifies and processes incoming MyStars FaaS v1 terminal webhooks (`POST /webhook/mystars`).
+   * - Validates `X-Faas-Signature` header (HMAC-SHA256 of raw UTF-8 body, supporting `"current,previous"` rotation).
+   * - Authoritatively fetches `GET /v1/orders/{order_id}` from MyStars when configured.
+   * - Transitions order to `completed` (and notifies buyer) when `status === "delivered"`.
+   * - Transitions order to `failed` (with `needsManualReconciliation: true` and admin alert) when `status` is `"failed" | "reversed" | "expired"`.
+   */
+  public static async processMyStarsWebhook(params: {
+    rawBody: string;
+    headers: Record<string, string | string[] | undefined>;
+    parsedBody?: unknown;
+    bot?: Telegraf | null;
+  }): Promise<{
+    ok: boolean;
+    duplicate: boolean;
+    mystarsOrderId: string;
+    mystarsStatus: string;
+    order?: Order;
+    reason?: string;
+  }> {
+    firestoreRepo.assertReadyForOrdersAndPayments();
+
+    let sigHeader: string | undefined;
+    for (const [k, v] of Object.entries(params.headers || {})) {
+      if (k.toLowerCase() === 'x-faas-signature') {
+        sigHeader = Array.isArray(v) ? v[0] : v;
+        break;
+      }
+    }
+
+    const secret = myStarsClient.getCredentials().webhookSecret;
+    if (!verifyMyStarsWebhookSignature(params.rawBody, sigHeader, secret)) {
+      throw new Error(
+        '[WEBHOOK_UNAUTHORIZED] Неверная подпись вебхука MyStars (X-Faas-Signature).',
+      );
+    }
+
+    let bodyObj: Record<string, unknown> | null = null;
+    if (params.parsedBody && typeof params.parsedBody === 'object') {
+      bodyObj = params.parsedBody as Record<string, unknown>;
+    } else if (params.rawBody) {
+      bodyObj = JSON.parse(params.rawBody) as Record<string, unknown>;
+    }
+
+    const mystarsOrderId =
+      typeof bodyObj?.order_id === 'string' ? bodyObj.order_id.trim() : '';
+    const webhookStatus =
+      typeof bodyObj?.status === 'string' ? bodyObj.status.trim().toLowerCase() : '';
+
+    if (!mystarsOrderId || !webhookStatus) {
+      throw new Error('Некорректный формат вебхука MyStars: отсутствуют order_id или status.');
+    }
+
+    const event: MyStarsWebhookEvent = {
+      order_id: mystarsOrderId,
+      status: webhookStatus,
+      failure_reason:
+        typeof bodyObj?.failure_reason === 'string' ? bodyObj.failure_reason : null,
+      purchase_tx:
+        typeof bodyObj?.purchase_tx === 'string' ? bodyObj.purchase_tx : null,
+    };
+
+    // Locate corresponding Order in Firestore
+    let targetOrder: Order | null = null;
+    const byMyStarsId = await firestoreRepo.queryDocs<Order>('orders', {
+      where: [{ field: 'mystarsOrderId', op: '==', value: mystarsOrderId }],
+      limit: 1,
+    });
+    if (byMyStarsId.length > 0) {
+      targetOrder = byMyStarsId[0];
+    } else {
+      const byExtRef = await firestoreRepo.queryDocs<Order>('orders', {
+        where: [
+          { field: 'externalExecutionReference', op: '==', value: mystarsOrderId },
+        ],
+        limit: 1,
+      });
+      if (byExtRef.length > 0) {
+        targetOrder = byExtRef[0];
+      }
+    }
+
+    if (!targetOrder) {
+      return {
+        ok: false,
+        duplicate: false,
+        mystarsOrderId,
+        mystarsStatus: webhookStatus,
+        reason: 'ORDER_NOT_FOUND',
+      };
+    }
+
+    if (targetOrder.fulfillmentStatus === 'completed') {
+      return {
+        ok: true,
+        duplicate: true,
+        mystarsOrderId,
+        mystarsStatus: webhookStatus,
+        order: targetOrder,
+      };
+    }
+
+    // Authoritatively re-verify via GET /v1/orders/{order_id} if MYSTARS_API_KEY is configured
+    let effectiveStatus = webhookStatus;
+    let purchaseTx = event.purchase_tx || undefined;
+    let failureReason = event.failure_reason || undefined;
+    let wholesaleTotalUsdt: string | undefined;
+
+    if (myStarsClient.isConfigured()) {
+      try {
+        const remote = await myStarsClient.getOrder(mystarsOrderId);
+        if (remote && typeof remote.status === 'string') {
+          effectiveStatus = remote.status.trim().toLowerCase();
+          purchaseTx = remote.purchase_tx || purchaseTx;
+          failureReason =
+            remote.failure_reason || remote.telegram_message || failureReason;
+          const remoteRec = remote as unknown as Record<string, unknown>;
+          wholesaleTotalUsdt =
+            remote.payment?.fee?.total ||
+            remote.payment?.amount ||
+            (typeof remoteRec.payment_amount === 'string'
+              ? remoteRec.payment_amount
+              : undefined);
+        }
+      } catch {
+        // Fallback to HMAC-verified webhook payload if upstream GET fails transiently
+      }
+    }
+
+    if (!wholesaleTotalUsdt && typeof bodyObj?.payment_amount === 'string') {
+      wholesaleTotalUsdt = bodyObj.payment_amount;
+    }
+
+    const pnlUpdates: Partial<Order> = {};
+    if (wholesaleTotalUsdt) {
+      const grossCents =
+        targetOrder.grossRevenueUsdCents ??
+        targetOrder.totalPriceUsdCents ??
+        targetOrder.totalPrice;
+      const providerFeeCents = targetOrder.providerFeeUsdCents ?? 0;
+      const costCents = Math.round(Number(wholesaleTotalUsdt) * 100);
+      if (Number.isFinite(costCents) && costCents >= 0) {
+        pnlUpdates.mystarsWholesaleCostUsdt = wholesaleTotalUsdt;
+        pnlUpdates.mystarsCostUsdCents = costCents;
+        pnlUpdates.netProfitUsdCents = grossCents - providerFeeCents - costCents;
+      }
+    }
+
+    await firestoreRepo.updateDoc<Order>('orders', targetOrder.orderId, {
+      ...pnlUpdates,
+      mystarsOrderId,
+      mystarsOrderStatus: effectiveStatus,
+      ...(purchaseTx ? { mystarsPurchaseTx: purchaseTx } : {}),
+      ...(failureReason ? { mystarsFailureReason: failureReason } : {}),
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (MYSTARS_SUCCESS_STATUSES.has(effectiveStatus)) {
+      const completed = await this.completeOrder({
+        orderId: targetOrder.orderId,
+        adminNote: `Автоматическая выдача через MyStars завершена (${mystarsOrderId}${purchaseTx ? `, tx: ${purchaseTx}` : ''}).`,
+        bot: params.bot,
+      });
+      return {
+        ok: true,
+        duplicate: false,
+        mystarsOrderId,
+        mystarsStatus: effectiveStatus,
+        order: completed,
+      };
+    }
+
+    if (MYSTARS_FAILURE_STATUSES.has(effectiveStatus)) {
+      const errDetail =
+        failureReason || `Заказ MyStars ${mystarsOrderId} завершился со статусом ${effectiveStatus}`;
+      const failed = await this.markOrderFulfillmentFailedPermanent(
+        targetOrder.orderId,
+        errDetail,
+        params.bot,
+        effectiveStatus,
+      );
+      return {
+        ok: false,
+        duplicate: false,
+        mystarsOrderId,
+        mystarsStatus: effectiveStatus,
+        order: failed || targetOrder,
+        reason: `MYSTARS_${effectiveStatus.toUpperCase()}`,
+      };
+    }
+
+    return {
+      ok: true,
+      duplicate: false,
+      mystarsOrderId,
+      mystarsStatus: effectiveStatus,
+      order: (await OrderService.getOrderById(targetOrder.orderId)) || targetOrder,
+    };
   }
 
   /**
